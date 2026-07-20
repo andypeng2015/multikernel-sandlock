@@ -226,6 +226,21 @@ fn is_write_open(flags: u64) -> bool {
     flags & (O_WRONLY | O_RDWR | O_CREAT) != 0
 }
 
+/// Returns the TGID (thread group leader PID) for a given TID.
+fn tgid_of(tid: u32) -> u32 {
+    let Ok(s) = std::fs::read_to_string(format!("/proc/{tid}/status")) else {
+        return tid;
+    };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:\t") {
+            if let Ok(tgid) = rest.trim().parse::<u32>() {
+                return tgid;
+            }
+        }
+    }
+    tid
+}
+
 /// Read all file-backed r-xp (executable) mappings from `/proc/<pid>/maps`.
 /// This captures the dynamic linker, all shared libraries, and the main binary
 /// as actually mapped by the kernel. 
@@ -307,7 +322,10 @@ impl LearnObserver {
                 if let Some(path) = event.path {
                     self.reads.lock().unwrap().insert(path);
                 }
-                self.pending_maps.lock().unwrap().insert(event.pid);
+            
+                /// When a non-leader thread calls execve, the new process runs under the TGID,
+                /// so we must insert the TGID into pending_maps.
+                self.pending_maps.lock().unwrap().insert(tgid_of(event.pid));
             }
             "openat" | "open" => {
                 if let Some(path) = event.path {
