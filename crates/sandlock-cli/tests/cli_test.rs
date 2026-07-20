@@ -880,8 +880,8 @@ fn test_write_collapse_skips_root() {
         "write list must not contain \"/\", got: {write_line}",
     );
     assert!(
-        stderr.contains("protected path"),
-        "expected 'protected path' warning in stderr, got: {stderr}",
+        stderr.contains("filesystem root"),
+        "expected 'filesystem root' warning in stderr, got: {stderr}",
     );
 }
 

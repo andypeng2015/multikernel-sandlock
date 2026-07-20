@@ -17,7 +17,7 @@ use sandlock_core::Sandbox;
 
 /// Protected: no legitimate sandboxed workload needs a recursive grant here.
 /// Write collapse to these is skipped + error. Read collapse never fires here.
-const PROTECTED_PATHS: &[&[u8]] = &[b"/", b"/root"];
+const PROTECTED_PATHS: &[&[u8]] = &[b"/root"];
 const PROTECTED_CRED_SUFFIXES: &[&[u8]] = &[b"/.ssh", b"/.aws", b"/.kube", b"/.gnupg"];
 
 /// Guarded: write grants are sometimes necessary but warrant operator awareness.
@@ -80,6 +80,15 @@ fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
             continue;
         }
         let Some(ancestor) = p.ancestors().skip(1).find(|a| a.exists()) else { continue };
+        // "/" is always skipped: granting write access to the filesystem root
+        // is never useful and would override every other policy entry.
+        if ancestor.as_os_str().as_encoded_bytes() == b"/" {
+            eprintln!(
+                "sandlock learn: WARNING: write collapse for '{}' reaches filesystem root, skipping",
+                p.display()
+            );
+            continue;
+        }
         match classify_path(&ancestor) {
             PathTier::Protected => {
                 eprintln!(
