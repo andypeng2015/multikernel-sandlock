@@ -1,3 +1,8 @@
+// Each test here spawns a full `sandlock` process.
+// Running all tests in parallel exhausts kernel resources on most hosts.
+// Limit parallelism when running this suite:
+//   cargo test -p sandlock-cli --test cli_test -- --test-threads=4
+
 use std::process::Command;
 
 fn sandlock_bin() -> Command {

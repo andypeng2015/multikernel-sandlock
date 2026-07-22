@@ -65,8 +65,10 @@ and guarded paths. A warning and diff are still printed.
 ## Tests
 
 ```bash
-# All learn tests
-cargo test -p sandlock-cli -- test_learn
+# All CLI tests (learn + run). Use --test-threads=4 or lower:
+# each test spawns a full sandlock process (supervisor + seccomp fd + COW upper dir);
+# running all > 50 in parallel exhausts kernel limits and causes random hangs.
+cargo test -p sandlock-cli --test cli_test -- --test-threads=4
 ```
 
 Tests require Linux 5.6+ (seccomp notif) and Linux 5.13+ (Landlock). They run the real `sandlock` binary, so build first:
