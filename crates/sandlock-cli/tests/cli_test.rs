@@ -388,9 +388,11 @@ fn test_learn_captures_fs_write() {
 /// COW must also confirm the real filesystem is not touched during learn.
 #[test]
 fn test_learn_new_file_collapses_to_parent() {
-    let path = "/var/tmp/sandlock-learn-write-test.txt";
+    let dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let path = dir.path().join("write-test.txt");
+    let path_str = path.to_str().unwrap();
     let output = sandlock_bin()
-        .args(["learn", "--", "sh", "-c", &format!("echo x > {path}")])
+        .args(["learn", "--", "sh", "-c", &format!("echo x > {path_str}")])
         .output()
         .expect("failed to run sandlock learn");
     assert!(
@@ -400,15 +402,15 @@ fn test_learn_new_file_collapses_to_parent() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     // New-file creates are collapsed to the parent directory (file didn't exist on real FS).
-    let parent = std::path::Path::new(path).parent().unwrap().to_str().unwrap();
+    let parent = path.parent().unwrap().to_str().unwrap();
     let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
     assert!(
-        write_line.contains(parent),
-        "expected parent dir {parent} under write = [...], got: {write_line}",
+        write_line.contains("/var/tmp"),
+        "expected /var/tmp under write = [...], got: {write_line}",
     );
     // COW must have intercepted the write, real file must not exist.
     assert!(
-        !std::path::Path::new(path).exists(),
+        !path.exists(),
         "real filesystem was modified, COW isolation failed",
     );
 }
@@ -417,9 +419,11 @@ fn test_learn_new_file_collapses_to_parent() {
 /// COW must intercept the create so the real directory does not appear.
 #[test]
 fn test_learn_captures_mkdir() {
-    let dir = "/var/tmp/sandlock-learn-mkdir-test";
+    let base = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let dir = base.path().join("newdir");
+    let dir_str = dir.to_str().unwrap();
     let output = sandlock_bin()
-        .args(["learn", "--", "sh", "-c", &format!("mkdir {dir}")])
+        .args(["learn", "--", "sh", "-c", &format!("mkdir {dir_str}")])
         .output()
         .expect("failed to run sandlock learn");
     assert!(output.status.success(),
@@ -428,7 +432,7 @@ fn test_learn_captures_mkdir() {
     let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
     assert!(write_line.contains("/var/tmp"),
         "expected /var/tmp in write = [...], got: {write_line}");
-    assert!(!std::path::Path::new(dir).exists(), "COW isolation failed: dir was created on real FS");
+    assert!(!dir.exists(), "COW isolation failed: dir was created on real FS");
 }
 
 /// unlink records the parent directory in write (Landlock REMOVE_FILE is a dir right).
@@ -480,10 +484,12 @@ fn test_learn_captures_rename() {
 /// Uses a relative target so COW can intercept the create.
 #[test]
 fn test_learn_captures_symlink() {
-    let link = "/var/tmp/sandlock-learn-symlink-test";
+    let dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let link = dir.path().join("link");
+    let link_str = link.to_str().unwrap();
     // Relative target so COW can intercept. Key check: /tmp (target's dir) must NOT appear
     // as write -- only /var/tmp (the linkpath's parent) should.
-    let cmd = format!("ln -s hostname {link}");
+    let cmd = format!("ln -s hostname {link_str}");
     let output = sandlock_bin()
         .args(["learn", "--", "sh", "-c", &cmd])
         .output()
@@ -493,7 +499,7 @@ fn test_learn_captures_symlink() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
     assert!(write_line.contains("/var/tmp"), "expected /var/tmp (link parent) in: {write_line}");
-    assert!(!std::path::Path::new(link).exists(), "COW isolation failed: symlink created on real FS");
+    assert!(!link.exists(), "COW isolation failed: symlink created on real FS");
 }
 
 /// hardlink records only the destination parent (MAKE_HARDLINK is a dst-dir right;
@@ -502,8 +508,10 @@ fn test_learn_captures_symlink() {
 fn test_learn_captures_hardlink() {
     let src = tempfile::NamedTempFile::new_in("/var/tmp").expect("tempfile in /var/tmp");
     let src_path = src.path().to_str().unwrap().to_owned();
-    let dst = "/tmp/sandlock-learn-hardlink-dst-test";
-    let cmd = format!("ln {src_path} {dst}");
+    let dst_dir = tempfile::TempDir::new_in("/tmp").expect("tempdir in /tmp");
+    let dst = dst_dir.path().join("hardlink");
+    let dst_str = dst.to_str().unwrap();
+    let cmd = format!("ln {src_path} {dst_str}");
     let output = sandlock_bin()
         .args(["learn", "--", "sh", "-c", &cmd])
         .output()
@@ -519,19 +527,22 @@ fn test_learn_captures_hardlink() {
     assert!(!write_line.contains("/var/tmp"), "src parent /var/tmp wrongly recorded as write in: {write_line}");
     // src file must appear in reads (ln never calls open() on it, so we add it explicitly).
     assert!(read_line.contains(&src_path), "expected src {src_path} in reads: {read_line}");
-    assert!(!std::path::Path::new(dst).exists(), "COW isolation failed: hardlink created on real FS");
+    assert!(!dst.exists(), "COW isolation failed: hardlink created on real FS");
 }
 
 /// All filesystem mutation syscalls in one run: mkdir, unlink, rename, symlink, hardlink.
 /// Verifies they are all captured without any one operation blocking the others.
 #[test]
 fn test_learn_captures_all_fs_mutations() {
-    let existing = tempfile::NamedTempFile::new_in("/var/tmp").expect("tempfile");
+    let base = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let existing = tempfile::NamedTempFile::new_in(base.path()).expect("tempfile");
     let existing_path = existing.path().to_str().unwrap().to_owned();
-    let newdir = "/var/tmp/sandlock-learn-allops-dir";
-    let symlink = "/var/tmp/sandlock-learn-allops-link";
+    let newdir = base.path().join("newdir");
+    let newdir_str = newdir.to_str().unwrap();
+    let symlink = base.path().join("link");
+    let symlink_str = symlink.to_str().unwrap();
     let cmd = format!(
-        "mkdir {newdir} && rmdir {newdir} && rm {existing_path} && ln -s hostname {symlink}",
+        "mkdir {newdir_str} && rmdir {newdir_str} && rm {existing_path} && ln -s hostname {symlink_str}",
     );
     let output = sandlock_bin()
         .args(["learn", "--", "sh", "-c", &cmd])
@@ -544,8 +555,8 @@ fn test_learn_captures_all_fs_mutations() {
     assert!(write_line.contains("/var/tmp"), "expected /var/tmp in: {write_line}");
     // COW: existing file must still be present, new dir and symlink must not exist.
     assert!(existing.path().exists(), "COW isolation failed: file deleted on real FS");
-    assert!(!std::path::Path::new(newdir).exists(), "COW isolation failed: dir created on real FS");
-    assert!(!std::path::Path::new(symlink).exists(), "COW isolation failed: symlink created on real FS");
+    assert!(!newdir.exists(), "COW isolation failed: dir created on real FS");
+    assert!(!symlink.exists(), "COW isolation failed: symlink created on real FS");
 }
 
 /// truncate records the file path itself (LANDLOCK_ACCESS_FS_TRUNCATE is a file right,
@@ -573,26 +584,27 @@ fn test_learn_captures_truncate() {
 fn test_learn_then_run_write() {
     let profile = tempfile::NamedTempFile::new().expect("tempfile");
     let profile_path = profile.path().to_str().unwrap().to_owned();
-    let write_path = "/var/tmp/sandlock-learn-run-write-test.txt";
-    let _ = std::fs::remove_file(write_path); // clean state
+    let write_dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let write_path = write_dir.path().join("run-write-test.txt");
+    let write_path_str = write_path.to_str().unwrap();
 
     // No pre-creation needed: learn collapses new-file creates to the parent directory,
     // so sandlock run gets write access to the directory and can create the file.
     let learn = sandlock_bin()
-        .args(["learn", "-o", &profile_path, "--", "sh", "-c", &format!("echo hello > {write_path}")])
+        .args(["learn", "-o", &profile_path, "--", "sh", "-c", &format!("echo hello > {write_path_str}")])
         .output()
         .expect("failed to run sandlock learn");
     assert!(learn.status.success(),
         "learn failed unexpectedly: {}", String::from_utf8_lossy(&learn.stderr));
-    assert!(!std::path::Path::new(write_path).exists(), "COW isolation failed during learn");
+    assert!(!write_path.exists(), "COW isolation failed during learn");
 
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "sh", "-c", &format!("echo hello > {write_path}")])
+        .args(["run", "--profile-file", &profile_path, "--", "sh", "-c", &format!("echo hello > {write_path_str}")])
         .output()
         .expect("failed to run sandlock run");
     assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
-    assert_eq!(std::fs::read_to_string(write_path).unwrap_or_default().trim(), "hello", "file not written during run");
-    let _ = std::fs::remove_file(write_path);
+    assert_eq!(std::fs::read_to_string(&write_path).unwrap_or_default().trim(), "hello", "file not written during run");
+    let _ = std::fs::remove_file(&write_path);
 }
 
 
