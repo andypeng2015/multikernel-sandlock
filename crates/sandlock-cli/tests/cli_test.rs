@@ -1091,3 +1091,69 @@ fn test_write_collapse_skips_protected() {
         "expected 'protected path' error in stderr, got: {stderr}",
     );
 }
+
+/// --merge unions a new observation run into an existing profile file.
+/// The merged profile must contain paths from both the old profile and
+/// the new observation;
+#[test]
+fn test_learn_merge_unions_profiles() {
+    // Step 1: create an initial profile by learning cat /etc/hostname
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+    let learn1 = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--", "cat", "/etc/hostname"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(learn1.status.success(),
+        "first learn failed: {}", String::from_utf8_lossy(&learn1.stderr));
+
+    // Step 2: merge a second observation (cat /etc/os-release) into the same file
+    let learn2 = sandlock_bin()
+        .args(["learn", "--merge", &profile_path, "--", "cat", "/etc/os-release"])
+        .output()
+        .expect("failed to run sandlock learn --merge");
+    assert!(learn2.status.success(),
+        "merge learn failed: {}", String::from_utf8_lossy(&learn2.stderr));
+
+    // The merged profile must contain reads from both runs
+    let merged = std::fs::read_to_string(&profile_path).expect("read merged profile");
+    assert!(merged.contains("/etc/hostname") || merged.contains("/etc"),
+        "merged profile missing /etc/hostname: {merged}");
+    assert!(merged.contains("/etc/os-release") || merged.contains("/etc"),
+        "merged profile missing /etc/os-release: {merged}");
+    // [program] must be kept from the first run (cat /etc/hostname)
+    assert!(merged.contains("hostname"),
+        "merged profile must keep [program] from first run: {merged}");
+}
+
+/// `sandlock run --profile-file` prints a hint to stderr suggesting
+/// `sandlock learn --merge` when the sandboxed process exits non-zero.
+#[test]
+fn test_run_denial_hint_on_nonzero_exit() {
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+
+    // Learn a minimal profile for a command that will later fail
+    let learn = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--", "true"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(learn.status.success(),
+        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+
+    // Run with the profile but have the process exit non-zero
+    let run = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "sh", "-c", "exit 1"])
+        .output()
+        .expect("failed to run sandlock run");
+    assert!(!run.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("sandlock learn --merge"),
+        "expected denial hint in stderr, got: {stderr}",
+    );
+    assert!(
+        stderr.contains(&profile_path),
+        "hint must include the profile path, got: {stderr}",
+    );
+}

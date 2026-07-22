@@ -513,7 +513,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let threads = max_threads.load(Ordering::Relaxed);
     let fds = max_fds.load(Ordering::Relaxed);
 
-    // Build the profile.
+    // Build the profile from observations.
     let mut profile_out = ProfileInput::default();
 
     // Record the observed command so `sandlock run -p profile.toml` works
@@ -572,8 +572,8 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     // Fill limits with observed peaks + headroom so the profile is usable with sandlock run.
     if peak_rss_kb > 0 {
-        let mib = (peak_rss_kb + 1023) / 1024;          // ceil to MiB
-        let headroom = (mib * 5 / 4).max(16);            // +25%, min 16M
+        let mib = (peak_rss_kb + 1023) / 1024;
+        let headroom = (mib * 5 / 4).max(16);
         profile_out.limits.memory = Some(format!("{headroom}M"));
     }
     if threads > 0 {
@@ -581,6 +581,49 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     }
     if fds > 0 {
         profile_out.limits.open_files = Some((fds * 2).max(32) as u32);
+    }
+
+    // --merge: union observed profile into an existing one.
+    if let Some(ref merge_path) = args.merge {
+        let existing_toml = std::fs::read_to_string(merge_path)
+            .map_err(|e| anyhow!("failed to read merge file {}: {e}", merge_path.display()))?;
+        let existing: ProfileInput = toml::from_str(&existing_toml)
+            .map_err(|e| anyhow!("failed to parse merge file {}: {e}", merge_path.display()))?;
+
+        // Keep [program] from the existing profile.
+        profile_out.program = existing.program.clone();
+
+        // Union filesystem paths, re-run dedup after merging.
+        let merged_reads: Vec<PathBuf> = {
+            let mut set: BTreeSet<PathBuf> = profile_out.filesystem.read.iter().cloned().collect();
+            set.extend(existing.filesystem.read.iter().cloned());
+            dedup_subsumed(set.into_iter().collect())
+        };
+        let merged_writes: Vec<PathBuf> = {
+            let mut set: BTreeSet<PathBuf> = profile_out.filesystem.write.iter().cloned().collect();
+            set.extend(existing.filesystem.write.iter().cloned());
+            dedup_subsumed(set.into_iter().collect())
+        };
+        profile_out.filesystem.read = merged_reads;
+        profile_out.filesystem.write = merged_writes;
+
+        // Union network.allow and allow_bind.
+        let mut allow_set: std::collections::BTreeSet<String> =
+            profile_out.network.allow.iter().cloned().collect();
+        allow_set.extend(existing.network.allow.iter().cloned());
+        profile_out.network.allow = allow_set.into_iter().collect();
+
+        let mut bind_set: std::collections::BTreeSet<u16> =
+            profile_out.network.allow_bind.iter().filter_map(port_spec_to_u16).collect();
+        bind_set.extend(existing.network.allow_bind.iter().filter_map(port_spec_to_u16));
+        profile_out.network.allow_bind = bind_set.into_iter()
+            .map(sandlock_core::profile::PortSpec::Port)
+            .collect();
+
+        // Limits: take the max of old vs observed.
+        profile_out.limits.memory = max_bytesize(existing.limits.memory.as_deref(), profile_out.limits.memory.as_deref());
+        profile_out.limits.processes = max_opt(existing.limits.processes, profile_out.limits.processes);
+        profile_out.limits.open_files = max_opt(existing.limits.open_files, profile_out.limits.open_files);
     }
 
     let kernel = std::fs::read_to_string("/proc/version")
@@ -604,8 +647,10 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .map_err(|e| anyhow!("failed to serialize profile: {e}"))?;
     let toml_out = format!("{header}{body}");
 
-    match args.output {
-        Some(ref path) => {
+    // Output target: -o overrides --merge's file; --merge writes back in place.
+    let output_path = args.output.as_ref().or(args.merge.as_ref());
+    match output_path {
+        Some(path) => {
             std::fs::write(path, &toml_out)
                 .map_err(|e| anyhow!("failed to write {}: {e}", path.display()))?;
             eprintln!("sandlock learn: profile written to {}", path.display());
@@ -614,4 +659,48 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn port_spec_to_u16(p: &sandlock_core::profile::PortSpec) -> Option<u16> {
+    match p {
+        sandlock_core::profile::PortSpec::Port(n) => Some(*n),
+        sandlock_core::profile::PortSpec::Spec(s) => s.trim().parse::<u16>().ok(),
+    }
+}
+
+/// Parse a bytesize string like "128M", "1G", "512K" into bytes.
+fn parse_bytesize_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(n) = s.strip_suffix('G') {
+        (n, 1024 * 1024 * 1024u64)
+    } else if let Some(n) = s.strip_suffix('M') {
+        (n, 1024 * 1024u64)
+    } else if let Some(n) = s.strip_suffix('K') {
+        (n, 1024u64)
+    } else {
+        (s, 1u64)
+    };
+    num.trim().parse::<u64>().ok().map(|n| n * mult)
+}
+
+/// Return the larger of two optional bytesize strings.
+fn max_bytesize(a: Option<&str>, b: Option<&str>) -> Option<String> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(s), None) | (None, Some(s)) => Some(s.to_string()),
+        (Some(sa), Some(sb)) => {
+            let va = parse_bytesize_bytes(sa).unwrap_or(0);
+            let vb = parse_bytesize_bytes(sb).unwrap_or(0);
+            Some(if va >= vb { sa.to_string() } else { sb.to_string() })
+        }
+    }
+}
+
+/// Return the larger of two optional u32 values.
+fn max_opt(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (Some(va), Some(vb)) => Some(va.max(vb)),
+    }
 }

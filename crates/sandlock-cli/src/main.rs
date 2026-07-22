@@ -210,6 +210,10 @@ struct LearnArgs {
     #[arg(short = 'o', long, value_name = "PATH")]
     output: Option<PathBuf>,
 
+    /// Union observed rules into an existing profile file and write it back
+    #[arg(long, value_name = "PATH")]
+    merge: Option<PathBuf>,
+
     /// Kill the observed process after this many seconds and write a partial profile
     #[arg(long, value_name = "SECS")]
     timeout: Option<u64>,
@@ -398,6 +402,13 @@ async fn run_command(args: RunArgs) -> Result<i32> {
             validate_no_supervisor_profile(base, &profile_source(&args))?;
         }
     }
+
+    // Save exec+args for the denial hint before profile_program_spec is consumed below.
+    let profile_hint_cmd: Option<String> = profile_program_spec.as_ref().and_then(|spec| {
+        let exec = spec.exec.as_ref()?.display().to_string();
+        let args_str = spec.args.join(" ");
+        Some(if args_str.is_empty() { exec } else { format!("{exec} {args_str}") })
+    });
 
     // Start from profile or default
     let mut builder = if let Some(base) = base_from_profile {
@@ -734,7 +745,23 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         }
     }
 
-    Ok(result.code().unwrap_or(1))
+    let exit_code = result.code().unwrap_or(1);
+
+    // When running from a profile file and the process exits non-zero, suggest
+    // extending the profile with --merge in case the failure was a denial.
+    if exit_code != 0 {
+        if let Some(ref path) = args.profile_file {
+            if let Some(ref cmd_str) = profile_hint_cmd {
+                eprintln!(
+                    "hint: if a denial caused this, extend the profile with:\n  \
+                     sandlock learn --merge {} -- {cmd_str}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    Ok(exit_code)
 }
 
 /// Validate that no flags incompatible with --no-supervisor are set.
