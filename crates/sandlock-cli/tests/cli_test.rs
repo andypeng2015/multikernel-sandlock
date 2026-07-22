@@ -1157,3 +1157,52 @@ fn test_run_denial_hint_on_nonzero_exit() {
         "hint must include the profile path, got: {stderr}",
     );
 }
+
+/// E7: learn through a symlink must record the canonical (real) path so that
+/// sandlock run allows access regardless of whether the workload uses the
+/// symlink path or the real path.
+#[test]
+fn test_learn_symlink_path_canonicalized() {
+    let real_dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir");
+    let file = real_dir.path().join("data.txt");
+    std::fs::write(&file, "hello").expect("write file");
+    let real_path = file.to_str().unwrap().to_owned();
+
+    // Create a symlink to the real dir under /tmp
+    let link = format!("/tmp/sandlock-e7-link-{}", std::process::id());
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(real_dir.path(), &link).expect("create symlink");
+    let via_link = format!("{link}/data.txt");
+
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+
+    // Learn: workload reads via the symlink path
+    let learn = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--", "cat", &via_link])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(learn.status.success(),
+        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+
+    // The profile must contain the canonical (real) path, not the symlink path.
+    // Without canonicalization, it records the symlink path and run fails when
+    // the workload opens via the real path.
+    let profile_content = std::fs::read_to_string(&profile_path).expect("read profile");
+    assert!(
+        profile_content.contains(real_dir.path().to_str().unwrap()),
+        "profile must contain canonical path {}, got:\n{profile_content}",
+        real_dir.path().display()
+    );
+
+    // Run: workload reads via the REAL path — must succeed with the learned profile
+    let run = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "cat", &real_path])
+        .output()
+        .expect("failed to run sandlock run");
+    assert!(run.status.success(),
+        "run via real path failed (E7 not fixed): {}",
+        String::from_utf8_lossy(&run.stderr));
+
+    let _ = std::fs::remove_file(&link);
+}

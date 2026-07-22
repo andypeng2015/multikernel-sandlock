@@ -338,6 +338,7 @@ impl LearnObserver {
             }
             "openat" | "open" => {
                 if let Some(path) = event.path {
+                    let path = canonicalize_or_keep(path);
                     if let Some(fl) = event.flags {
                         if is_write_open(fl) {
                             self.writes.lock().unwrap().insert(path);
@@ -351,6 +352,7 @@ impl LearnObserver {
             // rights, so the parent dir is what sandlock run needs, not the target.
             "mkdirat" | "unlinkat" | "symlinkat" => {
                 if let Some(p) = event.path {
+                    let p = canonicalize_or_keep(p);
                     if let Some(parent) = p.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
@@ -359,6 +361,7 @@ impl LearnObserver {
             // rename: needs RENAME_OLD on parent of old path + RENAME_NEW on parent of new path.
             "renameat2" => {
                 for p in [event.path, event.path2].into_iter().flatten() {
+                    let p = canonicalize_or_keep(p);
                     if let Some(parent) = p.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
@@ -367,9 +370,10 @@ impl LearnObserver {
             // link: source needs read access (ln doesn't open() it); dst parent needs MAKE_HARDLINK.
             "linkat" => {
                 if let Some(src) = event.path {
-                    self.reads.lock().unwrap().insert(src);
+                    self.reads.lock().unwrap().insert(canonicalize_or_keep(src));
                 }
                 if let Some(dst) = event.path2 {
+                    let dst = canonicalize_or_keep(dst);
                     if let Some(parent) = dst.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
@@ -378,7 +382,7 @@ impl LearnObserver {
             // truncate: LANDLOCK_ACCESS_FS_TRUNCATE applies to the file itself.
             "truncate" => {
                 if let Some(p) = event.path {
-                    self.writes.lock().unwrap().insert(p);
+                    self.writes.lock().unwrap().insert(canonicalize_or_keep(p));
                 }
             }
             "connect" | "sendto" | "sendmsg" | "sendmmsg" => {
@@ -394,6 +398,12 @@ impl LearnObserver {
     }
 }
 
+
+/// Resolve symlinks to get the canonical path. Falls back to the original
+/// if the path doesn't exist yet (e.g. COW-intercepted creates).
+fn canonicalize_or_keep(p: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&p).unwrap_or(p)
+}
 
 pub async fn run(args: LearnArgs) -> Result<()> {
     if args.cmd.is_empty() {
