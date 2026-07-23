@@ -384,6 +384,73 @@ fn test_learn_captures_udp() {
     );
 }
 
+/// All destinations in a sendmmsg call are recorded, not just the first.
+#[test]
+fn test_learn_captures_sendmmsg_all_destinations() {
+    let sock1 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let sock2 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port1 = sock1.local_addr().unwrap().port();
+    let port2 = sock2.local_addr().unwrap().port();
+    std::thread::spawn(move || { let mut b = [0u8;8]; let _ = sock1.recv_from(&mut b); });
+    std::thread::spawn(move || { let mut b = [0u8;8]; let _ = sock2.recv_from(&mut b); });
+
+    let script = format!(concat!(
+        "import ctypes, socket, struct\n",
+        "libc = ctypes.CDLL('libc.so.6')\n",
+        "class iovec(ctypes.Structure):\n",
+        "    _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]\n",
+        "class msghdr(ctypes.Structure):\n",
+        "    _fields_ = [\n",
+        "        ('msg_name', ctypes.c_void_p),\n",
+        "        ('msg_namelen', ctypes.c_uint),\n",
+        "        ('_p1', ctypes.c_uint),\n",
+        "        ('msg_iov', ctypes.c_void_p),\n",
+        "        ('msg_iovlen', ctypes.c_size_t),\n",
+        "        ('msg_control', ctypes.c_void_p),\n",
+        "        ('msg_controllen', ctypes.c_size_t),\n",
+        "        ('msg_flags', ctypes.c_int),\n",
+        "        ('_p2', ctypes.c_uint),\n",
+        "    ]\n",
+        "class mmsghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_hdr', msghdr), ('msg_len', ctypes.c_uint), ('_p', ctypes.c_uint)]\n",
+        "def sai(port):\n",
+        "    return struct.pack('=HH4s8x', socket.AF_INET, socket.htons(port), socket.inet_aton('127.0.0.1'))\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "a1 = ctypes.create_string_buffer(sai({port1}))\n",
+        "a2 = ctypes.create_string_buffer(sai({port2}))\n",
+        "data = ctypes.create_string_buffer(b'x')\n",
+        "iovs = (iovec * 2)()\n",
+        "iovs[0].iov_base = ctypes.cast(data, ctypes.c_void_p).value\n",
+        "iovs[0].iov_len = 1\n",
+        "iovs[1].iov_base = ctypes.cast(data, ctypes.c_void_p).value\n",
+        "iovs[1].iov_len = 1\n",
+        "vec = (mmsghdr * 2)()\n",
+        "vec[0].msg_hdr.msg_name = ctypes.cast(a1, ctypes.c_void_p).value\n",
+        "vec[0].msg_hdr.msg_namelen = 16\n",
+        "vec[0].msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iovs[0]), ctypes.c_void_p).value\n",
+        "vec[0].msg_hdr.msg_iovlen = 1\n",
+        "vec[1].msg_hdr.msg_name = ctypes.cast(a2, ctypes.c_void_p).value\n",
+        "vec[1].msg_hdr.msg_namelen = 16\n",
+        "vec[1].msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iovs[1]), ctypes.c_void_p).value\n",
+        "vec[1].msg_hdr.msg_iovlen = 1\n",
+        "libc.sendmmsg(s.fileno(), vec, 2, 0)\n",
+        "s.close()\n",
+    ), port1 = port1, port2 = port2);
+
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let allow_line = stdout.lines().find(|l| l.starts_with("allow = [")).unwrap_or("");
+    assert!(allow_line.contains(&format!("udp://127.0.0.1:{port1}")),
+        "expected port {port1} in allow, got: {allow_line}");
+    assert!(allow_line.contains(&format!("udp://127.0.0.1:{port2}")),
+        "expected port {port2} (second sendmmsg destination) in allow, got: {allow_line}");
+}
+
 // ── Resource limits ───────────────────────────────────────────────────────────
 
 /// Resource peaks are recorded under [limits].

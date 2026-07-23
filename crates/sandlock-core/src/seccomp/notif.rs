@@ -1802,8 +1802,49 @@ fn resolve_held_gate(
     }
 }
 
-/// Emit a syscall event to the policy_fn callback thread (if active).
-/// Returns the callback's verdict for held syscalls.
+/// Decode sendmmsg entries 1..vlen into observation-only `SyscallEvent`s.
+/// Entry 0 is handled by the main `emit_policy_event` path; this covers the rest.
+fn decode_sendmmsg_extras(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    nr: i64,
+    name: &str,
+    category: crate::policy_fn::SyscallCategory,
+    parent_pid: Option<u32>,
+    denied: bool,
+    protocol: &Option<String>,
+) -> Vec<crate::policy_fn::SyscallEvent> {
+    let mut extras = Vec::new();
+    if nr != libc::SYS_sendmmsg { return extras; }
+    let vlen = notif.data.args[2] as usize;
+    let base_ptr = notif.data.args[1];
+    for i in 1..vlen {
+        let entry_ptr = crate::network::materialize::mmsg_entry_ptr(base_ptr, i);
+        let Ok(hdr) = read_child_mem(notif_fd, notif.id, notif.pid, entry_ptr, 12) else { continue };
+        if hdr.len() < 12 { continue; }
+        let name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
+        let name_len = u32::from_ne_bytes(hdr[8..12].try_into().unwrap()) as usize;
+        let (host, port) = read_sockaddr_for_event(notif, name_ptr, name_len, notif_fd);
+        if host.is_none() { continue; }
+        extras.push(crate::policy_fn::SyscallEvent {
+            syscall: name.to_string(),
+            category,
+            pid: notif.pid,
+            parent_pid,
+            host,
+            port,
+            size: None,
+            argv: None,
+            denied,
+            path: None,
+            path2: None,
+            flags: None,
+            protocol: protocol.clone(),
+        });
+    }
+    extras
+}
+
 async fn emit_policy_event(
     notif: &SeccompNotif,
     action: &NotifAction,
@@ -1877,8 +1918,7 @@ async fn emit_policy_event(
     // sendmsg/sendmmsg: sockaddr is inside struct msghdr at args[1].
     // msghdr layout: msg_name ptr (u64 @ offset 0), msg_namelen u32 (@ offset 8).
     // For sendmmsg the first mmsghdr entry's msghdr starts at offset 0, same layout.
-    // TODO: only the first of args[2] mmsghdr entries is decoded; remaining
-    // destinations are missed. Full fix requires returning Vec<SyscallEvent>.
+    // Remaining entries (1..vlen) are emitted as observation-only events below.
     if nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg {
         if let Ok(hdr) = read_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], 12) {
             if hdr.len() >= 12 {
@@ -1936,6 +1976,12 @@ async fn emit_policy_event(
         path2 = resolve_second_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
     }
 
+    
+    // Decode remaining sendmmsg entries before unblocking the child.
+    let sendmmsg_extras = decode_sendmmsg_extras(
+        notif, notif_fd, nr, name, category, parent_pid, denied, &protocol,
+    );
+
     let event = crate::policy_fn::SyscallEvent {
         syscall: name.to_string(),
         category,
@@ -1966,7 +2012,7 @@ async fn emit_policy_event(
         || nr == libc::SYS_sendto || nr == libc::SYS_sendmsg
         || nr == libc::SYS_sendmmsg;
 
-    if is_held {
+    let verdict = if is_held {
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
         let _ = tx.send(crate::policy_fn::PolicyEvent {
             event,
@@ -1983,7 +2029,14 @@ async fn emit_policy_event(
             gate: None,
         });
         None
+    };
+    // Emit the remaining sendmmsg destinations as observation-only events.
+    // The verdict above already covers the whole syscall; gate: None is correct.
+    for extra in sendmmsg_extras {
+        let _ = tx.send(crate::policy_fn::PolicyEvent { event: extra, gate: None });
     }
+
+    verdict
 }
 
 // ============================================================
