@@ -159,6 +159,59 @@ fn test_learn_then_run_collapse() {
         "run failed with collapsed profile: {}", String::from_utf8_lossy(&run.stderr));
 }
 
+/// Learned memory limit reflects actual anonymous allocation, not just the floor.
+#[test]
+fn test_learn_then_run_memory_limit() {
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+
+    // Allocate 20 MiB, learned limit must exceed the 16M floor.
+    let script = "import time; x = bytearray(20 * 1024 * 1024); time.sleep(0.05)";
+    let learn = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--", "python3", "-c", script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(learn.status.success(), "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+
+    let profile_toml = std::fs::read_to_string(&profile_path).expect("read profile");
+    let mem_line = profile_toml.lines().find(|l| l.starts_with("memory")).unwrap();
+    let mib: u64 = mem_line.trim_end_matches('"').split('"').nth(1)
+        .and_then(|s| s.trim_end_matches('M').parse().ok()).unwrap_or(0);
+    assert!(mib >= 25, "expected memory >= 25M (20M + 25% headroom), got {mib}M");
+
+    let run = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "python3", "-c", script])
+        .output()
+        .expect("failed to run sandlock run");
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+}
+
+/// Learned process limit reflects observed child processes.
+#[test]
+fn test_learn_then_run_process_limit() {
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+
+    // sh forks cat as a child, observed peak is 2 processes.
+    let learn = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--", "sh", "-c", "cat /etc/hostname & wait"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(learn.status.success(), "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+
+    let profile_toml = std::fs::read_to_string(&profile_path).expect("read profile");
+    let proc_line = profile_toml.lines().find(|l| l.starts_with("processes")).unwrap();
+    let procs: u32 = proc_line.split('=').nth(1)
+        .and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    assert!(procs >= 4, "expected processes >= 4 (2 observed * 2), got {procs}");
+
+    let run = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "sh", "-c", "cat /etc/hostname & wait"])
+        .output()
+        .expect("failed to run sandlock run");
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+}
+
 /// Merged profile covers paths from both learn runs.
 #[test]
 fn test_learn_then_run_merge() {

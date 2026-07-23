@@ -11,10 +11,14 @@ use tokio::sync::Mutex as AsyncMutex;
 pub struct ResourceState {
     /// Live concurrent process count — incremented on fork, decremented on wait.
     pub proc_count: u32,
+    /// Peak concurrent process count observed since sandbox start.
+    pub peak_proc_count: u32,
     /// Maximum allowed concurrent processes.
     pub max_processes: u32,
     /// Estimated anonymous memory usage (bytes).
     pub mem_used: u64,
+    /// Peak anonymous memory usage observed since sandbox start (bytes).
+    pub peak_mem_used: u64,
     /// Maximum allowed anonymous memory (bytes).
     pub max_memory_bytes: u64,
     /// Whether fork notifications should be held (checkpoint/freeze).
@@ -32,8 +36,10 @@ impl ResourceState {
     pub fn new(max_memory_bytes: u64, max_processes: u32) -> Self {
         Self {
             proc_count: 0,
+            peak_proc_count: 1, // root process always exists; handle_fork counts children only
             max_processes,
             mem_used: 0,
+            peak_mem_used: 0,
             max_memory_bytes,
             hold_forks: false,
             held_notif_ids: Vec::new(),
