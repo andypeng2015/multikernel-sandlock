@@ -397,7 +397,8 @@ impl LearnObserver {
             "connect" | "sendto" | "sendmsg" | "sendmmsg" => {
                 if let (Some(ip), Some(port), Some(proto)) = (event.host, event.port, event.protocol) {
                     if proto != "icmp" {
-                        self.connects.lock().unwrap().insert(format!("{proto}://{ip}:{port}"));
+                        let host = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
+                        self.connects.lock().unwrap().insert(format!("{proto}://{host}:{port}"));
                     }
                 }
             }

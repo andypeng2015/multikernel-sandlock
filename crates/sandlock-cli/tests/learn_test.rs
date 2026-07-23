@@ -282,6 +282,33 @@ fn test_learn_captures_net_connect() {
     );
 }
 
+/// IPv6 endpoints are recorded with brackets: tcp://[::1]:port.
+/// Skipped on hosts without IPv6 loopback.
+#[test]
+fn test_learn_captures_ipv6_connect() {
+    let listener = match std::net::TcpListener::bind("[::1]:0") {
+        Ok(l) => l,
+        Err(_) => { eprintln!("skipped: IPv6 loopback unavailable"); return; }
+    };
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || { let _ = listener.accept(); });
+
+    let script = format!(
+        "import socket; s=socket.socket(socket.AF_INET6); s.connect(('::1',{port})); s.close()"
+    );
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = format!("tcp://[::1]:{port}");
+    let net_line = stdout.lines().find(|l| l.starts_with("allow = [")).unwrap_or("");
+    assert!(net_line.contains(&expected),
+        "expected {expected} under [network] allow = [...], got: {net_line}");
+}
+
 /// Bind calls are recorded under [network] allow_bind.
 #[test]
 fn test_learn_captures_bind() {
