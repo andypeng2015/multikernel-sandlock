@@ -309,6 +309,22 @@ fn test_learn_captures_ipv6_connect() {
         "expected {expected} under [network] allow = [...], got: {net_line}");
 }
 
+/// getaddrinfo routing probes (UDP connect to port 80) must not appear in the profile.
+#[test]
+fn test_learn_no_phantom_udp_from_getaddrinfo() {
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c",
+               "import socket; socket.getaddrinfo('localhost', 80)"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let allow_line = stdout.lines().find(|l| l.starts_with("allow = [")).unwrap_or("allow = []");
+    assert!(!allow_line.contains("udp://"),
+        "phantom UDP entries from routing probes must not appear in profile: {allow_line}");
+}
+
 /// Bind calls are recorded under [network] allow_bind.
 #[test]
 fn test_learn_captures_bind() {

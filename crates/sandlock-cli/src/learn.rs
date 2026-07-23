@@ -397,8 +397,14 @@ impl LearnObserver {
             "connect" | "sendto" | "sendmsg" | "sendmmsg" => {
                 if let (Some(ip), Some(port), Some(proto)) = (event.host, event.port, event.protocol) {
                     if proto != "icmp" {
-                        let host = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
-                        self.connects.lock().unwrap().insert(format!("{proto}://{host}:{port}"));
+                        // Skip UDP connect to port 80: glibc getaddrinfo uses connect() on a
+                        // temporary UDP socket to port 80 purely to probe routing, no data sent.
+                        if proto == "udp" && port == 80 && event.syscall == "connect" {
+                            // phantom address-sorting probe — skip
+                        } else {
+                            let host = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
+                            self.connects.lock().unwrap().insert(format!("{proto}://{host}:{port}"));
+                        }
                     }
                 }
             }
