@@ -277,6 +277,7 @@ struct LearnObserver {
     reads: Arc<Mutex<BTreeSet<PathBuf>>>,
     writes: Arc<Mutex<BTreeSet<PathBuf>>>,
     connects: Arc<Mutex<BTreeSet<String>>>,
+    binds: Arc<Mutex<BTreeSet<u16>>>,
     /// PIDs with an exec attempt observed but the post-exec maps scan still
     /// pending; the scan runs on the pid's first non-exec event, which is
     /// guaranteed to run under the new image.
@@ -293,6 +294,7 @@ impl LearnObserver {
             reads: Arc::new(Mutex::new(BTreeSet::new())),
             writes: Arc::new(Mutex::new(BTreeSet::new())),
             connects: Arc::new(Mutex::new(BTreeSet::new())),
+            binds: Arc::new(Mutex::new(BTreeSet::new())),
             pending_maps: Arc::new(Mutex::new(HashSet::new())),
             first_exe: Arc::new(Mutex::new(None)),
         }
@@ -383,6 +385,13 @@ impl LearnObserver {
             "truncate" => {
                 if let Some(p) = event.path {
                     self.writes.lock().unwrap().insert(canonicalize_or_keep(p));
+                }
+            }
+            "bind" => {
+                if let Some(port) = event.port {
+                    if port > 0 {
+                        self.binds.lock().unwrap().insert(port);
+                    }
                 }
             }
             "connect" | "sendto" | "sendmsg" | "sendmmsg" => {
@@ -579,6 +588,9 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         ..Default::default()
     };
     profile_out.network.allow = observer.connects.lock().unwrap().iter().cloned().collect();
+    profile_out.network.allow_bind = observer.binds.lock().unwrap().iter()
+        .map(|&p| sandlock_core::profile::PortSpec::Port(p))
+        .collect();
 
     // Fill limits with observed peaks + headroom so the profile is usable with sandlock run.
     if peak_rss_kb > 0 {

@@ -647,6 +647,30 @@ fn test_learn_captures_net_connect() {
     );
 }
 
+/// `sandlock learn` must record bind() calls under `[network] allow_bind`
+#[test]
+fn test_learn_captures_bind() {
+    let script = concat!(
+        "import socket\n",
+        "s = socket.socket()\n",
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+        "s.bind(('127.0.0.1', 19876))\n",
+        "s.close()\n",
+    );
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let bind_line = stdout.lines().find(|l| l.starts_with("allow_bind = [")).unwrap_or("");
+    assert!(
+        bind_line.contains("19876"),
+        "expected 19876 in allow_bind, got: {bind_line}",
+    );
+}
+
 /// `sandlock learn` must capture reads done via the `openat2` syscall (not just
 /// `openat`).
 #[test]
