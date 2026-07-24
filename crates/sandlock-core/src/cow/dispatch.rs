@@ -491,6 +491,9 @@ fn cow_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
         Ok(true) => NotifAction::ReturnValue(0),
         Err(crate::error::BranchError::QuotaExceeded) => NotifAction::Errno(libc::ENOSPC),
         Err(crate::error::BranchError::Denied) => NotifAction::Errno(libc::EPERM),
+        // Whiteouted source: Continue would let the kernel act on the lower
+        // entry, which still exists with its pre-delete content.
+        Err(crate::error::BranchError::Deleted) => NotifAction::Errno(libc::ENOENT),
         _ => NotifAction::Continue,
     }
 }
