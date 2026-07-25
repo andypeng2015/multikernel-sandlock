@@ -32,6 +32,7 @@ sandbox = Sandbox(
     # [program]  (process knobs only; exec/args are arguments to .run/.cmd)
     env={}, cwd=None, uid=None, gid=None,
     clean_env=False, no_coredump=False, no_huge_pages=False,
+    no_supervisor=False,
 
     # [filesystem]
     fs_readable=(), fs_writable=(), fs_denied=(),
@@ -87,6 +88,7 @@ gid           = 0
 clean_env     = true
 no_coredump   = true
 no_huge_pages = true
+no_supervisor = false
 
 [filesystem]
 read      = ["/usr", "/lib"]
@@ -257,6 +259,7 @@ fields on `Sandbox`.
 | `clean_env`     | `clean_env`     | `bool`              | `False` | When `True`, start with a minimal environment (`PATH`, `HOME`, `USER`, `TERM`, `LANG`) instead of inheriting the parent's.                            |
 | `no_coredump`   | `no_coredump`   | `bool`              | `False` | Apply `prctl(PR_SET_DUMPABLE, 0)`. Disables core dumps and restricts `/proc/<pid>` access from other processes. Breaks `gdb`, `strace`, and `perf`.   |
 | `no_huge_pages` | `no_huge_pages` | `bool`              | `False` | Disable transparent huge pages via `prctl(PR_SET_THP_DISABLE)`.                                                                                      |
+| `no_supervisor` | `no_supervisor` | `bool`              | `False` | Skip the seccomp user-notification supervisor. The sandbox runs with Landlock + a kernel-only deny filter, without IP allowlisting, resource limits, COW, chroot mediation, `/proc` virtualization, or custom handlers. Required when nesting inside another sandlock (the kernel only allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task). |
 
 ## `[filesystem]`
 
@@ -363,6 +366,7 @@ and have no TOML counterpart.
 | `policy_fn` | `Callable \| None`| `None`  | Per-event dynamic policy callback. See the project README's "Dynamic Policy" section.                      |
 | `init_fn`   | `Callable \| None`| `None`  | Callback invoked once in the template process prior to COW fork.                                           |
 | `work_fn`   | `Callable \| None`| `None`  | Callback invoked in each COW clone; receives `clone_id` as its argument.                                   |
+| `control_socket` | `bool`        | `True`  | Enable the per-sandbox control socket for introspection (`sandlock ps`, `sandlock config`). When `False`, no runtime dir, pid file, or control-socket task is created — the sandbox is invisible to `sandlock ps` / `sandlock config`. `no_supervisor` sandboxes only create a control socket when `control_socket=True`. |
 
 ## Advanced
 
