@@ -349,6 +349,29 @@ fn test_learn_captures_bind() {
     );
 }
 
+/// AF_UNIX named bind: the socket path's parent directory is recorded in writes
+#[test]
+fn test_learn_captures_unix_bind() {
+    let dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let sock = dir.path().join("test.sock");
+    let sock_str = sock.to_str().unwrap();
+    let script = format!(
+        "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); \
+         s.bind('{sock_str}'); s.close()"
+    );
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    let parent = dir.path().to_str().unwrap();
+    assert!(write_line.contains(parent),
+        "expected parent dir {parent} in write = [...], got: {write_line}");
+}
+
 /// UDP destinations via sendto and sendmsg are both recorded under [network] allow.
 #[test]
 fn test_learn_captures_udp() {

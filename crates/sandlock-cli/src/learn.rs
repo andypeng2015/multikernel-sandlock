@@ -391,6 +391,13 @@ impl LearnObserver {
                     if port > 0 {
                         self.binds.lock().unwrap().insert(port);
                     }
+                } else if let Some(p) = event.path {
+                    // AF_UNIX named bind: Landlock MAKE_SOCK is a directory right,
+                    // so the parent dir is what sandlock run needs.
+                    let p = canonicalize_or_keep(p);
+                    if let Some(parent) = p.parent() {
+                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    }
                 }
             }
             "connect" | "sendto" | "sendmsg" | "sendmmsg" => {

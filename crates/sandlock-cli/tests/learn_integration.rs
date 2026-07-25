@@ -136,6 +136,40 @@ fn test_learn_then_run_bind() {
     assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
 }
 
+/// AF_UNIX bind: socket parent observed during learn, bind succeeds during run.
+#[test]
+fn test_learn_then_run_unix_bind() {
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+    let dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let sock = dir.path().join("rndtrip.sock");
+    let sock_str = sock.to_str().unwrap();
+    let script = format!(
+        "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); \
+         s.bind('{sock_str}'); s.close()"
+    );
+
+    let learn = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(learn.status.success(),
+        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+
+    // bind() during learn is executed on-behalf by the supervisor (outside the
+    // COW overlay), so the socket file exists on the real FS after learn.
+    // Remove it so run can bind to the same path without EADDRINUSE.
+    let _ = std::fs::remove_file(&sock);
+
+    let run = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock run");
+    assert!(run.status.success(),
+        "run failed (unix bind parent not in writes?): {}",
+        String::from_utf8_lossy(&run.stderr));
+}
+
 /// Collapsed profile: directory grant covers files not individually observed during learn.
 #[test]
 fn test_learn_then_run_collapse() {

@@ -1748,6 +1748,17 @@ fn resolve_second_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Optio
     }
 }
 
+/// Extract the `sun_path` from an `AF_UNIX` sockaddr in child memory.
+fn read_unix_bind_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd)
+    -> Option<std::path::PathBuf>
+{
+    let addr = notif.data.args[1];
+    let len  = notif.data.args[2] as usize;
+    if addr == 0 || len < 3 { return None; }
+    let bytes = read_child_mem(notif_fd, notif.id, notif.pid, addr, len.min(110)).ok()?;
+    crate::network::materialize::named_unix_socket_path(&bytes)
+}
+
 /// Extract IP and port from a sockaddr in child memory. Parsing (including
 /// v4-mapped canonicalization) is shared with the enforcement path so the
 /// policy_fn callback judges the same address the policy layer does.
@@ -1906,6 +1917,11 @@ async fn emit_policy_event(
         let (h, p) = read_sockaddr_for_event(notif, notif.data.args[1], notif.data.args[2] as usize, notif_fd);
         host = h;
         port = p;
+    }
+
+    // AF_UNIX named bind: no IP/port, but the sun_path needs a MAKE_SOCK grant on its parent directory.
+    if nr == libc::SYS_bind && host.is_none() {
+        path = read_unix_bind_path_for_notif(notif, notif_fd);
     }
 
     // sendto(fd, buf, len, flags, addr, addrlen): sockaddr in args[4]/args[5].
