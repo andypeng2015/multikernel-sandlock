@@ -232,3 +232,36 @@ async fn test_popen_rejects_second_spawn() {
         .await;
     assert!(second.is_err(), "second popen on a used Sandbox must error, not reuse state");
 }
+
+/// A stream the caller took stays the caller's: `wait()` must not drain it (or
+/// steal its bytes into the `RunResult`) behind the caller's back, and must
+/// report `None` for it. The untaken piped stream on the same process is still
+/// collected as usual, so the two paths are exercised together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_popen_taken_stdout_is_not_drained_by_wait() {
+    let mut sb = base().with_name("popen-taken-stdout");
+    let mut child = sb
+        .popen(
+            &["sh", "-c", "printf out; printf err 1>&2"],
+            StdioMode::Inherit,
+            StdioMode::Piped,
+            StdioMode::Piped,
+        )
+        .await
+        .unwrap();
+
+    let mut stdout = File::from(child.take_stdout().expect("taking stdout must yield the stream"));
+
+    let mut out = String::new();
+    stdout.read_to_string(&mut out).unwrap();
+    assert_eq!(out, "out", "the taken stream must still carry the child's output");
+
+    let res = child.wait().await.unwrap();
+    assert!(res.success());
+    assert!(res.stdout.is_none(), "a taken stdout must be None in the RunResult");
+    assert_eq!(
+        res.stderr.as_deref(),
+        Some(&b"err"[..]),
+        "the untaken piped stderr must still be captured",
+    );
+}

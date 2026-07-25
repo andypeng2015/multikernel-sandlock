@@ -692,3 +692,191 @@ async fn test_chroot() {
 
     let _ = std::fs::remove_dir_all(&chroot_dir);
 }
+
+// ============================================================
+// Capture pipes must be drained while the child runs, not after it exits.
+//
+// A child that writes more than one pipe buffer (64 KiB by default) blocks in
+// `write()` once the pipe fills. If `wait()` only reads the pipes after the
+// child has exited, the child can never reach that exit and the run hangs until
+// the caller's timeout — forever if there is none — losing the output.
+//
+// Each test bounds itself with `tokio::time::timeout` so the regression fails
+// the test instead of hanging the suite; dropping the `Sandbox` on that path
+// SIGKILLs the child's process group.
+// ============================================================
+
+/// Payload comfortably larger than the default 64 KiB pipe buffer.
+const OVER_PIPE_BUFFER: usize = 1024 * 1024;
+
+fn capture_policy() -> Sandbox {
+    Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_run_captures_stdout_larger_than_the_pipe_buffer() {
+    let cmd = format!("head -c {} /dev/zero | tr '\\0' 'X'", OVER_PIPE_BUFFER);
+    let mut sb = capture_policy().with_name("test");
+    let args = ["sh", "-c", cmd.as_str()];
+    let fut = sb.run(&args);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), fut)
+        .await
+        .expect("run() hung: the capture pipe filled and the child could not exit")
+        .unwrap();
+
+    assert!(result.success(), "child should exit 0");
+    assert_eq!(
+        result.stdout.as_ref().map(|b| b.len()),
+        Some(OVER_PIPE_BUFFER),
+        "the whole payload must be captured, not just the first pipe buffer",
+    );
+    assert!(
+        result.stdout.as_ref().unwrap().iter().all(|&b| b == b'X'),
+        "captured stdout must be the payload itself, not spliced or reordered bytes",
+    );
+}
+
+#[tokio::test]
+async fn test_run_captures_stderr_larger_than_the_pipe_buffer() {
+    let cmd = format!("head -c {} /dev/zero | tr '\\0' 'E' 1>&2", OVER_PIPE_BUFFER);
+    let mut sb = capture_policy().with_name("test");
+    let args = ["sh", "-c", cmd.as_str()];
+    let fut = sb.run(&args);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), fut)
+        .await
+        .expect("run() hung on a stderr payload larger than the pipe buffer")
+        .unwrap();
+
+    assert!(result.success(), "child should exit 0");
+    assert_eq!(
+        result.stderr.as_ref().map(|b| b.len()),
+        Some(OVER_PIPE_BUFFER),
+        "the whole stderr payload must be captured",
+    );
+    assert!(
+        result.stderr.as_ref().unwrap().iter().all(|&b| b == b'E'),
+        "captured stderr must be the payload itself",
+    );
+}
+
+/// Both streams over the buffer at once. This is the case a *sequential* drain
+/// (finish stdout, then start stderr) still deadlocks on: stdout only reaches
+/// EOF when the child exits, and the child is blocked writing stderr.
+#[tokio::test]
+async fn test_run_captures_large_stdout_and_stderr_together() {
+    let cmd = format!(
+        "head -c {n} /dev/zero | tr '\\0' 'O'; head -c {n} /dev/zero | tr '\\0' 'E' 1>&2",
+        n = OVER_PIPE_BUFFER
+    );
+    let mut sb = capture_policy().with_name("test");
+    let args = ["sh", "-c", cmd.as_str()];
+    let fut = sb.run(&args);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), fut)
+        .await
+        .expect("run() hung with both streams over the pipe buffer")
+        .unwrap();
+
+    assert!(result.success(), "child should exit 0");
+    assert_eq!(result.stdout.as_ref().map(|b| b.len()), Some(OVER_PIPE_BUFFER));
+    assert_eq!(result.stderr.as_ref().map(|b| b.len()), Some(OVER_PIPE_BUFFER));
+    assert!(
+        result.stdout.as_ref().unwrap().iter().all(|&b| b == b'O'),
+        "stdout must hold only its own payload",
+    );
+    assert!(
+        result.stderr.as_ref().unwrap().iter().all(|&b| b == b'E'),
+        "stderr must hold only its own payload — the two streams must not be crossed",
+    );
+}
+
+/// A `wait()` the caller cancels must not destroy the capture: the drains
+/// belong to the `Sandbox`, so a later `wait()` still returns what they read.
+///
+/// Cancelling a `wait()` is a normal in-tree idiom (a `tokio::time::timeout`
+/// or `select!` around it, then `kill()` and wait again). If the first poll
+/// moved the pipe read ends into detached readers that the cancelled future
+/// owned, they would be lost with it and every later `wait()` would report no
+/// output at all. Nothing here is large enough to fill a pipe buffer — this is
+/// about ownership of the drains, not about the deadlock above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cancelled_wait_keeps_the_capture_for_the_next_wait() {
+    let mut sb = capture_policy().with_name("drain-cancel");
+    sb.spawn(&["sh", "-c", "printf hello; sleep 5"]).await.unwrap();
+
+    // The child sleeps well past this, so the first wait is cancelled mid-flight.
+    let first = tokio::time::timeout(std::time::Duration::from_millis(500), sb.wait()).await;
+    assert!(first.is_err(), "the child sleeps 5s: this wait must be cancelled, not complete");
+
+    sb.kill().unwrap();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait())
+        .await
+        .expect("the second wait() hung")
+        .unwrap();
+
+    assert_eq!(
+        result.stdout.as_deref(),
+        Some(&b"hello"[..]),
+        "the cancelled wait() must not have consumed and discarded the child's output",
+    );
+}
+
+/// A capture-mode `wait()` must not park threads of the shared blocking pool
+/// for the child's whole lifetime.
+///
+/// That pool is also what the COW copier and the fork-tracking worker run on,
+/// and both must make progress *while* a child is alive — so a `wait()` that
+/// holds pool threads until its child exits can starve a second, unrelated
+/// sandbox into a deadlock rather than merely slowing it down. The runtime here
+/// is deliberately small so that a two-thread-per-wait cost is fatal; with
+/// drains that cost no pool threads, the second run finishes normally.
+///
+/// Own runtime, so `max_blocking_threads` can be set (`#[tokio::test]` cannot).
+#[test]
+fn test_capture_wait_does_not_park_blocking_pool_threads() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        // A long-lived child that writes nothing at all: any pool thread this
+        // costs is held purely for being alive.
+        let mut idle = capture_policy().with_name("drain-idle");
+        idle.spawn(&["sh", "-c", "sleep 60"]).await.unwrap();
+
+        let mut quick = capture_policy().with_name("drain-quick");
+
+        let idle_wait = idle.wait();
+        let quick_run = quick.run(&["echo", "hi"]);
+        tokio::pin!(idle_wait);
+        tokio::pin!(quick_run);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            tokio::select! {
+                biased;
+                // Polled first, so its drains are in flight before the second
+                // sandbox starts.
+                _ = &mut idle_wait => panic!("the idle child sleeps 60s; it must not exit first"),
+                r = &mut quick_run => r,
+            }
+        })
+        .await
+        .expect("a second sandbox deadlocked while the first was merely alive")
+        .unwrap();
+
+        assert!(result.success());
+        assert_eq!(result.stdout.as_deref(), Some(&b"hi\n"[..]));
+    });
+}

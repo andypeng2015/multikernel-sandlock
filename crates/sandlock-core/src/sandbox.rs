@@ -255,6 +255,11 @@ struct Runtime {
     loadavg_handle: Option<JoinHandle<()>>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
+    // Tasks draining the capture pipes above while the child runs (see `wait`).
+    // They belong to the runtime, not to the `wait()` that started them, so a
+    // cancelled `wait()` does not take the output with it.
+    stdout_drain: Option<JoinHandle<Vec<u8>>>,
+    stderr_drain: Option<JoinHandle<Vec<u8>>>,
     // Parent-held write end of a piped stdin (popen). The caller takes it via
     // `Process::take_stdin`; closing it signals EOF to the child.
     _stdin_write: Option<std::os::fd::OwnedFd>,
@@ -743,24 +748,63 @@ impl Sandbox {
     }
 
     /// Wait for the child process to exit.
+    ///
+    /// Dropping the returned future does not cost the captured output: the pipe
+    /// drains belong to the `Sandbox`, so a caller that cancels this `wait()`
+    /// (a `timeout` or `select!` around it) and calls `wait()` again still gets
+    /// what the child wrote.
     pub async fn wait(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
         use crate::result::RunResult;
 
         let pid = self.rt().child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
 
-        if let RuntimeState::Stopped(ref es) = self.rt().state {
-            return Ok(RunResult {
-                exit_status: es.clone(),
-                stdout: None,
-                stderr: None,
-            });
+        // Already reaped: hand back the same status again, plus whatever the
+        // drains collected. They outlive the `wait()` that started them, so a
+        // second call still reports the output of a first one that was
+        // cancelled — or that already returned it, in which case they are gone
+        // and both streams are `None`.
+        let stopped = match self.rt().state {
+            RuntimeState::Stopped(ref es) => Some(es.clone()),
+            _ => None,
+        };
+        if let Some(exit_status) = stopped {
+            let (stdout, stderr) = self.collect_pipe_drains().await;
+            return Ok(RunResult { exit_status, stdout, stderr });
         }
 
         // Deliver EOF to a piped stdin the caller never took: otherwise a child
         // that reads stdin (e.g. `cat`) blocks forever and this wait never
         // returns. A taken stdin is already None here (the caller owns it).
         drop(self.rt_mut()._stdin_write.take());
+
+        // Start draining the capture pipes BEFORE waiting for the child to exit.
+        //
+        // Reading them after the exit wait deadlocks the moment the child writes
+        // more than one pipe buffer (64 KiB by default): the pipe fills, the
+        // child blocks in `write()` and can never exit, while this function waits
+        // for exactly that exit. The run then hangs until the caller's timeout
+        // (forever if there is none) and the output is lost. Draining
+        // concurrently keeps the pipe moving, so the child can finish writing and
+        // exit, and the reads still end at EOF — which arrives once the child and
+        // every descendant holding the write end are gone.
+        //
+        // The drains are parked in the runtime rather than in this future: a
+        // caller that cancels `wait()` (a `timeout` or `select!` around it) must
+        // be able to `wait()` again and still be given the output. The
+        // `is_none()` guard is what makes that second call reuse them instead of
+        // starting a second reader. A stream the caller took through
+        // `Process::take_stdout`/`take_stderr` is `None` here and stays theirs.
+        if self.rt().stdout_drain.is_none() {
+            if let Some(fd) = self.rt_mut()._stdout_read.take() {
+                self.rt_mut().stdout_drain = sandbox_spawn_pipe_drain(fd);
+            }
+        }
+        if self.rt().stderr_drain.is_none() {
+            if let Some(fd) = self.rt_mut()._stderr_read.take() {
+                self.rt_mut().stderr_drain = sandbox_spawn_pipe_drain(fd);
+            }
+        }
 
         // Wait for the top-level child to exit. Prefer the child's pidfd via
         // `AsyncFd`: pidfd readiness fires only on *exit*, so — unlike a
@@ -787,10 +831,30 @@ impl Sandbox {
             self.rt_mut().seccomp_cow = cow.branch.take();
         }
 
-        let stdout = self.rt_mut()._stdout_read.take().map(sandbox_read_fd_to_end);
-        let stderr = self.rt_mut()._stderr_read.take().map(sandbox_read_fd_to_end);
+        let (stdout, stderr) = self.collect_pipe_drains().await;
 
         Ok(RunResult { exit_status, stdout, stderr })
+    }
+
+    /// Join the capture-pipe drains, if this runtime still holds them.
+    ///
+    /// Only called once the child has been reaped, so the EOF each drain is
+    /// reading towards is already reachable. `None` means the stream was never
+    /// piped, was taken by the caller, or was already collected by an earlier
+    /// `wait()`; a drain that panicked or was aborted yields no output rather
+    /// than failing the run.
+    async fn collect_pipe_drains(&mut self) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let out = self.rt_mut().stdout_drain.take();
+        let err = self.rt_mut().stderr_drain.take();
+        let stdout = match out {
+            Some(h) => Some(h.await.unwrap_or_default()),
+            None => None,
+        };
+        let stderr = match err {
+            Some(h) => Some(h.await.unwrap_or_default()),
+            None => None,
+        };
+        (stdout, stderr)
     }
 
     /// Fork the sandboxed child and install policy (seccomp + notif
@@ -1315,6 +1379,8 @@ impl Sandbox {
                 loadavg_handle: None,
                 _stdout_read: None,
                 _stderr_read: None,
+                stdout_drain: None,
+                stderr_drain: None,
                 _stdin_write: None,
                 seccomp_cow: None,
                 supervisor_resource: None,
@@ -1409,6 +1475,8 @@ impl Sandbox {
             loadavg_handle: None,
             _stdout_read: None,
             _stderr_read: None,
+            stdout_drain: None,
+            stderr_drain: None,
             _stdin_write: None,
             seccomp_cow: None,
             supervisor_resource: None,
@@ -2079,6 +2147,9 @@ impl Drop for Sandbox {
             if let Some(h) = rt.notif_handle.take() { h.abort(); }
             if let Some(h) = rt.throttle_handle.take() { h.abort(); }
             if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
+            // Nobody is left to collect these; aborting closes the read ends.
+            if let Some(h) = rt.stdout_drain.take() { h.abort(); }
+            if let Some(h) = rt.stderr_drain.take() { h.abort(); }
 
             let is_error = matches!(
                 rt.state,
@@ -2237,6 +2308,36 @@ unsafe fn wire_child_stdio(mode: StdioMode, target: i32, pipe_src: Option<i32>, 
             }
         }
     }
+}
+
+/// Spawn a task that reads one capture pipe to EOF, for `wait` to join once the
+/// child has been reaped.
+///
+/// An ordinary task, not `spawn_blocking`: a blocking read would hold a thread
+/// of the shared blocking pool for the child's entire lifetime — even for a
+/// child that writes nothing — and that pool is also what the COW copier and
+/// the fork-tracking worker need *while* a child is alive, so a saturated pool
+/// is a deadlock rather than a slowdown.
+///
+/// `Receiver::from_owned_fd` sets O_NONBLOCK on this fd and registers it with
+/// the runtime's I/O driver (which `wait` needs anyway, for the pidfd). The
+/// flag belongs to the open file description behind the *read* end; the child
+/// writes to the write end, a separate description, so its `write()`s stay
+/// blocking — which is what keeps the pipe applying back-pressure rather than
+/// dropping output. The conversion can only fail if the fd is not a readable
+/// pipe, which cannot happen for the pipes `do_create_stdio` creates; if it
+/// somehow did, the stream is left uncaptured rather than the run failing.
+fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<JoinHandle<Vec<u8>>> {
+    let mut rx = match tokio::net::unix::pipe::Receiver::from_owned_fd(fd) {
+        Ok(rx) => rx,
+        Err(_) => return None,
+    };
+    Some(tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let _ = rx.read_to_end(&mut buf).await;
+        buf
+    }))
 }
 
 fn sandbox_read_fd_to_end(fd: std::os::fd::OwnedFd) -> Vec<u8> {
