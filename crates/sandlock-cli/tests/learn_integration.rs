@@ -246,6 +246,34 @@ fn test_learn_then_run_process_limit() {
     assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
 }
 
+/// mknod: FIFO created during learn round-trips to run.
+#[test]
+fn test_learn_then_run_mknod() {
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+    let dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let fifo = dir.path().join("rndtrip.fifo");
+    let fifo_str = fifo.to_str().unwrap();
+    let script = format!("import os; os.mkfifo('{fifo_str}')");
+
+    let learn = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(learn.status.success(),
+        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+    assert!(!fifo.exists(), "COW isolation failed during learn");
+
+    let run = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "python3", "-c", &script])
+        .output()
+        .expect("failed to run sandlock run");
+    assert!(run.status.success(),
+        "run failed (mknod not in profile writes?): {}", String::from_utf8_lossy(&run.stderr));
+    assert!(fifo.exists(), "FIFO not created during run");
+    let _ = std::fs::remove_file(&fifo);
+}
+
 /// Merged profile covers paths from both learn runs.
 #[test]
 fn test_learn_then_run_merge() {

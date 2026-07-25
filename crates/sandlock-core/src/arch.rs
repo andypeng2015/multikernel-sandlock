@@ -65,6 +65,7 @@ legacy_syscall!(sys_getdents, "getdents");
 legacy_syscall!(sys_unlink, "unlink");
 legacy_syscall!(sys_rmdir, "rmdir");
 legacy_syscall!(sys_mkdir, "mkdir");
+legacy_syscall!(sys_mknod, "mknod");
 legacy_syscall!(sys_rename, "rename");
 legacy_syscall!(sys_symlink, "symlink");
 legacy_syscall!(sys_link, "link");

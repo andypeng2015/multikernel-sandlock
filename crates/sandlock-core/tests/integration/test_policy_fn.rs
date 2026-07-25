@@ -605,16 +605,19 @@ async fn test_policy_fn_fs_mutation_events() {
 
     let dir = temp_file("mutations-dir");
     let renamed = temp_file("mutations-renamed");
+    let fifo = temp_file("mutations-fifo");
     let cmd = format!(
-        "mkdir {dir} && mv {dir} {renamed} && rmdir {renamed}",
+        "mkdir {dir} && mv {dir} {renamed} && rmdir {renamed} && mkfifo {fifo}",
         dir = dir.display(),
         renamed = renamed.display(),
+        fifo = fifo.display(),
     );
     let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(result.success());
+    let _ = std::fs::remove_file(&fifo);
 
     let captured = events.lock().unwrap();
-    for name in ["mkdirat", "renameat2", "unlinkat"] {
+    for name in ["mkdirat", "renameat2", "unlinkat", "mknodat"] {
         assert!(
             captured.iter().any(|(n, p)| n == name && p.is_some()),
             "expected a {name} event with a resolved path, got: {:?}",

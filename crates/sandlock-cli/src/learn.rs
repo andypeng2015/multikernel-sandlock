@@ -349,9 +349,9 @@ impl LearnObserver {
                     }
                 }
             }
-            // mkdir/unlink/rmdir/symlink: Landlock MAKE_*/REMOVE_* are directory
+            // mkdir/unlink/rmdir/symlink/mknod: Landlock MAKE_*/REMOVE_* are directory
             // rights, so the parent dir is what sandlock run needs, not the target.
-            "mkdirat" | "unlinkat" | "symlinkat" => {
+            "mkdirat" | "mknodat" | "unlinkat" | "symlinkat" => {
                 if let Some(p) = event.path {
                     let p = canonicalize_or_keep(p);
                     if let Some(parent) = p.parent() {

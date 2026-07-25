@@ -583,6 +583,29 @@ impl SeccompCowBranch {
         Ok(ok)
     }
 
+    /// Handle mknodat: create a file-system node in the upper layer.
+    ///
+    /// Returns `Err(QuotaExceeded)` when the node would exceed `max_disk`.
+    pub fn handle_mknod(&mut self, path: &str, mode: u32, dev: u64) -> Result<bool, BranchError> {
+        let rel = match self.safe_rel(path) {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        self.check_quota(256)?;
+        self.deleted.remove(&rel);
+        self.has_changes = true;
+        // Ensure the parent directory exists in the upper layer before creating
+        // the node (mirrors handle_symlink; parent may only exist in lower).
+        if let Some(p) = parent_rel(&rel) {
+            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
+        }
+        let ok = crate::sys::fs::mknod_in_root(&self.upper, &rel, mode, dev).is_ok();
+        if ok {
+            self.disk_used += 256;
+        }
+        Ok(ok)
+    }
+
     /// Handle rename.
     ///
     /// Returns `Err(QuotaExceeded)` when the COW copy would exceed `max_disk`.

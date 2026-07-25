@@ -269,6 +269,21 @@ pub(crate) fn mkdirp_in_root(root: &Path, rel: &str, mode: u32) -> Result<(), i3
     Ok(())
 }
 
+/// Create a file-system node `rel` confined within `root` (parent must exist).
+/// `mode` must include the type bits (e.g. `S_IFIFO | 0o600`); `dev` is only
+/// meaningful for `S_IFBLK`/`S_IFCHR` nodes.
+pub(crate) fn mknod_in_root(root: &Path, rel: &str, mode: u32, dev: u64) -> Result<(), i32> {
+    let (pfd, base) = parent_dir_in_root(root, rel)?;
+    let cbase = CString::new(base).map_err(|_| {
+        unsafe { libc::close(pfd) };
+        libc::EINVAL
+    })?;
+    let rc = unsafe { libc::mknodat(pfd, cbase.as_ptr(), mode as libc::mode_t, dev as libc::dev_t) };
+    let err = last_errno(libc::EIO);
+    unsafe { libc::close(pfd) };
+    if rc < 0 { Err(err) } else { Ok(()) }
+}
+
 /// Create a symlink `rel -> target` confined within `root` (parent must exist).
 pub(crate) fn symlinkat_in_root(root: &Path, rel: &str, target: &str) -> Result<(), i32> {
     let (pfd, base) = parent_dir_in_root(root, rel)?;

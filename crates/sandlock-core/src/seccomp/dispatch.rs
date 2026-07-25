@@ -1002,14 +1002,14 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
 
     // Write syscalls (*at variants + legacy)
     let mut write_nrs = vec![
-        libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_renameat2,
+        libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_mknodat, libc::SYS_renameat2,
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
         libc::SYS_fchownat, libc::SYS_truncate,
     ];
     write_nrs.extend([
-        arch::sys_unlink(), arch::sys_rmdir(), arch::sys_mkdir(), arch::sys_rename(),
-        arch::sys_symlink(), arch::sys_link(), arch::sys_chmod(), arch::sys_chown(),
-        arch::sys_lchown(),
+        arch::sys_unlink(), arch::sys_rmdir(), arch::sys_mkdir(), arch::sys_mknod(),
+        arch::sys_rename(), arch::sys_symlink(), arch::sys_link(), arch::sys_chmod(),
+        arch::sys_chown(), arch::sys_lchown(),
     ].into_iter().flatten());
     for nr in write_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_write));

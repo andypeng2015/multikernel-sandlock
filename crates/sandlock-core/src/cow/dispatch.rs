@@ -316,6 +316,7 @@ pub(crate) async fn handle_cow_open(
 enum CowWriteOp {
     Unlink { path: String, is_dir: bool },
     Mkdir { path: String },
+    Mknod { path: String, mode: u32, dev: u64 },
     Rename { old_path: String, new_path: String },
     Symlink { target: String, linkpath: String },
     Link { old_path: String, new_path: String },
@@ -329,6 +330,7 @@ impl CowWriteOp {
         match self {
             CowWriteOp::Unlink { path, .. }
             | CowWriteOp::Mkdir { path }
+            | CowWriteOp::Mknod { path, .. }
             | CowWriteOp::Chmod { path, .. }
             | CowWriteOp::Chown { path, .. }
             | CowWriteOp::Truncate { path, .. } => {
@@ -391,6 +393,14 @@ fn parse_cow_write(
             path: read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?,
         });
     }
+    if nr == libc::SYS_mknodat {
+        // mknodat(dirfd, pathname, mode, dev)
+        return Some(CowWriteOp::Mknod {
+            path: read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?,
+            mode: notif.data.args[2] as u32,
+            dev:  notif.data.args[3],
+        });
+    }
     if nr == libc::SYS_renameat2 {
         let old_path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
         let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
@@ -432,6 +442,14 @@ fn parse_cow_write(
     if Some(nr) == arch::sys_mkdir() {
         return Some(CowWriteOp::Mkdir {
             path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
+        });
+    }
+    if Some(nr) == arch::sys_mknod() {
+        // mknod(pathname, mode, dev)
+        return Some(CowWriteOp::Mknod {
+            path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
+            mode: notif.data.args[1] as u32,
+            dev:  notif.data.args[2],
         });
     }
     if Some(nr) == arch::sys_rename() {
@@ -602,6 +620,10 @@ pub(crate) async fn handle_cow_write(
         CowWriteOp::Mkdir { ref path } => {
             if !cow.matches(path) { return NotifAction::Continue; }
             cow_result(cow.handle_mkdir(path))
+        }
+        CowWriteOp::Mknod { ref path, mode, dev } => {
+            if !cow.matches(path) { return NotifAction::Continue; }
+            cow_result(cow.handle_mknod(path, mode, dev))
         }
         CowWriteOp::Rename { ref old_path, ref new_path } => {
             if !cow.matches(old_path) { return NotifAction::Continue; }

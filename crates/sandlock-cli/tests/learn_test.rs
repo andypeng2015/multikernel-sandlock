@@ -372,6 +372,28 @@ fn test_learn_captures_unix_bind() {
         "expected parent dir {parent} in write = [...], got: {write_line}");
 }
 
+/// mknod/mknodat: FIFO creates are captured by the parent directory (Landlock
+/// MAKE_FIFO is a directory right, so the parent is what sandlock run needs).
+#[test]
+fn test_learn_captures_mknod() {
+    let dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let fifo = dir.path().join("test.fifo");
+    let fifo_str = fifo.to_str().unwrap();
+    let output = sandlock_bin()
+        .args(["learn", "--", "python3", "-c",
+               &format!("import os; os.mkfifo('{fifo_str}')")])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "sandlock learn failed: stderr={}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let write_line = stdout.lines().find(|l| l.starts_with("write = [")).unwrap_or("");
+    let parent = dir.path().to_str().unwrap();
+    assert!(write_line.contains(parent),
+        "expected parent dir {parent} in write = [...], got: {write_line}");
+    assert!(!fifo.exists(), "COW isolation failed: FIFO was created on real FS");
+}
+
 /// UDP destinations via sendto and sendmsg are both recorded under [network] allow.
 #[test]
 fn test_learn_captures_udp() {

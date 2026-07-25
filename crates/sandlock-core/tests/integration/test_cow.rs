@@ -203,6 +203,36 @@ async fn test_seccomp_cow_open_directory() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
+/// Test that mknod (via mkfifo) creates a FIFO in the COW upper layer and
+/// commits it to the workdir on exit.
+#[tokio::test]
+async fn test_seccomp_cow_mknod_fifo() {
+    let workdir = temp_dir("seccomp-mknod");
+    let fifo_path = workdir.join("test.fifo");
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    let cmd = format!("mkfifo {}", fifo_path.display());
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    match result {
+        Ok(r) => {
+            assert!(r.success(), "mkfifo should succeed in COW sandbox, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(fifo_path.exists(), "FIFO should be committed to workdir after exit");
+        }
+        Err(e) => eprintln!("Seccomp COW mknod test skipped: {}", e),
+    }
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
 /// Test that chdir works for directories created inside COW.
 ///
 /// When a directory is created via COW (only exists in the upper layer),

@@ -1522,12 +1522,14 @@ fn syscall_name(nr: i64) -> &'static str {
         n if n == libc::SYS_getrandom => "getrandom",
         n if n == libc::SYS_unlinkat => "unlinkat",
         n if n == libc::SYS_mkdirat => "mkdirat",
+        n if n == libc::SYS_mknodat => "mknodat",
         n if n == libc::SYS_renameat2 => "renameat2",
         n if n == libc::SYS_linkat => "linkat",
         n if n == libc::SYS_symlinkat => "symlinkat",
         n if n == libc::SYS_truncate => "truncate",
         // Legacy single-path variants (x86_64 only).
         n if Some(n) == arch::sys_mkdir() => "mkdirat",
+        n if Some(n) == arch::sys_mknod() => "mknodat",
         n if Some(n) == arch::sys_rmdir() => "unlinkat",
         n if Some(n) == arch::sys_unlink() => "unlinkat",
         n if Some(n) == arch::sys_symlink() => "symlinkat",
@@ -1543,7 +1545,7 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
     use crate::policy_fn::SyscallCategory;
     match nr {
         n if n == libc::SYS_openat || n == arch::SYS_OPENAT2 || n == libc::SYS_unlinkat
-            || n == libc::SYS_mkdirat || n == libc::SYS_renameat2
+            || n == libc::SYS_mkdirat || n == libc::SYS_mknodat || n == libc::SYS_renameat2
             || n == libc::SYS_symlinkat || n == libc::SYS_linkat
             || n == libc::SYS_fchmodat || n == libc::SYS_fchownat
             || n == libc::SYS_truncate || n == libc::SYS_readlinkat
@@ -1551,6 +1553,7 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             || n == libc::SYS_faccessat || n == libc::SYS_getdents64
             || Some(n) == arch::sys_getdents()
             || Some(n) == arch::sys_open() || Some(n) == arch::sys_mkdir()
+            || Some(n) == arch::sys_mknod()
             || Some(n) == arch::sys_rmdir() || Some(n) == arch::sys_unlink()
             || Some(n) == arch::sys_symlink() || Some(n) == arch::sys_link()
             || Some(n) == arch::sys_rename() || Some(n) == arch::sys_renameat()
@@ -1673,6 +1676,16 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
         n if n == libc::SYS_mkdirat => {
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+        }
+        // mknodat(dirfd, pathname, mode, dev)
+        n if n == libc::SYS_mknodat => {
+            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
+            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+        }
+        // mknod(pathname, mode, dev), legacy, AT_FDCWD implied.
+        n if Some(n) == arch::sys_mknod() => {
+            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
         }
         // unlinkat(dirfd, pathname, flags)
         n if n == libc::SYS_unlinkat => {
@@ -1978,12 +1991,14 @@ async fn emit_policy_event(
         }
     }
 
-    // mkdirat, unlinkat, symlinkat, truncate: single resolved path.
+    // mkdirat, unlinkat, symlinkat, truncate, mknodat: single resolved path.
     // renameat2, linkat (and their legacy equivalents): src path + dst path2.
-    let is_fs_mutating = nr == libc::SYS_mkdirat || nr == libc::SYS_unlinkat
+    let is_fs_mutating = nr == libc::SYS_mkdirat || nr == libc::SYS_mknodat
+        || nr == libc::SYS_unlinkat
         || nr == libc::SYS_symlinkat || nr == libc::SYS_truncate
         || nr == libc::SYS_renameat2 || nr == libc::SYS_linkat
-        || Some(nr) == arch::sys_mkdir() || Some(nr) == arch::sys_rmdir()
+        || Some(nr) == arch::sys_mkdir() || Some(nr) == arch::sys_mknod()
+        || Some(nr) == arch::sys_rmdir()
         || Some(nr) == arch::sys_unlink() || Some(nr) == arch::sys_symlink()
         || Some(nr) == arch::sys_link() || Some(nr) == arch::sys_rename()
         || Some(nr) == arch::sys_renameat();
