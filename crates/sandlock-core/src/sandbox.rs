@@ -476,6 +476,12 @@ pub struct Sandbox {
     /// allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task.
     pub no_supervisor: bool,
 
+    /// Enable the per-sandbox control socket for introspection (`sandlock ps`,
+    /// `sandlock config`, etc.). Defaults to `true`. Set to `false` to skip
+    /// the runtime dir, pid file, and control-socket tokio task entirely.
+    #[serde(skip)]
+    pub control_socket: bool,
+
     // User-namespace identity (run-as uid/gid)
     pub user: Option<RunAs>,
 
@@ -581,6 +587,7 @@ impl Clone for Sandbox {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
+            control_socket: self.control_socket,
             user: self.user,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
@@ -1846,15 +1853,20 @@ impl Sandbox {
 
         // Even for --no-supervisor sandboxes, write a pid file so sandlock ps
         // can discover and list them.  The control socket is only created when
-        // a supervisor exists (inside the if-let below).
-        if no_supervisor {
+        // a supervisor exists (inside the if-let below).  Honour the
+        // control_socket opt-out knob.
+        if no_supervisor && self.control_socket {
             let sandbox_name = self.rt().name.clone();
+            let supervisor_pid = std::process::id() as i32;
             let dir = crate::control::sandbox_dir(&sandbox_name);
             if dir.exists() {
                 let _ = std::fs::remove_dir_all(&dir);
             }
             if std::fs::create_dir_all(&dir).is_ok() {
-                let _ = std::fs::write(crate::control::pid_path(&dir), format!("{}\n", pid));
+                let pid_path = crate::control::pid_path(&dir);
+                let tmp_path = dir.join(".pid.tmp");
+                let _ = std::fs::write(&tmp_path, format!("{}\n{}\n", pid, supervisor_pid));
+                let _ = std::fs::rename(&tmp_path, &pid_path);
                 self.rt_mut().control_dir = Some(dir);
             }
         }
@@ -1892,21 +1904,33 @@ impl Sandbox {
             // Best-effort: in nested sandboxes /dev/shm may be restricted by
             // the outer sandlock's landlock policy.  Warn and continue without
             // a control socket rather than failing the sandbox.
+            //
+            // Honour the control_socket opt-out knob: when false, skip the
+            // entire runtime dir + socket setup.
             let sandbox_name = self.rt().name.clone();
+            let supervisor_pid = std::process::id() as i32;
             let control_listener: Option<std::os::unix::net::UnixListener>;
-            match crate::control::setup_runtime_dir(&sandbox_name, pid) {
-                Ok((listener, control_dir)) => {
-                    self.rt_mut().control_dir = Some(control_dir);
-                    control_listener = Some(listener);
+            if self.control_socket {
+                match crate::control::setup_runtime_dir(
+                    &sandbox_name,
+                    pid,
+                    supervisor_pid,
+                ) {
+                    Ok((listener, control_dir)) => {
+                        self.rt_mut().control_dir = Some(control_dir);
+                        control_listener = Some(listener);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "sandlock: control socket setup failed for '{}': {} \
+                             (introspection unavailable for this sandbox)",
+                            sandbox_name, e
+                        );
+                        control_listener = None;
+                    }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "sandlock: control socket setup failed for '{}': {} \
-                         (introspection unavailable for this sandbox)",
-                        sandbox_name, e
-                    );
-                    control_listener = None;
-                }
+            } else {
+                control_listener = None;
             }
 
             if self.time_start.is_some() || self.random_seed.is_some() {

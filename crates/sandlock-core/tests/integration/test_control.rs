@@ -186,13 +186,15 @@ fn test_control_prunes_stale_dirs_via_cli() {
             let dir = sandlock_core::control::sandbox_dir(&name);
             assert!(dir.exists(), "runtime dir should exist: {:?}", dir);
 
-            // Read the child PID from the pid file.
+            // Read the child PID from the pid file (first line only;
+            // the file now has format child_pid\nsupervisor_pid\n).
             let pid_file = sandlock_core::control::pid_path(&dir);
             let child_pid: i32 = std::fs::read_to_string(&pid_file)
                 .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+                .lines()
+                .next()
+                .and_then(|l| l.trim().parse().ok())
+                .expect("first line of pid file should be child PID");
 
             // Kill the supervisor process (SIGKILL — no Drop cleanup).
             child.kill().expect("kill supervisor");

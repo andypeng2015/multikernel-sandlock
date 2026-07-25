@@ -3,8 +3,11 @@
 //! Every sandbox (CLI, Python SDK, embedded) gets a runtime directory under
 //! `/dev/shm/sandlock-$UID/<name>/` containing:
 //!
-//! * `pid` — single-line pid file; lets `sandlock ps` list and prune dead
-//!   sandboxes without opening the socket.
+//! * `pid` — two-line pid file (`child_pid\nsupervisor_pid\n`); lets
+//!   `sandlock ps` list and prune dead sandboxes without opening the
+//!   socket. The child PID is used for `/proc` introspection (UPTIME,
+//!   CMD); the supervisor PID owns the control socket and is used for
+//!   liveness checks.
 //! * `control.sock` — Unix stream socket bound by the supervisor before the
 //!   child is forked.  Serves the introspection wire protocol.
 //!
@@ -59,6 +62,20 @@ pub fn sock_path(dir: &Path) -> PathBuf {
     dir.join("control.sock")
 }
 
+/// Read the supervisor PID from a runtime dir's pid file.
+/// Returns `None` if the file is missing, unparseable, or in the old
+/// single-line format (backward compat: falls back to line 1).
+fn read_supervisor_pid(dir: &Path) -> Option<i32> {
+    let content = std::fs::read_to_string(pid_path(dir)).ok()?;
+    let mut lines = content.lines();
+    // Line 2 is the supervisor PID in the current format.
+    if let Some(pid) = lines.nth(1).and_then(|l| l.trim().parse().ok()) {
+        return Some(pid);
+    }
+    // Fall back to line 1 (old single-line format or corrupt file).
+    content.lines().next()?.trim().parse().ok()
+}
+
 // ============================================================
 // Runtime dir lifecycle — called from sandbox-core
 // ============================================================
@@ -67,13 +84,33 @@ pub fn sock_path(dir: &Path) -> PathBuf {
 /// control socket.  Returns the `UnixListener` (to be passed to
 /// `spawn_control_loop`) and the dir path.
 ///
-/// Must be called after the child is forked (so `pid` is known) but before
-/// `do_start` releases the child to execve.
-pub fn setup_runtime_dir(name: &str, pid: i32) -> Result<(UnixListener, PathBuf), std::io::Error> {
+/// Must be called after the child is forked (so `child_pid` is known) but
+/// before `do_start` releases the child to execve.
+///
+/// # Name collision
+///
+/// If a runtime directory already exists for `name` and its supervisor is
+/// still alive, this returns `ErrorKind::AlreadyExists`.  Stale dirs (dead
+/// supervisor) are removed and recreated.
+pub fn setup_runtime_dir(
+    name: &str,
+    child_pid: i32,
+    supervisor_pid: i32,
+) -> Result<(UnixListener, PathBuf), std::io::Error> {
     let dir = sandbox_dir(name);
 
-    // Remove any stale dir from a previous run with the same name.
+    // Check for name collision: if the dir exists and the sandbox is still
+    // alive, refuse to overwrite it.
     if dir.exists() {
+        if let Some(pid) = read_supervisor_pid(&dir) {
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("sandbox '{}' is already running (PID {})", name, pid),
+                ));
+            }
+        }
+        // Dead or unparseable — safe to remove.
         std::fs::remove_dir_all(&dir)?;
     }
     std::fs::create_dir_all(&dir)?;
@@ -85,8 +122,12 @@ pub fn setup_runtime_dir(name: &str, pid: i32) -> Result<(UnixListener, PathBuf)
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
 
-    // Write pid file.
-    std::fs::write(pid_path(&dir), format!("{}\n", pid))?;
+    // Write pid file atomically via temp + rename so list_live_sandboxes
+    // never sees a partially-written or empty pid file.
+    let pid_path = pid_path(&dir);
+    let tmp_path = dir.join(".pid.tmp");
+    std::fs::write(&tmp_path, format!("{}\n{}\n", child_pid, supervisor_pid))?;
+    std::fs::rename(&tmp_path, &pid_path)?;
 
     // Bind control socket.
     let sp = sock_path(&dir);
@@ -321,12 +362,15 @@ async fn handle_config(
     let _ = write_response(stream, &resp).await;
 }
 
-/// Write a length-prefixed JSON response.
+/// Write a length-prefixed JSON response.  Rejects bodies over 64 KB
+/// (mirrors the client-side cap in `send_control_request`).
 async fn write_response(
     stream: &mut tokio::net::UnixStream,
     resp: &ControlResponse,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
+    const MAX_RESPONSE_BYTES: usize = 65536;
+
     let body = serde_json::to_vec(resp).unwrap_or_else(|_| {
         serde_json::to_vec(&ControlResponse {
             v: 1,
@@ -336,6 +380,24 @@ async fn write_response(
         })
         .unwrap_or_default()
     });
+
+    // Cap oversized responses on the server side too.
+    let body = if body.len() > MAX_RESPONSE_BYTES {
+        serde_json::to_vec(&ControlResponse {
+            v: 1,
+            ok: false,
+            data: None,
+            err: Some(format!(
+                "response too large ({} bytes, max {})",
+                body.len(),
+                MAX_RESPONSE_BYTES
+            )),
+        })
+        .unwrap_or_default()
+    } else {
+        body
+    };
+
     let len = (body.len() as u32).to_be_bytes();
     stream.write_all(&len).await?;
     stream.write_all(&body).await?;
@@ -347,9 +409,14 @@ async fn write_response(
 // ============================================================
 
 /// Walk `/dev/shm/sandlock-$UID/` and return entries for every live sandbox.
-/// Dead sandboxes (pid file exists but process is gone) are pruned.
+/// Dead sandboxes (supervisor process is gone) are pruned.
 ///
-/// Returns `(name, pid)` pairs for live sandboxes.
+/// Returns `(name, child_pid)` pairs for live sandboxes.  The child PID is
+/// used by `sandlock ps` for `/proc/<pid>/stat` and `/proc/<pid>/cmdline`.
+///
+/// Directories younger than 2 seconds are never pruned, even if the pid
+/// file is missing or unparseable — this avoids a race with `setup_runtime_dir`
+/// which creates the dir before writing the pid file.
 pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
     let uid = unsafe { libc::getuid() };
     let root = runtime_dir_uid(uid);
@@ -363,6 +430,8 @@ pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
         Err(_) => return Ok(Vec::new()),
     };
 
+    let now = std::time::SystemTime::now();
+
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -373,31 +442,44 @@ pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
             continue;
         }
 
+        // Parse the pid file.  Format: child_pid\nsupervisor_pid\n
         let pid_file = pid_path(&dir);
         let pid_str = match std::fs::read_to_string(&pid_file) {
             Ok(s) => s,
             Err(_) => {
-                // No pid file — stale/incomplete dir, remove it.
-                let _ = std::fs::remove_dir_all(&dir);
+                // No pid file — could be a dir being set up concurrently.
+                // Don't prune if the dir was modified less than 2 seconds ago.
+                if !dir_is_recent(&dir, &now) {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
                 continue;
             }
         };
 
-        let pid: i32 = match pid_str.trim().parse() {
-            Ok(p) => p,
-            Err(_) => {
-                let _ = std::fs::remove_dir_all(&dir);
+        let mut lines = pid_str.lines();
+        let child_pid: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
+            Some(p) => p,
+            None => {
+                if !dir_is_recent(&dir, &now) {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
                 continue;
             }
         };
+        let supervisor_pid: i32 = lines
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(child_pid); // fall back to child_pid for old format
 
-        // Liveness check: kill(pid, 0) returns 0 if the process exists.
-        if unsafe { libc::kill(pid, 0) } == 0 {
+        // Liveness check: use supervisor PID since the supervisor owns
+        // the control socket.  If the supervisor is dead, the sandbox is
+        // effectively dead even if the child still runs.
+        if unsafe { libc::kill(supervisor_pid, 0) } == 0 {
             let name = match dir.file_name().and_then(|n| n.to_str()) {
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            live.push((name, pid));
+            live.push((name, child_pid));
         } else {
             // Dead: prune.
             let _ = std::fs::remove_dir_all(&dir);
@@ -407,6 +489,18 @@ pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
     // Sort by name for deterministic output.
     live.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(live)
+}
+
+/// Return true if `dir` was modified less than 2 seconds ago.
+fn dir_is_recent(dir: &Path, now: &std::time::SystemTime) -> bool {
+    if let Ok(meta) = std::fs::metadata(dir) {
+        if let Ok(mtime) = meta.modified() {
+            if let Ok(elapsed) = now.duration_since(mtime) {
+                return elapsed.as_secs() < 2;
+            }
+        }
+    }
+    false
 }
 
 // ============================================================
@@ -424,6 +518,19 @@ pub fn send_control_request(
     use std::os::unix::net::UnixStream;
 
     let dir = sandbox_dir(name);
+
+    // Check supervisor liveness before attempting connect.  If the
+    // supervisor is dead the socket is stale and connect() would fail
+    // with a confusing "No such file" — give a clearer message.
+    if let Some(pid) = read_supervisor_pid(&dir) {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return Err(format!(
+                "sandbox '{}' supervisor (PID {}) is not running",
+                name, pid
+            ));
+        }
+    }
+
     let sp = sock_path(&dir);
     let mut stream = UnixStream::connect(&sp)
         .map_err(|e| format!("connect to {:?}: {}", sp, e))?;

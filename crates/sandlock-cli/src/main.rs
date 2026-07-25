@@ -312,7 +312,8 @@ async fn main() -> Result<()> {
         }
 
         Command::Kill { name } => {
-            // Read pid from the per-sandbox pid file (no socket round-trip).
+            // Read both PIDs from the per-sandbox pid file (no socket
+            // round-trip).  Format: child_pid\nsupervisor_pid\n
             let dir = sandlock_core::control::sandbox_dir(&name);
             let pid_file = sandlock_core::control::pid_path(&dir);
             let pid_str = match std::fs::read_to_string(&pid_file) {
@@ -322,26 +323,38 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             };
-            let pid: i32 = match pid_str.trim().parse() {
-                Ok(p) => p,
-                Err(_) => {
+            let mut lines = pid_str.lines();
+            let child_pid: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
+                Some(p) => p,
+                None => {
                     eprintln!("sandlock: invalid pid file for '{}'", name);
                     std::process::exit(1);
                 }
             };
-            // Liveness check.
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                eprintln!("sandlock: sandbox '{}' (PID {}) is not running", name, pid);
+            let supervisor_pid: i32 = lines
+                .next()
+                .and_then(|l| l.trim().parse().ok())
+                .unwrap_or(child_pid); // fall back for old single-line format
+
+            // Check supervisor liveness (the process that owns the socket).
+            if unsafe { libc::kill(supervisor_pid, 0) } != 0 {
+                eprintln!(
+                    "sandlock: sandbox '{}' (supervisor PID {}) is not running",
+                    name, supervisor_pid
+                );
                 std::process::exit(1);
             }
-            let ret = unsafe { libc::killpg(pid, libc::SIGKILL) };
-            if ret == 0 {
-                println!("Killed sandbox '{}' (PID {})", name, pid);
-            } else {
-                let err = std::io::Error::last_os_error();
-                eprintln!("sandlock: failed to kill '{}' (PID {}): {}", name, pid, err);
-                std::process::exit(1);
-            }
+
+            // killpg on child_pid kills the entire process group (child +
+            // descendants).  Also signal the supervisor directly in case
+            // it's in a different process group.
+            unsafe { libc::killpg(child_pid, libc::SIGKILL) };
+            unsafe { libc::kill(supervisor_pid, libc::SIGKILL) };
+
+            println!(
+                "Killed sandbox '{}' (child PID {}, supervisor PID {})",
+                name, child_pid, supervisor_pid
+            );
         }
 
         Command::Check => {
