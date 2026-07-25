@@ -2162,6 +2162,10 @@ impl Drop for Sandbox {
 
             if let Some(ref mut cow) = rt.seccomp_cow {
                 match action {
+                    // NOTE: commit() is synchronous and blocks up to
+                    // DROP_COMMIT_LOCK_WAIT (5s) on a contended workdir before
+                    // deferring (bounded, no CPU spin). Do not drop a committing
+                    // Sandbox on an async runtime worker.
                     BranchAction::Commit => { let _ = cow.commit(); }
                     BranchAction::Abort => { let _ = cow.abort(); }
                     // Mark kept so the branch's Drop backstop preserves the upper
@@ -2236,7 +2240,7 @@ fn sandbox_read_exact(fd: i32, buf: &mut [u8]) {
 
 /// Create a `O_CLOEXEC` pipe, returning `(read_end, write_end)` as owned fds.
 /// `pipe2` yields `fds[0]` = read, `fds[1]` = write.
-fn make_cloexec_pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd), std::io::Error> {
+pub(crate) fn make_cloexec_pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd), std::io::Error> {
     use std::os::fd::{FromRawFd, OwnedFd};
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {

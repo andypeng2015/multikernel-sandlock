@@ -9,6 +9,7 @@ use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::error::BranchError;
 
@@ -237,10 +238,14 @@ pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
 /// primitive for recovering work this process (or a previous one) could not
 /// publish.
 ///
-/// `storage_base` is one `fs_storage` dir. With the default storage the base is
-/// per-process (`$TMPDIR/sandlock-cow-<pid>`), so a sweep across process
-/// lifetimes has to enumerate those bases itself; pass an explicit `fs_storage`
-/// to keep every branch under one root.
+/// `storage_base` is one `fs_storage` dir. The default storage base is now
+/// **per-user, not per-process** (`$XDG_RUNTIME_DIR/sandlock-cow`, or a secure
+/// `$TMPDIR/sandlock-cow-<uid>`), so one sweep of that base enumerates every
+/// preserved branch this user's live and dead pids left behind —
+/// [`PreservedBranch::pid`] liveness is what disambiguates an in-flight merge
+/// from a crashed one. That base is nonetheless session-scoped when it is
+/// `$XDG_RUNTIME_DIR` (logind reaps it on last-session-exit, size-limited
+/// tmpfs); a daemon or cross-session recovery MUST pin a durable `fs_storage`.
 ///
 /// Unreadable entries are skipped rather than failing the sweep: one broken
 /// branch dir must not hide the rest.
@@ -281,6 +286,185 @@ enum BranchState {
     Finished,
 }
 
+/// Choose the base directory for COW branch storage when no explicit
+/// `fs_storage` is set.
+///
+/// Prefers a per-user `$XDG_RUNTIME_DIR/sandlock-cow` — 0700, per-user, and not
+/// reaped by tmp-cleaners — but **only** when the real and effective uid are
+/// equal (`uid == euid`), i.e. no privilege change is in effect: a root/setuid
+/// process must never write a user's preserved work into their runtime dir.
+/// Gating on `euid != 0` alone was not enough — a setuid-to-non-root process
+/// (`ruid=1000, euid=1001`) would still pass it and write into ruid 1000's
+/// `$XDG_RUNTIME_DIR` (`/run/user/1000`) with files owned by euid 1001, the very
+/// cross-user write this guard exists to prevent. Otherwise it falls back to a
+/// per-uid `$TMPDIR/sandlock-cow-<uid>`
+/// so a sweep still spans that user's dead pids. The pid is deliberately gone
+/// from the base name — that is what lets [`list_preserved`] cross process
+/// lifetimes.
+///
+/// Pure: the environment is injected so the choice can be tested without racing
+/// process-global state.
+fn preferred_storage_base(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    tmp: &Path,
+    uid: u32,
+    euid: u32,
+) -> PathBuf {
+    if uid == euid {
+        if let Some(xdg) = xdg_runtime_dir {
+            if !xdg.is_empty() {
+                return PathBuf::from(xdg).join("sandlock-cow");
+            }
+        }
+    }
+    tmp_storage_base(tmp, uid)
+}
+
+/// The per-uid fallback base under `$TMPDIR`.
+fn tmp_storage_base(tmp: &Path, uid: u32) -> PathBuf {
+    tmp.join(format!("sandlock-cow-{uid}"))
+}
+
+/// Create `base` with mode 0700, or — if it already exists — require that it is
+/// a real directory (not a symlink) owned by `uid`.
+///
+/// The default base name is now durable and predictable per user, which would
+/// otherwise widen a pre-creation / symlink-swap attack: an attacker who wins
+/// the race to create `$TMPDIR/sandlock-cow-<uid>` as a symlink, or as a dir
+/// they own, could redirect or read another user's preserved uppers. Rejecting
+/// a foreign or symlinked base closes that; the caller falls back to a base it
+/// can create securely.
+fn ensure_secure_base(base: &Path, uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    match base.symlink_metadata() {
+        Ok(meta) => {
+            if !meta.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "storage base exists and is not a directory (possible symlink attack)",
+                ));
+            }
+            if meta.uid() != uid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "storage base is not owned by the current user",
+                ));
+            }
+            // create() makes the base 0700; a reused base owned by us but with any
+            // group/world bit set (0o077) was widened out from under us (or planted
+            // pre-created and mode-relaxed), which would let another user read or
+            // meddle with preserved uppers. Reject it so the caller falls back to a
+            // base it can create securely, matching create()'s "0700, owner-checked"
+            // contract.
+            if meta.mode() & 0o077 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "storage base is group- or world-accessible (expected 0700)",
+                ));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Non-recursive create on the leaf: a plain mkdir(2) fails `EEXIST` on a
+            // symlink WITHOUT following it, closing the create-through-a-planted-symlink
+            // TOCTOU that `recursive(true)` (create_dir_all, which accepts an existing
+            // symlink-to-dir) would leave open in a world-writable `$TMPDIR`. The parent
+            // (`$XDG_RUNTIME_DIR` or `$TMPDIR`) always exists, so no intermediates are
+            // needed. If someone raced us to the name, re-validate what is actually there
+            // rather than trust it: the branch above accepts a same-user directory and
+            // rejects a symlink or a foreign-owned one.
+            match fs::DirBuilder::new().mode(0o700).create(base) {
+                Ok(()) => Ok(()),
+                Err(e2) if e2.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure_secure_base(base, uid)
+                }
+                Err(e2) => Err(e2),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// ============================================================
+// Cross-process commit lock
+// ============================================================
+
+/// Default for [`crate::transaction::Transaction::commit_lock_wait`]: how long a
+/// transaction's commit merge waits for another commit to release the workdir
+/// lock before giving up. Merges are short (a file-by-file copy of one upper),
+/// so a wait this long only expires when something is genuinely wrong.
+pub(crate) const COMMIT_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// Poll interval while waiting for the commit lock. `flock` has no timed
+/// variant, so the wait is a bounded retry over the non-blocking form.
+pub(crate) const COMMIT_LOCK_POLL: Duration = Duration::from_millis(20);
+
+/// How long a plain `Sandbox`'s commit — run synchronously in `Drop` — waits on a
+/// contended workdir lock before deferring. Long enough to cover a typical
+/// concurrent merge, short enough that teardown never spins the 30s a transaction
+/// coordinator would.
+pub(crate) const DROP_COMMIT_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Why acquiring the workdir commit lock gave up, so the caller can tell
+/// contention (a conflict, worth retrying) from a broken workdir.
+#[derive(Debug)]
+pub(crate) enum LockFailure {
+    /// The lock was held by someone else for the whole wait.
+    Contended(Duration),
+    /// The workdir could not be opened, or `flock` failed for a reason other
+    /// than contention.
+    Io(std::io::Error),
+}
+
+/// Take an exclusive lock on the workdir, waiting up to `deadline_after` for a
+/// concurrent commit merge to release it. `flock` has no timed variant, so this
+/// is a bounded poll over the non-blocking form, with the poll sleep injected so
+/// a test can observe how many times — if at all — the loop actually waited.
+///
+/// The lock object is an fd on the workdir DIRECTORY inode itself (not a separate
+/// `.lock` file), so two `open()`s of the same workdir contend even within one
+/// process — which is exactly the mutual exclusion between a transaction merge
+/// and a plain-Sandbox merge that concern requires.
+pub(crate) fn acquire_commit_lock_polling(
+    workdir: &Path,
+    deadline_after: Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<std::fs::File, LockFailure> {
+    use std::os::unix::io::AsRawFd;
+    let lock = std::fs::File::open(workdir).map_err(LockFailure::Io)?;
+    let deadline = std::time::Instant::now() + deadline_after;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(lock);
+        }
+        let err = std::io::Error::last_os_error();
+        // EWOULDBLOCK (== EAGAIN on Linux) means another commit holds the lock.
+        // Any other errno is a real failure and must not be retried.
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(LockFailure::Io(err));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(LockFailure::Contended(deadline_after));
+        }
+        sleep(COMMIT_LOCK_POLL);
+    }
+}
+
+/// Why a locked commit ([`SeccompCowBranch::commit_with_lock_polling`]) could not
+/// publish the change set. The transaction coordinator maps this to a `TxnError`
+/// (it holds the workdir and preserved-upper paths); a plain `Sandbox`'s `Drop`
+/// collapses it into a `BranchError`. In every non-`Ok` case the upper has
+/// already been preserved for recovery.
+#[derive(Debug)]
+pub(crate) enum CommitError {
+    /// Another commit held the workdir lock for the whole wait.
+    Contended(Duration),
+    /// The workdir lock could not be taken for a reason other than contention.
+    Lock(std::io::Error),
+    /// The merge itself failed partway.
+    Merge(BranchError),
+}
+
 /// Seccomp-based COW branch. Redirects writes to an upper directory
 /// and tracks deletions in memory.
 pub struct SeccompCowBranch {
@@ -303,10 +487,47 @@ impl SeccompCowBranch {
     /// Create a new seccomp COW branch.
     ///
     /// `max_disk_bytes`: maximum bytes allowed in the upper directory (0 = unlimited).
+    ///
+    /// With an explicit `storage` the base is that path verbatim (the caller
+    /// owns its security). With no `storage`, the base defaults to a **stable,
+    /// per-user** location so preserved work survives and a sweep can cross a
+    /// user's dead pids: `$XDG_RUNTIME_DIR/sandlock-cow` when running unprivileged
+    /// and that dir is available, otherwise a securely-created (0700, owner-checked)
+    /// `$TMPDIR/sandlock-cow-<uid>`. `$XDG_RUNTIME_DIR` is session-scoped
+    /// (reaped by logind on last-session-exit, size-limited tmpfs), so a daemon or
+    /// cross-session recovery MUST set an explicit durable `fs_storage`. See
+    /// [`crate::recovery`].
     pub fn create(workdir: &Path, storage: Option<&Path>, max_disk_bytes: u64) -> Result<Self, BranchError> {
-        let storage_base = storage
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("sandlock-cow-{}", std::process::id())));
+        let storage_base = match storage {
+            Some(p) => p.to_path_buf(),
+            None => {
+                // No pid in the base name: the default is per-uid so a sweep
+                // spans this user's dead pids. XDG is euid-gated and the tmp
+                // fallback is created 0700 with an owner/symlink check.
+                let uid = unsafe { libc::getuid() };
+                let euid = unsafe { libc::geteuid() };
+                let tmp = std::env::temp_dir();
+                let primary = preferred_storage_base(
+                    std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                    &tmp,
+                    uid,
+                    euid,
+                );
+                match ensure_secure_base(&primary, uid) {
+                    Ok(()) => primary,
+                    // A stale/wrong-owner XDG (e.g. an inherited /run/user/0 after
+                    // de-priv) falls back to the secure tmp base rather than
+                    // hard-failing.
+                    Err(_) => {
+                        let fb = tmp_storage_base(&tmp, uid);
+                        ensure_secure_base(&fb, uid).map_err(|e| {
+                            BranchError::Operation(format!("create storage base: {e}"))
+                        })?;
+                        fb
+                    }
+                }
+            }
+        };
         let branch_id = uuid::Uuid::new_v4().to_string();
         let branch_dir = storage_base.join(&branch_id);
         let upper = branch_dir.join("upper");
@@ -1031,16 +1252,36 @@ impl SeccompCowBranch {
         entries.into_iter().collect()
     }
 
-    /// Commit: merge upper into workdir.
+    /// Commit: take the cross-process workdir lock, then merge upper into workdir.
     ///
-    /// The merge is file-by-file and not crash-atomic. If it fails
-    /// (`ENOSPC`, `EACCES`, an obstructing symlink, ...) the workdir may be left
-    /// partially merged and this returns `Err` — but the upper is **preserved**,
-    /// holding exactly what did not make it across: each change is dropped from
-    /// the upper as it lands, so after a failure `changes()` reports the
-    /// REMAINDER and not the whole run. Call `commit()` again to retry it once
-    /// the cause is cleared, or `abort()` to discard the remainder. Dropping the
-    /// branch after a failed commit does NOT reclaim it.
+    /// **Locking, blocking and the deferred-error contract.** This is the
+    /// plain-`Sandbox` commit path (also run synchronously in `Sandbox::Drop`,
+    /// which ignores this `Result`). It takes the SAME cross-process workdir lock
+    /// as a transaction merge — so the two can no longer interleave and tear each
+    /// other — but waits only `DROP_COMMIT_LOCK_WAIT` (5s) before deferring, so
+    /// teardown never spins the 30s a transaction coordinator would. Because that
+    /// wait is synchronous, `commit()` (and therefore dropping a committing
+    /// `Sandbox`) **blocks the calling thread up to `DROP_COMMIT_LOCK_WAIT` on a
+    /// contended workdir** — bounded, no CPU spin (a non-blocking `flock` polled
+    /// at `COMMIT_LOCK_POLL`): do not drop a committing `Sandbox` on an async
+    /// runtime worker. On a genuinely contended lock it preserves the upper as
+    /// `CommitDeferred` and returns `Err` rather than tearing a merge in flight;
+    /// the two lock-failure kinds map to distinct messages (contention vs a broken
+    /// workdir, the latter interpolating the io error).
+    ///
+    /// Two failure shapes, not to be conflated:
+    /// - **Contended / lock failure** (the deferral): the lock could not be taken,
+    ///   the workdir is UNTOUCHED, and the WHOLE change set is preserved as
+    ///   `CommitDeferred` (recoverable via [`crate::recovery::list_preserved`]).
+    ///   Retry by re-running the commit once the contention clears.
+    /// - **Merge failure** (`ENOSPC`, `EACCES`, an obstructing symlink, ...): the
+    ///   lock WAS held and the merge ran; the workdir may be left partially merged
+    ///   and this returns `Err`, but the upper is **preserved** holding exactly
+    ///   what did not make it across — each change is dropped from the upper as it
+    ///   lands, so afterwards `changes()` reports the REMAINDER, not the whole run.
+    ///   Call `commit()` again to retry the remainder once the cause is cleared,
+    ///   or `abort()` to discard it. Dropping the branch after a failed commit does
+    ///   NOT reclaim it.
     ///
     /// Deletions are applied first, one at a time, and each is dropped from the
     /// set as it lands; if any is still outstanding when they have all been
@@ -1077,8 +1318,102 @@ impl SeccompCowBranch {
     /// Entries are merged in sorted order, so a partial merge is a prefix of a
     /// deterministic sequence rather than an arbitrary subset.
     pub fn commit(&mut self) -> Result<(), BranchError> {
-        if self.is_disposed() { return Ok(()); }
+        self.commit_inner(DROP_COMMIT_LOCK_WAIT, std::thread::sleep)
+    }
 
+    /// The body of [`Self::commit`], with the lock-wait bound and the poll sleep
+    /// injected so a test can exercise the contended-deferral path without
+    /// actually sleeping `DROP_COMMIT_LOCK_WAIT`. Production always calls it with
+    /// [`DROP_COMMIT_LOCK_WAIT`] and the real `std::thread::sleep` via
+    /// [`Self::commit`].
+    fn commit_inner(
+        &mut self,
+        lock_wait: Duration,
+        sleep: impl FnMut(Duration),
+    ) -> Result<(), BranchError> {
+        match self.commit_with_lock_polling(lock_wait, sleep) {
+            Ok(()) => Ok(()),
+            Err(CommitError::Merge(e)) => Err(e),
+            // The upper was preserved (CommitDeferred, or a stronger reason left
+            // in place on a retry) inside `commit_with_lock_polling`; make the
+            // deferral observable so it is recoverable rather than a silent lost
+            // commit. Contention and a broken workdir are distinct — do not
+            // collapse them into one message.
+            Err(CommitError::Contended(waited)) => {
+                eprintln!(
+                    "sandlock: commit deferred: workdir lock on {} contended for {:?}; \
+                     upper preserved for recovery",
+                    self.workdir_str, waited
+                );
+                Err(BranchError::Operation(
+                    "commit deferred: workdir lock contended".into(),
+                ))
+            }
+            Err(CommitError::Lock(e)) => {
+                eprintln!(
+                    "sandlock: commit deferred: workdir lock on {} could not be taken ({}); \
+                     upper preserved for recovery",
+                    self.workdir_str, e
+                );
+                Err(BranchError::Operation(format!(
+                    "commit deferred: workdir lock error: {e}"
+                )))
+            }
+        }
+    }
+
+    /// Take the cross-process workdir lock, then merge. This is the ONE lock
+    /// layer both a transaction coordinator and a plain `Sandbox` serialize on;
+    /// no caller wraps this in a second lock, so there is no self-deadlock.
+    ///
+    /// Ordering is load-bearing:
+    /// 1. a disposed/`Kept` branch never opens the lock;
+    /// 2. the flock is taken BEFORE the branch is marked `MergeInterrupted`, so a
+    ///    contended FRESH commit is preserved as `CommitDeferred` (workdir
+    ///    untouched) and never mis-reported as a half-merge. A contended RETRY of
+    ///    a commit that already failed part way keeps its stronger
+    ///    `MergeInterrupted` marker rather than downgrading it (see
+    ///    `preserve_deferred_unless_interrupted`), so the
+    ///    `CommitDeferred <=> workdir untouched` invariant holds across retries;
+    /// 3. only with the lock held does the destructive merge run.
+    pub(crate) fn commit_with_lock_polling(
+        &mut self,
+        lock_wait: Duration,
+        sleep: impl FnMut(Duration),
+    ) -> Result<(), CommitError> {
+        if self.is_disposed() {
+            return Ok(());
+        }
+        let _lock = match acquire_commit_lock_polling(&self.workdir, lock_wait, sleep) {
+            Ok(l) => l,
+            Err(LockFailure::Contended(d)) => {
+                // On a FRESH commit the upper holds a complete, mergeable change
+                // set that only failed to be published and the workdir was never
+                // touched: that is `CommitDeferred`. But `commit()` is retryable
+                // and a retry after a partial merge is already
+                // `Preserved(MergeInterrupted)` over a HALF-MERGED workdir —
+                // downgrading it to `CommitDeferred` ("workdir untouched") would
+                // let a recovery sweep re-apply a half-merged change set. Never
+                // weaken a stronger reason; the invariant is
+                // CommitDeferred <=> workdir untouched.
+                self.preserve_deferred_unless_interrupted();
+                return Err(CommitError::Contended(d));
+            }
+            Err(LockFailure::Io(e)) => {
+                self.preserve_deferred_unless_interrupted();
+                return Err(CommitError::Lock(e));
+            }
+        };
+        // `_lock` is held across the merge and released when this scope ends.
+        self.commit_merge().map_err(CommitError::Merge)
+    }
+
+
+    /// The destructive merge of the upper into the workdir. The caller holds the
+    /// workdir lock; this marks the branch `MergeInterrupted` before its first
+    /// destructive step so a crash mid-merge still leaves a sweep something to
+    /// find.
+    fn commit_merge(&mut self) -> Result<(), BranchError> {
         // Enter the interrupted state BEFORE the first destructive operation,
         // which also puts the marker on disk before the workdir is touched, so a
         // crash mid-merge still leaves a sweep something to find. Every `?`
@@ -1323,6 +1658,21 @@ impl SeccompCowBranch {
     pub(crate) fn preserve(&mut self, reason: PreserveReason) {
         self.state = BranchState::Preserved(reason);
         let _ = self.write_preserved_marker(reason);
+    }
+
+    /// Preserve as [`PreserveReason::CommitDeferred`] on a lock failure, but only
+    /// if the branch is not already [`PreserveReason::MergeInterrupted`].
+    ///
+    /// `CommitDeferred` promises "the workdir is untouched, the whole set is
+    /// preserved"; `MergeInterrupted` means "the workdir may be half merged". A
+    /// contended retry of a commit that previously failed part way through the
+    /// merge must not overwrite the stronger, half-merged marker with the weaker
+    /// untouched one — that would tell a recovery sweep to re-apply a change set
+    /// that has already partly landed.
+    fn preserve_deferred_unless_interrupted(&mut self) {
+        if !matches!(self.state, BranchState::Preserved(PreserveReason::MergeInterrupted)) {
+            self.preserve(PreserveReason::CommitDeferred);
+        }
     }
 
     fn write_preserved_marker(&self, reason: PreserveReason) -> std::io::Result<()> {
@@ -3747,6 +4097,692 @@ mod tests {
                 (ChangeKind::Deleted, PathBuf::from("gone.txt")),
             ],
             "a kept branch must still describe what the run did",
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Concern 1: the workdir commit lock now lives INSIDE the branch
+    // ------------------------------------------------------------
+
+    /// A commit must serialize on the workdir lock: while another holder has it,
+    /// `commit_with_lock_polling` must NOT merge — it waits (the injected sleep
+    /// loop runs), then defers, preserving the whole change set as
+    /// `CommitDeferred` with the workdir untouched. On the old lock-free `commit`
+    /// this merged straight over the concurrent one and tore the workdir.
+    #[test]
+    fn commit_respects_external_workdir_lock() {
+        use std::os::unix::io::AsRawFd;
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::write(branch.upper.join("a.txt"), "plan\n").unwrap();
+
+        // Another merge in flight: hold LOCK_EX on the workdir from a second fd.
+        let held = std::fs::File::open(workdir.path()).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "test setup: could not take the workdir lock"
+        );
+
+        let mut polls = 0usize;
+        let err = branch
+            .commit_with_lock_polling(Duration::from_millis(50), |_| polls += 1)
+            .expect_err("a held workdir lock must block the commit");
+        drop(held);
+
+        assert!(matches!(err, CommitError::Contended(_)), "expected contention, got: {err:?}");
+        assert!(polls > 0, "the poll loop must actually have waited for the holder");
+        assert!(
+            !workdir.path().join("a.txt").exists(),
+            "nothing may be merged while another holder has the lock"
+        );
+        assert_eq!(
+            branch.state,
+            BranchState::Preserved(PreserveReason::CommitDeferred),
+            "a contended commit preserves the untouched change set as CommitDeferred"
+        );
+        assert_eq!(
+            std::fs::read_to_string(branch.upper.join("a.txt")).unwrap(),
+            "plan\n",
+            "the preserved upper must still hold the bytes"
+        );
+    }
+
+    /// S3: a contended RETRY of a commit that already failed part way through the
+    /// merge must NOT downgrade the on-disk `MergeInterrupted` marker to
+    /// `CommitDeferred`. `CommitDeferred` means "workdir untouched, whole set
+    /// preserved"; `MergeInterrupted` means "workdir may be half merged". A
+    /// recovery sweep that read a downgraded `CommitDeferred` over a half-merged
+    /// workdir would re-apply a partial change set. Without the guard in
+    /// `commit_with_lock_polling`, the contended retry below overwrites the marker
+    /// (and state) with `CommitDeferred`; with it, both stay `MergeInterrupted`.
+    #[test]
+    fn contended_retry_does_not_downgrade_merge_interrupted() {
+        use std::os::unix::io::AsRawFd;
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        // Obstruct the merge: a symlink in the workdir where the upper holds a
+        // regular file (fails under O_NOFOLLOW), leaving the branch half merged.
+        std::os::unix::fs::symlink("/dev/null", workdir.path().join("blocked.txt")).unwrap();
+
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let storage_dir = branch.storage_dir.clone();
+        fs::write(branch.upper.join("blocked.txt"), "payload").unwrap();
+
+        // First commit runs the merge and fails on the obstruction -> the branch
+        // is Preserved(MergeInterrupted), on disk and in memory.
+        branch.commit().expect_err("the obstructed merge must fail");
+        assert_eq!(
+            branch.state,
+            BranchState::Preserved(PreserveReason::MergeInterrupted),
+            "an obstructed merge leaves the branch MergeInterrupted",
+        );
+        assert_eq!(
+            read_preserved(&storage_dir).unwrap().reason,
+            PreserveReason::MergeInterrupted,
+            "the on-disk marker records the half-merge before the retry",
+        );
+
+        // Clear the obstruction, then contend the workdir lock so the RETRY fails
+        // at lock acquisition (before it can run the merge again).
+        fs::remove_file(workdir.path().join("blocked.txt")).unwrap();
+        let held = std::fs::File::open(workdir.path()).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "test setup: could not take the workdir lock"
+        );
+
+        let err = branch
+            .commit_with_lock_polling(Duration::from_millis(20), |_| {})
+            .expect_err("the retry must fail: the lock is held");
+        drop(held);
+
+        assert!(matches!(err, CommitError::Contended(_)), "expected contention, got: {err:?}");
+        // The invariant: the stronger reason must survive the contended retry, in
+        // memory AND on disk. A downgrade here is the S3 bug.
+        assert_eq!(
+            branch.state,
+            BranchState::Preserved(PreserveReason::MergeInterrupted),
+            "a contended retry must not downgrade MergeInterrupted in memory",
+        );
+        assert_eq!(
+            read_preserved(&storage_dir).unwrap().reason,
+            PreserveReason::MergeInterrupted,
+            "a contended retry must not downgrade the on-disk marker to CommitDeferred",
+        );
+    }
+
+    /// The single lock layer must not self-deadlock: an uncontended commit takes
+    /// the workdir flock once, merges, and succeeds — proving there is no second
+    /// lock wrapping the first (which would fail to re-acquire the same directory
+    /// flock and spin to `Contended`).
+    ///
+    /// The lock-wait is a fast bound and the poll sleep is a no-op counter, so a
+    /// self-deadlock regression fails in milliseconds rather than burning the real
+    /// wait, and the counter proves the loop never had to wait at all on the
+    /// uncontended path. This does NOT assert the lock is present — that a merge
+    /// serializes at all is `commit_wrapper_defers_and_preserves_under_contention`;
+    /// this only asserts the one lock does not deadlock on itself.
+    #[test]
+    fn commit_does_not_self_deadlock_uncontended() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::write(branch.upper.join("a.txt"), "plan\n").unwrap();
+
+        let mut polls = 0usize;
+        branch
+            .commit_with_lock_polling(Duration::from_millis(20), |_| polls += 1)
+            .expect("an uncontended commit must not deadlock on its own lock");
+        assert_eq!(polls, 0, "an uncontended commit must take the lock without waiting");
+        assert_eq!(
+            std::fs::read_to_string(workdir.path().join("a.txt")).unwrap(),
+            "plan\n",
+            "the merge must have landed"
+        );
+        assert_eq!(branch.state, BranchState::Finished, "a merged branch is Finished");
+    }
+
+    /// The thin `commit()` wrapper (the plain-Sandbox / Drop path) also
+    /// serializes: under contention it defers-and-preserves as `CommitDeferred`
+    /// and returns an error, rather than tearing a merge in flight. Driven through
+    /// `commit_inner` with an injected fast lock-wait and a no-op poll sleep so the
+    /// test does not block the real `DROP_COMMIT_LOCK_WAIT` (5s).
+    #[test]
+    fn commit_wrapper_defers_and_preserves_under_contention() {
+        use std::os::unix::io::AsRawFd;
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::write(branch.upper.join("a.txt"), "plan\n").unwrap();
+
+        let held = std::fs::File::open(workdir.path()).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "test setup: could not take the workdir lock"
+        );
+
+        let err = branch
+            .commit_inner(Duration::from_millis(20), |_| {})
+            .expect_err("a contended plain-Sandbox commit must defer, not tear the workdir");
+        drop(held);
+
+        assert!(
+            err.to_string().contains("lock contended"),
+            "a contended commit must report the contention message distinctly, got: {err}",
+        );
+        assert_eq!(
+            branch.state,
+            BranchState::Preserved(PreserveReason::CommitDeferred),
+            "the deferred commit must preserve for recovery, not reclaim"
+        );
+        assert!(!workdir.path().join("a.txt").exists(), "nothing may be merged under contention");
+        assert_eq!(
+            std::fs::read_to_string(branch.upper.join("a.txt")).unwrap(),
+            "plan\n",
+            "the preserved upper must still hold the bytes"
+        );
+    }
+
+    /// GAP-4: the Io arm of the commit lock obeys the same no-downgrade rule as the
+    /// contended arm. A branch already `Preserved(MergeInterrupted)` whose retry
+    /// cannot even OPEN the workdir (ENOENT -> `LockFailure::Io`) must keep its
+    /// stronger MergeInterrupted marker — in memory AND on disk — and leave the
+    /// upper intact, never downgrading to CommitDeferred (which would tell a sweep
+    /// the half-merged workdir is untouched). Reverting the Io arm's guard to
+    /// `preserve(CommitDeferred)` unconditionally fails this.
+    #[test]
+    fn io_lock_failure_retry_does_not_downgrade_merge_interrupted() {
+        // SEPARATE storage dir: it survives removing the workdir below.
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        // Obstruct the merge so the first commit half-merges and leaves the branch
+        // MergeInterrupted: a symlink in the workdir where the upper holds a regular
+        // file fails under O_NOFOLLOW.
+        std::os::unix::fs::symlink("/dev/null", workdir.path().join("blocked.txt")).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let storage_dir = branch.storage_dir.clone();
+        fs::write(branch.upper.join("blocked.txt"), "payload").unwrap();
+
+        branch.commit().expect_err("the obstructed merge must fail");
+        assert_eq!(
+            branch.state,
+            BranchState::Preserved(PreserveReason::MergeInterrupted),
+            "an obstructed merge leaves the branch MergeInterrupted",
+        );
+
+        // Remove the workdir so the RETRY's File::open(workdir) is ENOENT -> Io, not
+        // contention.
+        fs::remove_dir_all(workdir.path()).unwrap();
+
+        let err = branch
+            .commit_with_lock_polling(Duration::from_millis(20), |_| {})
+            .expect_err("a workdir that cannot be opened fails the retry with Io");
+        assert!(
+            matches!(err, CommitError::Lock(_)),
+            "a missing workdir is an Io lock failure, got: {err:?}",
+        );
+        assert_eq!(
+            branch.state,
+            BranchState::Preserved(PreserveReason::MergeInterrupted),
+            "the Io retry must not downgrade MergeInterrupted in memory",
+        );
+        assert_eq!(
+            read_preserved(&storage_dir).unwrap().reason,
+            PreserveReason::MergeInterrupted,
+            "the Io retry must not downgrade the on-disk marker to CommitDeferred",
+        );
+        assert_eq!(
+            fs::read_to_string(branch.upper.join("blocked.txt")).unwrap(),
+            "payload",
+            "the unmerged upper must stay intact across the failed retry",
+        );
+    }
+
+    /// GAP-5: a disposed branch (Kept, or Finished) short-circuits the commit
+    /// BEFORE it touches the workdir lock. Even with an external LOCK_EX held on the
+    /// workdir, commit returns Ok(()) without a single poll and leaves the state
+    /// unchanged. This pins the `is_disposed()`-before-lock ordering: moving the
+    /// check after acquisition would block on the held lock and return
+    /// Err(Contended).
+    #[test]
+    fn disposed_branch_commits_ok_under_external_lock_without_polling() {
+        use std::os::unix::io::AsRawFd;
+
+        for kept in [true, false] {
+            let workdir = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let mut branch =
+                SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+            fs::write(branch.upper.join("a.txt"), "plan\n").unwrap();
+            let expected_state = if kept {
+                branch.keep();
+                BranchState::Preserved(PreserveReason::Kept)
+            } else {
+                branch.abort().unwrap();
+                BranchState::Finished
+            };
+
+            // Hold the workdir lock externally, as a concurrent merge would.
+            let held = std::fs::File::open(workdir.path()).unwrap();
+            assert_eq!(
+                unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0,
+                "test setup: could not take the workdir lock"
+            );
+
+            let mut polls = 0usize;
+            let started = std::time::Instant::now();
+            branch
+                .commit_with_lock_polling(Duration::from_millis(20), |_| polls += 1)
+                .expect("a disposed branch must commit-Ok without touching the lock");
+            let elapsed = started.elapsed();
+            drop(held);
+
+            assert_eq!(polls, 0, "a disposed branch must not poll the workdir lock (kept={kept})");
+            assert!(elapsed < Duration::from_secs(1), "must return at once, took {elapsed:?}");
+            assert_eq!(branch.state, expected_state, "disposition must be unchanged (kept={kept})");
+        }
+    }
+
+    /// GAP-9: the `commit()` wrapper maps an Io lock failure to a message DISTINCT
+    /// from the contended one ("commit deferred: workdir lock error:" vs
+    /// "... lock contended"), and preserves as CommitDeferred. Collapsing the two
+    /// arms into one message would fail this.
+    #[test]
+    fn wrapper_maps_lock_io_to_distinct_message() {
+        // Separate storage: survives removing the workdir below.
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::write(branch.upper.join("a.txt"), "plan\n").unwrap();
+
+        // Remove the workdir so the lock's File::open is ENOENT -> Io (not contention).
+        fs::remove_dir_all(workdir.path()).unwrap();
+
+        let err = branch
+            .commit_inner(Duration::from_millis(20), |_| {})
+            .expect_err("a workdir that cannot be opened fails the commit");
+        assert!(
+            err.to_string().contains("commit deferred: workdir lock error:"),
+            "the Io lock failure must map to its own distinct message, got: {err}",
+        );
+        assert!(
+            !err.to_string().contains("lock contended"),
+            "the Io message must not be the contended one, got: {err}",
+        );
+        assert_eq!(
+            branch.state,
+            BranchState::Preserved(PreserveReason::CommitDeferred),
+            "a fresh Io-deferred commit preserves as CommitDeferred",
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Concern 2: stable, per-user, securely-created default storage base
+    // ------------------------------------------------------------
+
+    /// The default base is per-user (no pid), XDG only when the real and
+    /// effective uid match (no privilege change in effect), and falls back to a
+    /// per-uid `$TMPDIR` base otherwise.
+    #[test]
+    fn preferred_storage_base_euid_gated_and_per_uid() {
+        let tmp = Path::new("/tmp");
+        let xdg = std::ffi::OsStr::new("/run/user/1000");
+
+        // real == effective + XDG present -> the XDG base.
+        assert_eq!(
+            preferred_storage_base(Some(xdg), tmp, 1000, 1000),
+            PathBuf::from("/run/user/1000/sandlock-cow"),
+        );
+        // A setuid-to-non-root process (ruid=1000, euid=1001) -> the per-uid tmp
+        // base, NEVER the XDG path: it must not write euid-owned files into
+        // ruid's `$XDG_RUNTIME_DIR` (/run/user/1000). This is the S2 regression:
+        // the old `euid != 0` gate wrongly returned the XDG base here.
+        assert_eq!(
+            preferred_storage_base(Some(xdg), tmp, 1000, 1001),
+            PathBuf::from("/tmp/sandlock-cow-1000"),
+        );
+        // A setuid-to-root process (ruid=1000, euid=0) -> the per-uid tmp base:
+        // real != effective, so no XDG write as root into a user's runtime dir.
+        assert_eq!(
+            preferred_storage_base(Some(xdg), tmp, 1000, 0),
+            PathBuf::from("/tmp/sandlock-cow-1000"),
+        );
+        // Empty / absent XDG -> the per-uid tmp base.
+        assert_eq!(
+            preferred_storage_base(Some(std::ffi::OsStr::new("")), tmp, 1000, 1000),
+            PathBuf::from("/tmp/sandlock-cow-1000"),
+        );
+        assert_eq!(
+            preferred_storage_base(None, tmp, 1000, 1000),
+            PathBuf::from("/tmp/sandlock-cow-1000"),
+        );
+    }
+
+    /// A foreign-owned or symlinked base is rejected (closing the predictable-name
+    /// pre-creation / symlink-swap attack the durable name would widen); a base we
+    /// create is 0700, and the check is idempotent on our own dir.
+    #[test]
+    fn ensure_secure_base_rejects_foreign_or_symlink_base() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = unsafe { libc::getuid() };
+        let root = tempfile::tempdir().unwrap();
+
+        // A symlink where the base should be is rejected.
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let linkbase = root.path().join("link-base");
+        std::os::unix::fs::symlink(&target, &linkbase).unwrap();
+        assert!(
+            ensure_secure_base(&linkbase, uid).is_err(),
+            "a symlinked base must be rejected"
+        );
+
+        // A base we create is accepted and is 0700; re-checking it is idempotent.
+        let fresh = root.path().join("fresh-base");
+        ensure_secure_base(&fresh, uid).expect("a base we create must be accepted");
+        let mode = fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a freshly-created base must be 0700, got {mode:o}");
+        ensure_secure_base(&fresh, uid).expect("an existing owned dir must still be accepted");
+
+        // A reused base owned by us but widened to group/world access is rejected
+        // (N4): create()'s contract is 0700, and a relaxed mode could expose
+        // preserved uppers to another user.
+        let widened = root.path().join("widened-base");
+        fs::create_dir(&widened).unwrap();
+        fs::set_permissions(&widened, fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(
+            ensure_secure_base(&widened, uid).is_err(),
+            "a group/world-accessible owned base must be rejected"
+        );
+
+        // A base not owned by the EXPECTED uid is rejected. We own `owned`, so
+        // asking for it as uid+1 fails the ownership check without needing root.
+        let owned = root.path().join("owned");
+        fs::create_dir(&owned).unwrap();
+        assert!(
+            ensure_secure_base(&owned, uid.wrapping_add(1)).is_err(),
+            "a base not owned by the expected uid must be rejected"
+        );
+    }
+
+    /// GAP-7: `ensure_secure_base` creates only the LEAF, never intermediates. A
+    /// base under a MISSING parent fails with ENOENT and does NOT fabricate the
+    /// parent — substituting `create_dir_all` for the non-recursive mkdir would
+    /// create `missing/` and succeed, failing this.
+    #[test]
+    fn ensure_secure_base_does_not_create_intermediates() {
+        let uid = unsafe { libc::getuid() };
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let leaf = missing.join("child");
+
+        let err = ensure_secure_base(&leaf, uid)
+            .expect_err("a base under a missing parent cannot be created non-recursively");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "expected ENOENT, got: {err:?}");
+        assert!(!missing.exists(), "the missing parent must NOT be fabricated");
+        assert!(!leaf.exists(), "the leaf must not exist either");
+    }
+
+    /// GAP-11: a stat error OTHER than NotFound is PROPAGATED, not read as "absent,
+    /// create it". A parent dir with mode 0o000 makes `symlink_metadata` on a child
+    /// fail with EACCES, which must surface as Err. Skipped as root, where mode bits
+    /// are ignored.
+    #[test]
+    fn ensure_secure_base_propagates_non_notfound_stat_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = unsafe { libc::getuid() };
+        if uid == 0 {
+            eprintln!("skipped: root ignores mode bits");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("noaccess");
+        fs::create_dir(&parent).unwrap();
+        let leaf = parent.join("child");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = ensure_secure_base(&leaf, uid);
+
+        // Restore before asserting so a failure cannot leave an unremovable tree.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        let err = result.expect_err("a non-NotFound stat error must propagate");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "EACCES must not be collapsed into NotFound, got: {err:?}",
+        );
+    }
+
+    /// GAP-6: the NotFound -> create -> AlreadyExists -> recurse arm re-validates
+    /// and REJECTS a planted symlink rather than failing open. This arm is only
+    /// reachable by a create race (lstat sees the leaf absent, then mkdir loses the
+    /// race and returns EEXIST), so it is driven by racing a planter thread that
+    /// spams `symlink(base)`.
+    ///
+    /// The invariant is sound regardless of which arm wins: after the planter is
+    /// joined nothing else touches `base` (the planter only ever calls `symlink`,
+    /// which cannot replace a directory), so if `base` is then a symlink,
+    /// `ensure_secure_base` MUST have returned Err — the first arm and the recurse
+    /// arm both reject a symlink. Mutating the recurse arm to `Ok(())` makes the
+    /// recurse-arm iterations return Ok while `base` is a symlink, failing this.
+    #[test]
+    fn ensure_secure_base_revalidates_on_create_race() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let uid = unsafe { libc::getuid() };
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let base = root.path().join("racy-base");
+
+        let mut saw_symlink_outcome = false;
+        for _ in 0..3000 {
+            let _ = fs::remove_dir_all(&base);
+            let _ = fs::remove_file(&base);
+
+            let go = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (pg, ps, pb, pt) = (go.clone(), stop.clone(), base.clone(), target.clone());
+            let planter = std::thread::spawn(move || {
+                while !pg.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                // Spam the symlink so it can land in the tiny window between the
+                // function's lstat and its mkdir (the recurse arm), as well as
+                // before the lstat (the first arm). `symlink` fails EEXIST once
+                // anything is there, so it never replaces a dir the function made.
+                while !ps.load(Ordering::Acquire) {
+                    let _ = std::os::unix::fs::symlink(&pt, &pb);
+                }
+            });
+
+            go.store(true, Ordering::Release);
+            let result = ensure_secure_base(&base, uid);
+            stop.store(true, Ordering::Release);
+            planter.join().unwrap();
+
+            // Race-free now: the planter has stopped and `base` is stable.
+            let is_symlink =
+                base.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false);
+            if is_symlink {
+                saw_symlink_outcome = true;
+                assert!(
+                    result.is_err(),
+                    "a base that is a symlink must be rejected, however the race landed",
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_file(&base);
+        assert!(
+            saw_symlink_outcome,
+            "the planter never won the race in 3000 attempts; the arm was not exercised",
+        );
+    }
+
+    /// GAP-8: when the XDG primary base cannot be secured, `create(None)` falls back
+    /// to the secure per-uid `$TMPDIR/sandlock-cow-<uid>` base — and if THAT also
+    /// cannot be secured, it HARD-ERRORS rather than silently using an insecure
+    /// base.
+    #[test]
+    fn create_falls_back_to_tmp_when_xdg_base_is_foreign() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = unsafe { libc::getuid() };
+        let euid = unsafe { libc::geteuid() };
+        if uid != euid {
+            eprintln!("skipped: the XDG base is only chosen when uid == euid");
+            return;
+        }
+
+        // Restore env on scope exit, even on panic.
+        struct EnvGuard {
+            xdg: Option<std::ffi::OsString>,
+            tmp: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.xdg {
+                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
+                }
+                match &self.tmp {
+                    Some(v) => std::env::set_var("TMPDIR", v),
+                    None => std::env::remove_var("TMPDIR"),
+                }
+            }
+        }
+        let _guard = EnvGuard {
+            xdg: std::env::var_os("XDG_RUNTIME_DIR"),
+            tmp: std::env::var_os("TMPDIR"),
+        };
+
+        let xdg_root = tempfile::tempdir().unwrap();
+        let tmp_root = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", xdg_root.path());
+        std::env::set_var("TMPDIR", tmp_root.path());
+        assert_eq!(std::env::temp_dir(), tmp_root.path(), "TMPDIR must drive temp_dir()");
+
+        // Plant $XDG/sandlock-cow (the primary) group/world-accessible -> insecure.
+        let foreign_primary = xdg_root.path().join("sandlock-cow");
+        fs::create_dir(&foreign_primary).unwrap();
+        fs::set_permissions(&foreign_primary, fs::Permissions::from_mode(0o777)).unwrap();
+
+        // create(None) must fall back to the secure per-uid tmp base.
+        let workdir = tempfile::tempdir().unwrap();
+        let branch = SeccompCowBranch::create(workdir.path(), None, 0).unwrap();
+        let tmp_base = tmp_root.path().join(format!("sandlock-cow-{uid}"));
+        assert_eq!(
+            branch.storage_dir.parent().unwrap(),
+            tmp_base,
+            "an insecure XDG base must fall back to the secure per-uid tmp base",
+        );
+        drop(branch); // reclaim the branch dir; the tmp base dir itself remains 0700
+
+        // Now make the tmp fallback ALSO insecure: create(None) must HARD-ERROR,
+        // never silently land on an insecure base.
+        fs::set_permissions(&tmp_base, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = match SeccompCowBranch::create(workdir.path(), None, 0) {
+            Ok(_) => panic!("both bases insecure must be a hard error, not a silent insecure base"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, BranchError::Operation(_)),
+            "expected a create-storage-base error, got: {err:?}",
+        );
+
+        // Clean the widened dirs so they do not leak into the next test.
+        let _ = fs::remove_dir_all(&foreign_primary);
+        let _ = fs::remove_dir_all(&tmp_base);
+    }
+
+    /// One sweep of the per-uid default base spans MULTIPLE pids' preserved work —
+    /// the point of dropping the pid from the base name — AND the base a real
+    /// `create(None)` actually chooses is that per-user base, carrying no pid
+    /// component.
+    ///
+    /// The base-selection half is load-bearing for the None-arm of `create`:
+    /// reverting it to a per-pid base name (e.g. `sandlock-cow-<pid>`) makes the
+    /// chosen base's parent differ from `preferred_storage_base(...)` and puts the
+    /// pid back into the base, failing the assertions below. The old form of this
+    /// test never called `create(None)` at all, so that revert could not fail it.
+    #[test]
+    fn list_preserved_default_base_spans_pids() {
+        let uid = unsafe { libc::getuid() };
+        let euid = unsafe { libc::geteuid() };
+
+        // A real create(None) chooses the per-user default base, not a per-pid one.
+        // Mirror create()'s selection exactly (same XDG-vs-tmp decision) so the
+        // expectation tracks it, then assert the branch dir's parent IS that base
+        // and that the base has NO pid component.
+        let tmp = std::env::temp_dir();
+        let primary = preferred_storage_base(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            &tmp,
+            uid,
+            euid,
+        );
+        let expected_base = if ensure_secure_base(&primary, uid).is_ok() {
+            primary
+        } else {
+            tmp_storage_base(&tmp, uid)
+        };
+        let workdir = tempfile::tempdir().unwrap();
+        let branch = SeccompCowBranch::create(workdir.path(), None, 0).unwrap();
+        let chosen_base = branch.storage_dir.parent().unwrap();
+        assert_eq!(
+            chosen_base, expected_base,
+            "create(None) must store under the per-user default base",
+        );
+        let pid = std::process::id().to_string();
+        assert!(
+            !chosen_base.components().any(|c| c.as_os_str() == pid.as_str()),
+            "the default base must carry NO pid component, got {}",
+            chosen_base.display(),
+        );
+        assert!(
+            !chosen_base.to_string_lossy().contains(&pid),
+            "the default base name must not embed the pid, got {}",
+            chosen_base.display(),
+        );
+        drop(branch); // reclaim the branch dir created under the shared default base
+
+        // The sweep half: two markers with different pids under one per-uid base
+        // (forced to the tmp fallback under a private root) are both found by a
+        // single sweep — pid liveness disambiguates them, not the base name.
+        let sweep_tmp = tempfile::tempdir().unwrap();
+        let base = preferred_storage_base(None, sweep_tmp.path(), uid, euid);
+        ensure_secure_base(&base, uid).unwrap();
+        for (i, pid) in [111u32, 222u32].into_iter().enumerate() {
+            let bd = base.join(format!("branch-{i}"));
+            fs::create_dir_all(bd.join("upper")).unwrap();
+            fs::write(
+                bd.join(PRESERVED_MARKER),
+                format!(
+                    "reason=commit-deferred\nworkdir=/wd{i}\nupper={}\npid={pid}\n",
+                    bd.join("upper").display()
+                ),
+            )
+            .unwrap();
+        }
+
+        let mut pids: Vec<u32> = list_preserved(&base).into_iter().map(|p| p.pid).collect();
+        pids.sort();
+        assert_eq!(
+            pids,
+            vec![111, 222],
+            "one sweep of the per-uid base must span both pids"
         );
     }
 }

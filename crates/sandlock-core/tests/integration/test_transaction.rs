@@ -6,7 +6,7 @@
 //! inter-stage pipes.
 
 use sandlock_core::sandbox::BranchAction;
-use sandlock_core::{AbortReason, ChangeKind, Sandbox, Stage, Transaction, TxnError};
+use sandlock_core::{AbortReason, ChangeKind, Sandbox, Stage, Transaction, TxnDisposition, TxnError};
 use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -67,8 +67,7 @@ async fn test_txn_commits_on_success() {
     .await
     .expect("transaction should run");
 
-    assert!(outcome.committed, "transaction should commit; abort_reason: {:?}", outcome.abort_reason);
-    assert!(outcome.abort_reason.is_none(), "a committed transaction has no abort reason");
+    assert!(outcome.committed(), "transaction should commit; disposition: {:?}", outcome.disposition);
     assert_eq!(outcome.stages.len(), 3, "all three stages should have run");
     assert!(workdir.join("a.txt").exists(), "a.txt must be committed to workdir");
     assert!(workdir.join("b.txt").exists(), "b.txt must be committed to workdir");
@@ -107,10 +106,10 @@ async fn test_txn_stage_can_exec_what_an_earlier_stage_created() {
     .expect("transaction should run");
 
     assert_eq!(
-        outcome.abort_reason, None,
+        outcome.disposition, TxnDisposition::Committed,
         "a stage must be able to exec a file an earlier stage created in the shared upper",
     );
-    assert!(outcome.committed, "the transaction should have committed");
+    assert!(outcome.committed(), "the transaction should have committed");
     assert!(workdir.join("x.sh").exists(), "x.sh must be committed to the workdir");
 
     let _ = fs::remove_dir_all(&workdir);
@@ -190,9 +189,9 @@ async fn test_txn_waits_for_a_concurrent_commit_lock() {
 
     let outcome = txn.await.expect("transaction should run");
     assert!(
-        outcome.committed,
-        "a transaction must wait out a concurrent commit, not lose its work; abort_reason: {:?}",
-        outcome.abort_reason
+        outcome.committed(),
+        "a transaction must wait out a concurrent commit, not lose its work; disposition: {:?}",
+        outcome.disposition
     );
     assert_eq!(fs::read_to_string(workdir.join("a.txt")).unwrap(), "plan\n");
     assert_eq!(fs::read_to_string(workdir.join("b.txt")).unwrap(), "built\n");
@@ -411,12 +410,12 @@ async fn test_txn_aborts_on_stage_failure() {
     .await
     .expect("transaction should run");
 
-    assert!(!outcome.committed, "a failing stage must abort the transaction");
+    assert!(!outcome.committed(), "a failing stage must abort the transaction");
     // The reason is typed: a caller can tell WHICH stage failed and how, with no
     // string matching.
     assert_eq!(
-        outcome.abort_reason,
-        Some(AbortReason::StageFailed {
+        outcome.disposition,
+        TxnDisposition::Aborted(AbortReason::StageFailed {
             index: 2,
             status: sandlock_core::ExitStatus::Code(1),
         }),
@@ -457,7 +456,7 @@ async fn test_txn_reclaims_upper() {
         Stage::new(&policy, &["sh", "-c", "exit 1"]),
     ])
     .run(None).await.expect("transaction should run");
-    assert!(!aborted.committed);
+    assert!(!aborted.committed());
     assert_eq!(branch_count(&storage), 0, "aborted transaction must reclaim its upper from the storage dir");
 
     // Commit path: also reclaimed after the merge.
@@ -466,7 +465,7 @@ async fn test_txn_reclaims_upper() {
         Stage::new(&policy, &["sh", "-c", "cat b.txt"]),
     ])
     .run(None).await.expect("transaction should run");
-    assert!(committed.committed);
+    assert!(committed.committed());
     assert_eq!(branch_count(&storage), 0, "committed transaction must reclaim its upper from the storage dir");
 
     let _ = fs::remove_dir_all(&workdir);
@@ -494,8 +493,8 @@ async fn test_txn_timeout_aborts_and_keeps_completed_stage_results() {
     .await
     .expect("transaction should run");
 
-    assert!(!outcome.committed, "a timed-out transaction must abort");
-    assert_eq!(outcome.abort_reason, Some(AbortReason::TimedOut));
+    assert!(!outcome.committed(), "a timed-out transaction must abort");
+    assert_eq!(outcome.disposition, TxnDisposition::Aborted(AbortReason::TimedOut));
     assert_eq!(
         outcome.stages.len(),
         1,
@@ -503,6 +502,90 @@ async fn test_txn_timeout_aborts_and_keeps_completed_stage_results() {
     );
     assert!(outcome.stages[0].success(), "the completed stage exited 0");
     assert!(!workdir.join("a.txt").exists(), "a.txt must NOT leak after a timeout abort");
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// S1: a stage that exits non-zero but leaves a BACKGROUNDED descendant holding
+/// its stderr pipe's write end must still abort as `StageFailed` carrying "boom",
+/// and return PROMPTLY — not hang on the drain (which waits for stderr EOF) and not
+/// be mis-reported as `TimedOut`.
+///
+/// The survivor is a NO-EXECVE shell-builtin busy loop in a backgrounded subshell
+/// (`(while :; do :; done) & echo boom 1>&2; exit 1`). This matters on THIS cage:
+/// a backgrounded `sleep` (the spec's prose scenario) is an exec'd child that
+/// returns `ENOSYS` here and so never survives to hold the pipe — the test would
+/// then pass even with the fix absent, testing nothing. A subshell running `:`
+/// (`fork`, no `execve`) really does survive, inherits the stage's fd 2 (the stderr
+/// pipe), and outlives the direct `sh`, which exits 1 immediately.
+///
+/// Without the post-`wait()` process-group kill (`let _ = sb.kill();`), the pipe's
+/// write end stays open after the direct `sh` is reaped — there is no PID namespace
+/// to reap the lingering subshell — so the drain (which reads to EOF, i.e. until
+/// EVERY fd-2 holder closes) blocks. This drain runs AFTER the stage phase's
+/// timeout has already been satisfied by `wait()` returning, so the transaction's
+/// own 8s deadline does not fail it fast; the blocked drain is effectively
+/// unbounded. The harness-level `tokio::time::timeout(15s)` below is therefore
+/// mandatory: without the fix it trips and the test fails as a caught regression,
+/// instead of hanging CI. With the fix, `kill()` SIGKILLs the stage's whole
+/// process group, the pipe reaches EOF, and the run returns `StageFailed` in
+/// milliseconds. Runs on a multi-threaded runtime, as the real runner does (the
+/// notify supervisor and the blocking drain each want a thread, and a lingering
+/// supervised descendant must not starve the timer).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_txn_stage_failure_is_not_masked_by_a_backgrounded_descendant() {
+    if !sandbox_available().await {
+        eprintln!("backgrounded-descendant test skipped: sandbox unavailable");
+        return;
+    }
+    let workdir = temp_dir("bg_descendant");
+    // Grant /dev/null on top of the base policy: a POSIX shell redirects a
+    // backgrounded job's stdin from /dev/null, so without it the descendant never
+    // launches and never holds the stderr pipe — the scenario this test needs.
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev/null")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .build()
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    // The harness timeout is the fail-fast backstop for the "drain hangs" regression
+    // (see the docstring): a broken fix trips it instead of hanging the suite.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(15),
+        Transaction::new([
+            Stage::new(&policy, &["sh", "-c", "true"]),
+            Stage::new(
+                &policy,
+                &["sh", "-c", "(while :; do :; done) & echo boom 1>&2; exit 1"],
+            ),
+        ])
+        .run(Some(Duration::from_secs(8))),
+    )
+    .await
+    .expect("the drain must not hang: kill() must release the backgrounded fd-2 holder")
+    .expect("transaction should run");
+    let elapsed = start.elapsed();
+
+    assert!(!outcome.committed(), "a failing stage must abort the transaction");
+    assert_eq!(
+        outcome.disposition,
+        TxnDisposition::Aborted(AbortReason::StageFailed {
+            index: 1,
+            status: sandlock_core::ExitStatus::Code(1),
+        }),
+        "the stage's own failure must be reported, not TimedOut from a hung drain",
+    );
+    assert_eq!(outcome.stages.len(), 2, "both stages' results must be recorded");
+    let stderr = String::from_utf8_lossy(outcome.stages[1].stderr.as_deref().unwrap_or(&[]));
+    assert!(stderr.contains("boom"), "the failing stage's stderr must be captured, got: {stderr:?}");
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "must return promptly once the stage exits, not wait out the deadline; took {elapsed:?}",
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -525,7 +608,7 @@ async fn test_txn_reports_changes_on_commit_and_abort() {
         Stage::new(&p_c, &["sh", "-c", "echo after > existing.txt"]),
     ])
     .run(None).await.expect("transaction should run");
-    assert!(committed.committed, "abort_reason: {:?}", committed.abort_reason);
+    assert!(committed.committed(), "disposition: {:?}", committed.disposition);
 
     let mut got: Vec<(ChangeKind, String)> = committed
         .changes
@@ -550,7 +633,7 @@ async fn test_txn_reports_changes_on_commit_and_abort() {
         Stage::new(&p_a, &["sh", "-c", "exit 1"]),
     ])
     .run(None).await.expect("transaction should run");
-    assert!(!aborted.committed);
+    assert!(!aborted.committed());
     assert_eq!(
         aborted.changes.iter().map(|c| c.path.display().to_string()).collect::<Vec<_>>(),
         vec!["added.txt".to_string()],
@@ -582,8 +665,8 @@ async fn test_txn_dry_run_reports_without_committing() {
     .await
     .expect("dry run should run");
 
-    assert!(!outcome.committed, "a dry run must never commit");
-    assert_eq!(outcome.abort_reason, Some(AbortReason::DryRun));
+    assert!(!outcome.committed(), "a dry run must never commit");
+    assert_eq!(outcome.disposition, TxnDisposition::DryRun);
     assert_eq!(outcome.stages.len(), 2, "a dry run still runs every stage");
     let mut paths: Vec<String> = outcome.changes.iter().map(|c| c.path.display().to_string()).collect();
     paths.sort();
@@ -773,10 +856,10 @@ async fn test_txn_aborts_on_first_stage_failure() {
     ])
     .run(None).await.expect("transaction should run");
 
-    assert!(!outcome.committed, "first-stage failure must abort");
+    assert!(!outcome.committed(), "first-stage failure must abort");
     assert_eq!(
-        outcome.abort_reason,
-        Some(AbortReason::StageFailed { index: 0, status: sandlock_core::ExitStatus::Code(1) }),
+        outcome.disposition,
+        TxnDisposition::Aborted(AbortReason::StageFailed { index: 0, status: sandlock_core::ExitStatus::Code(1) }),
     );
     assert_eq!(outcome.stages.len(), 1, "transaction must stop at the failed stage — later stages must not run");
     assert!(!workdir.join("a.txt").exists(), "a.txt must NOT leak after abort");
@@ -811,7 +894,7 @@ async fn test_txn_timeout_reclaims_upper() {
     .run(Some(Duration::from_millis(600)))
     .await
     .expect("transaction should run");
-    assert!(!outcome.committed, "timed-out transaction must abort");
+    assert!(!outcome.committed(), "timed-out transaction must abort");
     assert_eq!(branch_count(&storage), 0, "timed-out transaction must reclaim its upper from the storage dir");
 
     let _ = fs::remove_dir_all(&workdir);
@@ -839,7 +922,7 @@ async fn test_txn_deletion_commit_applies_abort_preserves() {
     .run(None)
     .await
     .expect("transaction should run");
-    assert!(committed.committed, "commit expected; abort_reason: {:?}", committed.abort_reason);
+    assert!(committed.committed(), "commit expected; disposition: {:?}", committed.disposition);
     assert!(!wd_c.join("keep.txt").exists(), "committed deletion must remove keep.txt from the workdir");
     assert_eq!(
         committed.changes.iter().map(|c| (c.kind.clone(), c.path.display().to_string())).collect::<Vec<_>>(),
@@ -858,7 +941,7 @@ async fn test_txn_deletion_commit_applies_abort_preserves() {
     .run(None)
     .await
     .expect("transaction should run");
-    assert!(!aborted.committed, "abort expected");
+    assert!(!aborted.committed(), "abort expected");
     assert_eq!(
         fs::read_to_string(wd_a.join("keep.txt")).unwrap(), "orig\n",
         "aborted deletion must leave keep.txt intact in the workdir",
@@ -1066,17 +1149,133 @@ fn parent_fd(n: i32) -> PathBuf {
         .unwrap_or_else(|e| panic!("test setup: the parent has no fd {n}: {e}"))
 }
 
-/// Stages inherit the parent's stdin, stdout and stderr — they are not connected
-/// to each other by pipes, and nothing is captured into their results.
+/// A failing stage's stderr is captured into its `RunResult`, indexed by the
+/// same `StageFailed.index` the abort carries — so an SDK caller gets the
+/// diagnostic without redirection boilerplate. Before per-stage capture,
+/// `stages[i].stderr` was always `None`, so this assertion could not hold.
+///
+/// This pins capture, NOT the cap: the payload is a few bytes and never reaches
+/// `STAGE_STDERR_CAP`. The end-to-end proof that the cap is wired is
+/// `test_txn_stage_stderr_is_capped_and_tail_biased`.
+#[tokio::test]
+async fn test_txn_stages_capture_stderr() {
+    if !sandbox_available().await {
+        eprintln!("stderr-capture test skipped: sandbox unavailable");
+        return;
+    }
+    let workdir = temp_dir("stderr-capture");
+    let policy = stage_policy(&workdir);
+
+    let outcome = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
+        Stage::new(&policy, &["sh", "-c", "echo boom 1>&2; exit 1"]),
+    ])
+    .run(None)
+    .await
+    .expect("transaction should run");
+
+    assert_eq!(
+        outcome.disposition,
+        TxnDisposition::Aborted(AbortReason::StageFailed {
+            index: 1,
+            status: sandlock_core::ExitStatus::Code(1),
+        }),
+        "the failing stage aborts the transaction",
+    );
+    assert_eq!(
+        outcome.stages[1].stderr.as_deref(),
+        Some(b"boom\n".as_slice()),
+        "the failing stage's stderr must be captured at stages[StageFailed.index]",
+    );
+    // Every stage that RAN carries captured stderr — a stage that emitted nothing
+    // is `Some(empty)`, not `None`.
+    assert_eq!(
+        outcome.stages[0].stderr.as_deref(),
+        Some(b"".as_slice()),
+        "a stage that wrote no stderr still carries a captured (empty) buffer",
+    );
+    // GAP-12: fd 1 stays inherited on the abort path too, so there is nothing to
+    // capture — stdout is `None`, never `Some(empty)`.
+    assert!(
+        outcome.stages[1].stdout.is_none(),
+        "a stage's stdout stays inherited (None) even when it aborts: {:?}",
+        outcome.stages[1],
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// GAP-1: a stage that floods more than `STAGE_STDERR_CAP` (64 KiB) to stderr has
+/// its capture CAPPED and tail-biased. This is the only end-to-end proof that
+/// `run_txn` wires the stage drain through `drain_capped_tee(STAGE_STDERR_CAP)`:
+/// reverting the cap to unbounded captures the whole flood and fails the length
+/// and marker assertions below.
+#[tokio::test]
+async fn test_txn_stage_stderr_is_capped_and_tail_biased() {
+    if !sandbox_available().await {
+        eprintln!("stderr-cap test skipped: sandbox unavailable");
+        return;
+    }
+    // Kept in sync with the private `transaction::STAGE_STDERR_CAP`.
+    const CAP: usize = 64 * 1024;
+    let workdir = temp_dir("stderr-cap");
+    let policy = stage_policy(&workdir);
+
+    // 128 KiB of "X\n" to fd 2, then a distinct terminal sentinel: total > CAP, and
+    // the LAST bytes written are the sentinel, so a tail-biased capture must end in
+    // it while a head-only capture would lose it.
+    let outcome = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
+        Stage::new(
+            &policy,
+            &["sh", "-c", "yes X | head -c 131072 1>&2; printf ZZZEND 1>&2; exit 1"],
+        ),
+    ])
+    .run(None)
+    .await
+    .expect("transaction should run");
+
+    assert_eq!(
+        outcome.disposition,
+        TxnDisposition::Aborted(AbortReason::StageFailed {
+            index: 1,
+            status: sandlock_core::ExitStatus::Code(1),
+        }),
+        "the flooding stage exits 1 and aborts the transaction",
+    );
+    let stderr = outcome.stages[1]
+        .stderr
+        .as_deref()
+        .expect("the flooding stage's stderr must be captured");
+    assert!(
+        stderr.len() >= CAP && stderr.len() <= CAP + 64,
+        "the capture must be bounded to ~the cap, not the whole flood; got {}",
+        stderr.len(),
+    );
+    assert!(
+        stderr.windows(b"[stderr truncated]".len()).any(|w| w == b"[stderr truncated]"),
+        "an over-cap capture must carry the truncation marker",
+    );
+    assert!(
+        stderr.ends_with(b"ZZZEND"),
+        "the terminal bytes must survive (tail-biased); capture ends with {:?}",
+        String::from_utf8_lossy(&stderr[stderr.len().saturating_sub(16)..]),
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// Stdout stays inherited (fd 0 and fd 1 remain the parent's own open files,
+/// streamed live), while stderr is redirected to the coordinator's capture pipe
+/// (fd 2 is no longer the parent's) AND captured into the stage result.
 ///
 /// Each stage records where its own fd 0/1/2 point (fd 1 through a dup, so the
-/// recording redirect does not hide it) and every one must be the very same
-/// open file as the parent's. A stage wired to a pipe — to the next stage or to
-/// a capture buffer — would name a different one.
+/// recording redirect does not hide it). fd 0/1 must name the parent's own file;
+/// fd 2 must not, because it is the capture pipe.
 #[tokio::test]
-async fn test_txn_stages_inherit_parent_stdio_and_capture_nothing() {
+async fn test_txn_stages_inherit_stdout_but_capture_stderr() {
     if !sandbox_available().await {
-        eprintln!("stdio test skipped: sandbox unavailable");
+        eprintln!("stdout-inherit test skipped: sandbox unavailable");
         return;
     }
     let workdir = temp_dir("stdio");
@@ -1097,10 +1296,11 @@ async fn test_txn_stages_inherit_parent_stdio_and_capture_nothing() {
     .run(None)
     .await
     .expect("transaction should run");
-    assert!(outcome.committed, "abort_reason: {:?}", outcome.abort_reason);
+    assert!(outcome.committed(), "disposition: {:?}", outcome.disposition);
 
     for (stage, tag) in [(0usize, "s"), (1, "t")] {
-        for fd in 0..3i32 {
+        // fd 0 and fd 1 are the parent's own open files (inherited live).
+        for fd in 0..2i32 {
             let seen = fs::read_to_string(workdir.join(format!("{tag}{fd}"))).unwrap();
             assert_eq!(
                 Path::new(seen.trim_end_matches('\n')),
@@ -1108,13 +1308,24 @@ async fn test_txn_stages_inherit_parent_stdio_and_capture_nothing() {
                 "stage {stage} fd {fd} must be the parent's own, not a pipe",
             );
         }
-    }
-    for (i, r) in outcome.stages.iter().enumerate() {
-        assert!(
-            r.stdout.is_none() && r.stderr.is_none(),
-            "stage {i} wrote to both streams, but an inherited stage has nothing to capture: {r:?}",
+        // fd 2 is the coordinator's capture pipe now, NOT the parent's stderr.
+        let seen2 = fs::read_to_string(workdir.join(format!("{tag}2"))).unwrap();
+        assert_ne!(
+            Path::new(seen2.trim_end_matches('\n')),
+            parent_fd(2),
+            "stage {stage} fd 2 must be the capture pipe, not the parent's own stderr",
         );
     }
+    // stdout stays uncaptured (inherited-live); stderr is captured.
+    for (i, r) in outcome.stages.iter().enumerate() {
+        assert!(r.stdout.is_none(), "stage {i} stdout must stay inherited (None): {r:?}");
+        assert!(r.stderr.is_some(), "stage {i} stderr must be captured: {r:?}");
+    }
+    assert_eq!(
+        outcome.stages[0].stderr.as_deref(),
+        Some(b"on-stderr\n".as_slice()),
+        "the captured stderr must be exactly what the stage wrote to fd 2",
+    );
 
     let _ = fs::remove_dir_all(&workdir);
 }
@@ -1139,10 +1350,10 @@ async fn test_txn_signalled_stage_reports_the_signal_and_shell_exit_code() {
     .await
     .expect("transaction should run");
 
-    assert!(!outcome.committed, "a signalled stage must abort the transaction");
+    assert!(!outcome.committed(), "a signalled stage must abort the transaction");
     assert_eq!(
-        outcome.abort_reason,
-        Some(AbortReason::StageFailed {
+        outcome.disposition,
+        TxnDisposition::Aborted(AbortReason::StageFailed {
             index: 1,
             status: sandlock_core::ExitStatus::Signal(libc::SIGTERM),
         }),
@@ -1176,7 +1387,7 @@ async fn test_txn_exit_code_separates_a_completed_dry_run_from_a_timeout() {
     .dry_run(None)
     .await
     .expect("dry run should run");
-    assert_eq!(dry.abort_reason, Some(AbortReason::DryRun));
+    assert_eq!(dry.disposition, TxnDisposition::DryRun);
     assert_eq!(
         dry.exit_code(),
         0,
@@ -1192,7 +1403,7 @@ async fn test_txn_exit_code_separates_a_completed_dry_run_from_a_timeout() {
     .run(Some(Duration::from_millis(600)))
     .await
     .expect("transaction should run");
-    assert_eq!(timed_out.abort_reason, Some(AbortReason::TimedOut));
+    assert_eq!(timed_out.disposition, TxnDisposition::Aborted(AbortReason::TimedOut));
     assert_eq!(timed_out.exit_code(), 124, "a timed-out transaction reports 124, as timeout(1) does");
 
     let _ = fs::remove_dir_all(&wd_d);
@@ -1236,11 +1447,10 @@ async fn test_txn_dry_run_neither_takes_the_commit_lock_nor_keeps_its_upper() {
     drop(held);
 
     assert_eq!(
-        outcome.abort_reason,
-        Some(AbortReason::DryRun),
+        outcome.disposition, TxnDisposition::DryRun,
         "the dry run completed; the held lock is none of its business",
     );
-    assert!(!outcome.committed, "a dry run must never commit");
+    assert!(!outcome.committed(), "a dry run must never commit");
     assert!(!workdir.join("a.txt").exists(), "a dry run must not publish anything");
     assert_eq!(
         branch_count(&storage),
@@ -1279,8 +1489,8 @@ async fn test_txn_dry_run_reports_the_failure_that_stopped_it_not_dry_run() {
     .await
     .expect("a failing stage is an outcome, not a dry-run error");
     assert_eq!(
-        failed.abort_reason,
-        Some(AbortReason::StageFailed {
+        failed.disposition,
+        TxnDisposition::Aborted(AbortReason::StageFailed {
             index: 1,
             status: sandlock_core::ExitStatus::Code(3),
         }),
@@ -1299,8 +1509,8 @@ async fn test_txn_dry_run_reports_the_failure_that_stopped_it_not_dry_run() {
     .await
     .expect("a timeout is an outcome, not a dry-run error");
     assert_eq!(
-        timed_out.abort_reason,
-        Some(AbortReason::TimedOut),
+        timed_out.disposition,
+        TxnDisposition::Aborted(AbortReason::TimedOut),
         "a dry run cut short by its timeout never reported a full diff",
     );
     assert_eq!(timed_out.exit_code(), 124, "a timed-out dry run reports 124, as timeout(1) does");
@@ -1478,9 +1688,9 @@ async fn test_txn_timeout_bounds_the_stage_phase_not_the_commit() {
 
     let outcome = txn.await.expect("the commit is not bounded by the stage timeout");
     assert!(
-        outcome.committed,
-        "every stage succeeded within the timeout, so the transaction must commit; abort_reason: {:?}",
-        outcome.abort_reason,
+        outcome.committed(),
+        "every stage succeeded within the timeout, so the transaction must commit; disposition: {:?}",
+        outcome.disposition,
     );
     assert_eq!(fs::read_to_string(workdir.join("b.txt")).unwrap(), "built\n");
 
@@ -1514,8 +1724,8 @@ async fn test_txn_a_deadline_that_expires_immediately_aborts_with_no_stage_resul
     .await
     .expect("an expired deadline is an outcome, not an error");
 
-    assert!(!outcome.committed, "a transaction that never ran a stage must not commit");
-    assert_eq!(outcome.abort_reason, Some(AbortReason::TimedOut));
+    assert!(!outcome.committed(), "a transaction that never ran a stage must not commit");
+    assert_eq!(outcome.disposition, TxnDisposition::Aborted(AbortReason::TimedOut));
     assert!(
         outcome.stages.is_empty(),
         "no stage completed, so there is nothing to report; got {:?}",
@@ -1618,7 +1828,7 @@ async fn test_txn_stage_results_are_in_execution_order_and_include_the_failed_st
     .await
     .expect("transaction should run");
 
-    assert!(!outcome.committed);
+    assert!(!outcome.committed());
     assert_eq!(
         outcome.stages.iter().map(|r| r.exit_status.clone()).collect::<Vec<_>>(),
         vec![
@@ -1658,8 +1868,8 @@ async fn test_txn_a_command_that_cannot_be_execed_is_a_stage_failure_not_a_drive
     .expect("a binary that cannot be exec'd is an abort, not a commit-channel error");
 
     assert_eq!(
-        outcome.abort_reason,
-        Some(AbortReason::StageFailed {
+        outcome.disposition,
+        TxnDisposition::Aborted(AbortReason::StageFailed {
             index: 1,
             status: sandlock_core::ExitStatus::Code(127),
         }),
@@ -1768,7 +1978,7 @@ async fn test_txn_stage_reads_an_earlier_stage_s_modification_not_the_workdir_co
     .await
     .expect("transaction should run");
 
-    assert!(outcome.committed, "abort_reason: {:?}", outcome.abort_reason);
+    assert!(outcome.committed(), "disposition: {:?}", outcome.disposition);
     assert_eq!(
         fs::read_to_string(workdir.join("seen.txt")).unwrap(),
         "after\n",
@@ -1777,4 +1987,47 @@ async fn test_txn_stage_reads_an_earlier_stage_s_modification_not_the_workdir_co
     assert_eq!(fs::read_to_string(workdir.join("in.txt")).unwrap(), "after\n");
 
     let _ = fs::remove_dir_all(&workdir);
+}
+
+/// Concern 5: the backend-neutral recovery module is not merely re-exported at
+/// the right TYPE — it PARSES a preserved branch at runtime through
+/// `sandlock_core::recovery::*`, not the flat aliases and not the backend-named
+/// `cow::seccomp` path. `read_preserved` is the genuine residual: it is never
+/// runtime-exercised through any other namespace, so a re-export pointed at a stub
+/// (returning `None`/empty) would still COMPILE but fail here.
+#[test]
+fn recovery_module_reexports_parse_a_preserved_branch_on_disk() {
+    use sandlock_core::recovery::{list_preserved, read_preserved, PreserveReason};
+
+    // Drop a real preserved branch on disk: an upper plus a marker in the on-disk
+    // format a preserved branch leaves (reason, workdir, upper, one deletion, and
+    // the preserving pid).
+    let base = temp_dir("recovery-reexport");
+    let branch_dir = base.join("branch-xyz");
+    let upper = branch_dir.join("upper");
+    fs::create_dir_all(&upper).unwrap();
+    let marker = format!(
+        "reason=commit-deferred\nworkdir=/some/workdir\nupper={}\ndeleted=gone.txt\npid=4242\n",
+        upper.display(),
+    );
+    fs::write(branch_dir.join("PRESERVED"), marker).unwrap();
+
+    // list_preserved through recovery:: FINDS and PARSES it.
+    let found = list_preserved(&base);
+    assert_eq!(found.len(), 1, "recovery::list_preserved must find the marked branch");
+    let p = &found[0];
+    assert_eq!(p.pid, 4242, "the marker's pid must be parsed");
+    assert_eq!(p.reason, PreserveReason::CommitDeferred, "the reason must be parsed");
+    assert_eq!(p.upper, upper, "the upper path must be parsed");
+    assert_eq!(p.workdir, PathBuf::from("/some/workdir"), "the workdir must be parsed");
+    assert_eq!(p.deleted, vec![PathBuf::from("gone.txt")], "the deletion must be parsed");
+
+    // read_preserved through recovery:: returns the same record for the branch dir.
+    let one = read_preserved(&branch_dir)
+        .expect("recovery::read_preserved must return Some for a marked branch");
+    assert_eq!(one.pid, 4242);
+    assert_eq!(one.reason, PreserveReason::CommitDeferred);
+    assert_eq!(one.upper, upper);
+
+    let _ = fs::remove_dir_all(&base);
 }

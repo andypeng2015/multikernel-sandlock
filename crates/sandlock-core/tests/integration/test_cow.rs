@@ -874,14 +874,18 @@ fn cow_sandbox(workdir: &std::path::Path, on_exit: BranchAction) -> SandboxBuild
         .on_exit(on_exit)
 }
 
-/// A merge that fails leaves the change set on disk under a `MergeInterrupted`
-/// marker, which on the plain-`Sandbox` path is the ONLY record that the
-/// workdir was never updated: the disposition runs in `Drop` and discards the
-/// `commit()` error, so the caller — who already has its `RunResult` in hand,
+/// A merge that STARTS and then fails leaves the change set on disk under a
+/// `MergeInterrupted` marker — the record that the workdir may have been touched
+/// and must be reconciled, not merely re-committed. On the plain-`Sandbox` path
+/// this is the only trace: the disposition runs in `Drop` and discards the
+/// `commit()` error, so the caller — already holding its `RunResult` and
 /// reporting a successful run — is never told.
 ///
-/// The merge is made to fail by removing the workdir between the run and the
-/// disposition, so the first copy has no root to open under.
+/// The failure is planted so it lands INSIDE the merge, not at the lock: the
+/// workdir stays intact (so the commit flock opens) but a symlink sits where the
+/// staged file must be written, so the copy fails after the branch has already
+/// entered `MergeInterrupted`. (A workdir that vanished before the lock is the
+/// untouched `CommitDeferred` case, covered separately in `test_transaction`.)
 #[tokio::test]
 async fn test_failed_merge_on_the_drop_path_leaves_the_upper_recoverable() {
     let workdir = temp_dir("merge-fail-wd");
@@ -902,9 +906,12 @@ async fn test_failed_merge_on_the_drop_path_leaves_the_upper_recoverable() {
             "the child must have written, exit={:?}, stderr={}",
             result.code(), result.stderr_str().unwrap_or(""),
         );
-        // Out of band, as an unmount or another process would: the workdir the
-        // merge is about to copy into is gone.
-        fs::remove_dir_all(&workdir).unwrap();
+        // Obstruct the MERGE, not the lock: the workdir stays, so the commit
+        // flock opens, but a symlink where the staged file must land makes the
+        // copy fail — the merge has already marked the branch `MergeInterrupted`
+        // by then. The child wrote `added.txt` into the upper (COW), so the base
+        // path is free to plant here without the child having followed it.
+        std::os::unix::fs::symlink("/dev/null", workdir.join("added.txt")).unwrap();
         // Dropped here: `Drop` commits, the merge fails, and the error is lost.
     }
 
@@ -930,15 +937,14 @@ async fn test_failed_merge_on_the_drop_path_leaves_the_upper_recoverable() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
-/// With no `fs_storage`, branch storage goes to the per-process default base
-/// `$TMPDIR/sandlock-cow-<pid>`, and `list_preserved` reads exactly one level:
-/// a sweep of `$TMPDIR` itself does not reach a branch under that base.
+/// With no `fs_storage`, branch storage goes to a STABLE, per-user base (not
+/// per-process), so one `list_preserved` sweep of that base spans multiple pids'
+/// preserved work — the property a recovery sweep across process lifetimes needs.
 ///
-/// The two halves are the documented limitation of the default layout — a sweep
-/// across process lifetimes has to enumerate the per-process bases itself — and
-/// the reason a caller who wants one recoverable root must pass `fs_storage`.
+/// The base name carries the uid, never the pid; `$XDG_RUNTIME_DIR/sandlock-cow`
+/// when unprivileged, else a secure `$TMPDIR/sandlock-cow-<uid>`.
 #[tokio::test]
-async fn test_default_storage_base_is_per_process_and_the_sweep_does_not_recurse() {
+async fn test_default_storage_base_is_per_user_and_spans_pids() {
     let workdir = temp_dir("default-base-wd");
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::create_dir_all(&workdir);
@@ -956,30 +962,67 @@ async fn test_default_storage_base_is_per_process_and_the_sweep_does_not_recurse
         );
     }
 
-    let base = std::env::temp_dir().join(format!("sandlock-cow-{}", std::process::id()));
-    let ours: Vec<_> = sandlock_core::list_preserved(&base)
-        .into_iter()
-        .filter(|p| p.upper.join("default-base-marker.txt").exists())
-        .collect();
-    assert_eq!(
-        ours.len(), 1,
-        "the kept branch must be under the per-process default base {}",
+    // Resolve the base the run actually used by finding our marker under either
+    // candidate default base (XDG when unprivileged, else per-uid $TMPDIR).
+    let uid = unsafe { libc::getuid() };
+    let euid = unsafe { libc::geteuid() };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if euid != 0 {
+        if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
+            if !x.is_empty() {
+                candidates.push(PathBuf::from(x).join("sandlock-cow"));
+            }
+        }
+    }
+    candidates.push(std::env::temp_dir().join(format!("sandlock-cow-{uid}")));
+
+    let (base, ours) = candidates
+        .iter()
+        .find_map(|b| {
+            let hit: Vec<_> = sandlock_core::list_preserved(b)
+                .into_iter()
+                .filter(|p| p.upper.join("default-base-marker.txt").exists())
+                .collect();
+            if hit.is_empty() { None } else { Some((b.clone(), hit)) }
+        })
+        .expect("the kept branch must be under a stable per-user default base");
+    assert_eq!(ours.len(), 1, "exactly one kept branch under the default base");
+
+    // The base name carries the uid, never the pid.
+    assert!(
+        !base.to_string_lossy().contains(&format!("sandlock-cow-{}", std::process::id())),
+        "the default base must not embed the pid: {}",
         base.display(),
     );
-    assert_eq!(
-        ours[0].branch_dir.parent(),
-        Some(base.as_path()),
-        "the branch must sit directly under the base, one level down",
-    );
 
-    let from_tmp = sandlock_core::list_preserved(&std::env::temp_dir());
+    // Hand-write a second preserved branch under the SAME base carrying a
+    // DIFFERENT pid, as a dead sibling process would leave behind. One sweep must
+    // find both — the per-user base crosses pids.
+    let sibling = base.join("sibling-branch-for-test");
+    let _ = fs::remove_dir_all(&sibling);
+    fs::create_dir_all(sibling.join("upper")).unwrap();
+    let other_pid = std::process::id().wrapping_add(1);
+    fs::write(
+        sibling.join("PRESERVED"),
+        format!(
+            "reason=commit-deferred\nworkdir=/some/wd\nupper={}\npid={other_pid}\n",
+            sibling.join("upper").display()
+        ),
+    )
+    .unwrap();
+
+    let swept: Vec<u32> = sandlock_core::list_preserved(&base).into_iter().map(|p| p.pid).collect();
     assert!(
-        !from_tmp.iter().any(|p| p.branch_dir == ours[0].branch_dir),
-        "the sweep must not descend from $TMPDIR into the per-process base, but it reached {}",
-        ours[0].branch_dir.display(),
+        swept.contains(&std::process::id()),
+        "our own pid's kept branch must be swept from the per-user base",
+    );
+    assert!(
+        swept.contains(&other_pid),
+        "a sibling pid's branch must be swept from the SAME base — the base spans pids",
     );
 
     let _ = fs::remove_dir_all(&ours[0].branch_dir);
+    let _ = fs::remove_dir_all(&sibling);
     let _ = fs::remove_dir_all(&workdir);
 }
 

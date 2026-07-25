@@ -18,6 +18,7 @@ pub(crate) mod vdso;
 pub(crate) mod random;
 pub(crate) mod time;
 pub(crate) mod cow;
+pub mod recovery;
 pub(crate) mod checkpoint;
 pub(crate) mod freeze;
 pub mod netlink;
@@ -42,10 +43,11 @@ pub use sandbox::{
 };
 pub use result::{RunResult, ExitStatus};
 pub use pipeline::{Stage, Pipeline, Gather};
-pub use transaction::{AbortReason, Transaction, TxnError, TxnOutcome};
+pub use transaction::{AbortReason, Transaction, TxnDisposition, TxnError, TxnOutcome};
 // Recovery of COW branch storage that was preserved rather than reclaimed. The
-// rest of `cow` is internal; these are what an out-of-band sweep needs.
-pub use cow::seccomp::{list_preserved, read_preserved, PreserveReason, PreservedBranch};
+// rest of `cow` is internal; the `recovery` module is the backend-neutral path
+// these belong to, and the flat aliases here are kept for convenience.
+pub use recovery::{list_preserved, read_preserved, PreserveReason, PreservedBranch};
 pub use dry_run::{Change, ChangeKind, DryRunResult};
 // Sectioned-profile parsing types: ProfileInput is the top-level deserialization
 // target; ProgramSpec carries [program].exec/args (not a Sandbox field).

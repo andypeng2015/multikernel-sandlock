@@ -4,9 +4,11 @@
 //! A transaction is **not** a pipeline. [`Pipeline`](crate::pipeline::Pipeline)
 //! is the `|` operator: N stages running *concurrently*, each stage's stdout
 //! wired to the next stage's stdin through a kernel pipe. A [`Transaction`]
-//! runs its stages *sequentially* with **no inter-stage pipes and all stdio
-//! inherited from the parent**; stages exchange data by reading and writing a
-//! shared workspace, not by streaming bytes. The two are separate types
+//! runs its stages *sequentially* with **no inter-stage pipes**; stdin and
+//! stdout are inherited from the parent, while each stage's stderr is teed live
+//! to the parent's fd 2 and also captured into that stage's `RunResult`. Stages
+//! exchange data by reading and writing a shared workspace, not by streaming
+//! bytes between each other. The two are separate types
 //! precisely so a `|`-built chain cannot be handed to the sequential runner and
 //! silently lose its pipes: there is no `From<Pipeline>` and no `BitOr` for
 //! `Transaction`, and a `Pipeline`'s stages are private. Taking them out is
@@ -18,25 +20,15 @@
 //!     Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
 //!     Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"]),
 //! ]).run(None).await?;
-//! assert!(outcome.committed);
+//! assert!(outcome.committed());
 //! ```
 
-use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
+use crate::cow::seccomp::{CommitError, COMMIT_LOCK_WAIT};
 use crate::error::{SandboxError, SandboxRuntimeError, SandlockError};
 use crate::pipeline::Stage;
 use crate::result::{ExitStatus, RunResult};
-
-/// Default for [`Transaction::commit_lock_wait`]: how long to wait for another
-/// transaction's commit merge to finish before giving up. Merges are short (a
-/// file-by-file copy of one upper), so a wait this long only expires when
-/// something is genuinely wrong.
-const COMMIT_LOCK_WAIT: Duration = Duration::from_secs(30);
-
-/// Poll interval while waiting for the commit lock. `flock` has no timed
-/// variant, so the wait is a bounded retry over the non-blocking form.
-const COMMIT_LOCK_POLL: Duration = Duration::from_millis(20);
 
 // ============================================================
 // Transaction
@@ -55,9 +47,11 @@ const COMMIT_LOCK_POLL: Duration = Duration::from_millis(20);
 /// performed — are the `Err` contract of [`run`](Self::run).
 ///
 /// **Stages are not connected by pipes.** Each stage inherits the parent's
-/// stdin, stdout and stderr; data moves between stages through the shared
-/// workspace. This is why a `Transaction` cannot be built with `|` — see the
-/// [module docs](self).
+/// stdin and stdout; its stderr is teed live to the parent's fd 2 and also
+/// captured, bounded, into `stages[i].stderr` (so `isatty(2)` is false on a
+/// stage's stderr, while fd 1 stays inherited). Data moves between stages
+/// through the shared workspace. This is why a `Transaction` cannot be built
+/// with `|` — see the [module docs](self).
 ///
 /// Every stage must set the same `workdir`, run with the supervisor
 /// (`no_supervisor == false`), leave `on_exit`/`on_error` at their defaults, set
@@ -123,7 +117,7 @@ impl Transaction {
     /// change set still lands in the workdir or is preserved. What a cancelled
     /// run gives up is the *report*: no `TxnOutcome`, no `TxnError`, and the
     /// preserved upper has to be found through
-    /// [`list_preserved`](crate::cow::seccomp::list_preserved).
+    /// [`list_preserved`](crate::recovery::list_preserved).
     pub async fn run(self, timeout: Option<Duration>) -> Result<TxnOutcome, TxnError> {
         validate_txn_stages(&self.stages)?;
         run_txn(self.stages, timeout, Disposition::Commit, self.commit_lock_wait).await
@@ -135,9 +129,9 @@ impl Transaction {
     /// The stages really execute — this predicts the filesystem effect on the
     /// workdir, not the effect of running the commands. Same contract as
     /// [`Sandbox::dry_run`](crate::sandbox::Sandbox::dry_run) for one sandbox.
-    /// The outcome always has `committed == false` and
-    /// `abort_reason == Some(`[`AbortReason::DryRun`]`)` unless a stage failed
-    /// or the transaction timed out first.
+    /// The outcome's [`disposition`](TxnOutcome::disposition) is
+    /// [`TxnDisposition::DryRun`] unless a stage failed or the transaction timed
+    /// out first.
     pub async fn dry_run(self, timeout: Option<Duration>) -> Result<TxnOutcome, TxnError> {
         validate_txn_stages(&self.stages)?;
         run_txn(self.stages, timeout, Disposition::DryRun, self.commit_lock_wait).await
@@ -196,7 +190,7 @@ pub enum TxnError {
     /// workdir is untouched and the whole change set is preserved — additions
     /// and modifications under `preserved_upper`, deletions in the `PRESERVED`
     /// marker beside it (see
-    /// [`read_preserved`](crate::cow::seccomp::read_preserved)). Retrying is the
+    /// [`read_preserved`](crate::recovery::read_preserved)). Retrying is the
     /// expected response.
     #[error(
         "transaction: gave up after {waited:?} waiting for another commit to release the workdir \
@@ -227,7 +221,7 @@ pub enum TxnError {
     /// The commit merge failed. The change set that did not land is preserved —
     /// additions and modifications under `preserved_upper`, deletions in the
     /// `PRESERVED` marker beside it (see
-    /// [`read_preserved`](crate::cow::seccomp::read_preserved)).
+    /// [`read_preserved`](crate::recovery::read_preserved)).
     ///
     /// The merge is not rolled back, so the workdir may be partially merged and
     /// re-running the stages is not the same thing as finishing this
@@ -302,23 +296,14 @@ impl From<TxnError> for SandlockError {
     }
 }
 
-/// Why [`acquire_commit_lock`] gave up, so the caller can tell contention (a
-/// conflict, worth retrying) from a broken workdir.
-#[derive(Debug)]
-enum LockFailure {
-    /// The lock was held by someone else for the whole wait.
-    Contended(Duration),
-    /// The workdir could not be opened, or `flock` failed for a reason other
-    /// than contention.
-    Io(std::io::Error),
-}
-
 // ============================================================
 // Outcome
 // ============================================================
 
-/// Why a transaction did not commit, having run and left the workdir untouched.
-/// A transaction that could not be carried out at all is a [`TxnError`] instead.
+/// Why a transaction ran but did not commit, leaving the workdir untouched. A
+/// transaction that could not be carried out at all is a [`TxnError`] instead;
+/// a run that committed, or a dry run that completed, is not an abort at all —
+/// see [`TxnDisposition`].
 ///
 /// `#[non_exhaustive]`: these are the reasons RFC #65 Phase 1 can produce and
 /// later phases add to them. Match with a `_` arm.
@@ -326,14 +311,12 @@ enum LockFailure {
 #[non_exhaustive]
 pub enum AbortReason {
     /// Stage `index` (0-based, in declaration order) did not exit 0. Later
-    /// stages were not run.
+    /// stages were not run. The failing stage's diagnostics are at
+    /// `TxnOutcome::stages[index].stderr`.
     StageFailed { index: usize, status: ExitStatus },
     /// The stage phase exceeded the transaction's timeout. The in-flight stage
     /// was killed; `TxnOutcome::stages` holds the stages that had completed.
     TimedOut,
-    /// [`Transaction::dry_run`] completed: every stage succeeded and the upper
-    /// was discarded on purpose rather than merged.
-    DryRun,
 }
 
 impl std::fmt::Display for AbortReason {
@@ -343,41 +326,64 @@ impl std::fmt::Display for AbortReason {
                 write!(f, "stage {index} did not exit cleanly: {status:?}")
             }
             AbortReason::TimedOut => write!(f, "the transaction timed out"),
-            AbortReason::DryRun => write!(f, "dry run: changes were reported, not committed"),
         }
     }
 }
 
+/// The single outcome a transaction ends in — exactly one of three states, so
+/// invalid combinations (committed *and* aborted; a dry run carrying a
+/// `StageFailed`) are unrepresentable.
+///
+/// Deliberately **not** `#[non_exhaustive]`: the three-set is total, and future
+/// abort reasons funnel through the already-`#[non_exhaustive]` [`AbortReason`],
+/// so an external caller gets exhaustive matching on the disposition itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxnDisposition {
+    /// Every stage exited 0 and the shared upper was merged into the workdir.
+    Committed,
+    /// A [`Transaction::dry_run`] completed: every stage exited 0 and the upper
+    /// was discarded on purpose, leaving the workdir untouched.
+    DryRun,
+    /// The transaction ran but did not commit; the workdir is byte-identical to
+    /// before the run.
+    Aborted(AbortReason),
+}
+
 /// Outcome of [`Transaction::run`] / [`Transaction::dry_run`].
 #[derive(Debug, Clone)]
-#[must_use = "a transaction can finish without committing; inspect `committed`"]
+#[must_use = "a transaction can finish without committing; inspect `disposition`"]
 pub struct TxnOutcome {
-    /// True if every stage exited 0 and the shared upper was merged into the
-    /// workdir. False if any stage failed, the transaction timed out, or this
-    /// was a dry run — in all of which the workdir is byte-identical to before.
-    pub committed: bool,
+    /// Which of the three terminal states the transaction ended in. This replaces
+    /// the old `committed: bool` + `abort_reason: Option<_>` pair, so an
+    /// impossible state (committed *and* aborted, or a dry run reported as a
+    /// stage failure) cannot be built. [`Self::committed`] is the boolean view.
+    pub disposition: TxnDisposition,
     /// Per-stage results in execution order, holding every stage that ran —
     /// including on an abort, and including the partial run recorded before a
     /// timeout cancelled the in-flight stage.
     ///
-    /// **`stdout` and `stderr` are always `None` here, by construction.** Stages
-    /// inherit the parent's stdio (see the [module docs](self)), so their output
-    /// has already gone to the parent's own fd 1/2 and there is nothing to
-    /// capture. This is asymmetric with `Pipeline::run`, which pipes the last
-    /// stage and returns its bytes. A caller that needs a failing stage's output
-    /// has to arrange for it — redirect inside the stage command, or read the
-    /// parent's stream — because [`AbortReason::StageFailed`] carries an index
-    /// and a status and nothing else.
+    /// `stdout` stays `None`: stages inherit the parent's fd 1, so their stdout
+    /// streamed live to the parent and there is nothing to capture. `stderr` is
+    /// `Some(bounded bytes)` for every stage that ran — it is teed live to the
+    /// parent's fd 2 AND captured (head+tail up to `STAGE_STDERR_CAP`). A failing
+    /// stage's diagnostics are therefore at `stages[index].stderr`, where `index`
+    /// is [`AbortReason::StageFailed`]'s `index`.
     pub stages: Vec<RunResult>,
     /// The filesystem changes the shared upper held at the end of the run, i.e.
     /// what the commit merged (or, when not committed, what was discarded).
     /// Captured from the branch before it is disposed of.
     pub changes: Vec<crate::dry_run::Change>,
-    /// Why the transaction did not commit; `None` when it did.
-    pub abort_reason: Option<AbortReason>,
 }
 
 impl TxnOutcome {
+    /// Whether every stage exited 0 and the shared upper was merged into the
+    /// workdir. The boolean view of [`Self::disposition`]; a dry run and any
+    /// abort are both `false`.
+    #[inline]
+    pub fn committed(&self) -> bool {
+        matches!(self.disposition, TxnDisposition::Committed)
+    }
+
     /// Process exit code for this outcome, for a caller that fronts a
     /// transaction with a command-line tool.
     ///
@@ -390,10 +396,10 @@ impl TxnOutcome {
     /// The commit channel is not represented here at all: it is
     /// [`TxnError::exit_code`].
     pub fn exit_code(&self) -> i32 {
-        match &self.abort_reason {
-            None | Some(AbortReason::DryRun) => 0,
-            Some(AbortReason::TimedOut) => 124,
-            Some(AbortReason::StageFailed { status, .. }) => match status {
+        match &self.disposition {
+            TxnDisposition::Committed | TxnDisposition::DryRun => 0,
+            TxnDisposition::Aborted(AbortReason::TimedOut) => 124,
+            TxnDisposition::Aborted(AbortReason::StageFailed { status, .. }) => match status {
                 ExitStatus::Code(c) => *c,
                 ExitStatus::Signal(s) => 128 + *s,
                 ExitStatus::Killed => 128 + libc::SIGKILL,
@@ -524,57 +530,44 @@ async fn run_txn(
     // guard, must not run on an executor worker, and must not be droppable by a
     // cancellation (see `finish_branch`).
     let taken = { state.lock().await.branch.take() };
-    let (mut reason, drive_err) = match driven {
+    let (reason, drive_err) = match driven {
         Ok(rsn) => (rsn, None),
         Err(e) => (None, Some(e)),
     };
     let all_ok = reason.is_none() && drive_err.is_none();
 
     let mut changes = Vec::new();
-    let committed = match taken {
-        Some(branch) => {
-            let want_commit = all_ok && disposition == Disposition::Commit;
-            let wd = workdir.clone();
-            let handle = tokio::task::spawn_blocking(move || {
-                finish_branch(branch, &wd, commit_lock_wait, want_commit)
-            });
-            let finished = match handle.await {
-                Ok(f) => f,
-                Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
-                Err(join) => return Err(TxnError::CommitAbandoned(join.to_string())),
-            };
-            changes = finished.changes;
-            match finished.commit {
-                Some(Ok(())) => true,
-                Some(Err(CommitFailure::Lock(LockFailure::Contended(waited)))) => {
-                    return Err(TxnError::Conflict { workdir, waited, preserved_upper: upper_dir })
-                }
-                Some(Err(CommitFailure::Lock(LockFailure::Io(source)))) => {
-                    return Err(TxnError::CommitLock {
-                        workdir,
-                        preserved_upper: upper_dir,
-                        source,
-                    })
-                }
-                Some(Err(CommitFailure::Merge(source))) => {
-                    return Err(TxnError::Merge { workdir, preserved_upper: upper_dir, source })
-                }
-                // The upper was discarded rather than merged: a dry run, or a
-                // run that aborted.
-                None => {
-                    if all_ok {
-                        reason = Some(AbortReason::DryRun);
-                    }
-                    false
-                }
+    let mut committed = false;
+    // `create` above always yields a branch and a transactional stage never takes
+    // it out of the shared state, so `taken` is always `Some`; a future violation
+    // of that invariant falls through as "nothing was committed" rather than
+    // reporting a commit that did not happen.
+    if let Some(branch) = taken {
+        let want_commit = all_ok && disposition == Disposition::Commit;
+        let handle =
+            tokio::task::spawn_blocking(move || finish_branch(branch, commit_lock_wait, want_commit));
+        let finished = match handle.await {
+            Ok(f) => f,
+            Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+            Err(join) => return Err(TxnError::CommitAbandoned(join.to_string())),
+        };
+        changes = finished.changes;
+        match finished.commit {
+            Some(Ok(())) => committed = true,
+            Some(Err(CommitError::Contended(waited))) => {
+                return Err(TxnError::Conflict { workdir, waited, preserved_upper: upper_dir })
             }
+            Some(Err(CommitError::Lock(source))) => {
+                return Err(TxnError::CommitLock { workdir, preserved_upper: upper_dir, source })
+            }
+            Some(Err(CommitError::Merge(source))) => {
+                return Err(TxnError::Merge { workdir, preserved_upper: upper_dir, source })
+            }
+            // The upper was discarded rather than merged: a dry run, or a run
+            // that aborted.
+            None => {}
         }
-        // Unreachable: `create` above always yields a branch and a transactional
-        // stage never takes it out of the shared state. Treat a future violation
-        // of that invariant as "nothing was committed" rather than reporting a
-        // commit that did not happen.
-        None => false,
-    };
+    }
     if let Some(e) = drive_err {
         return Err(e);
     }
@@ -583,20 +576,17 @@ async fn run_txn(
         .map(|m| m.into_inner().unwrap_or_default())
         .unwrap_or_else(|arc| arc.lock().map(|g| g.clone()).unwrap_or_default());
 
-    Ok(TxnOutcome {
-        committed,
-        stages,
-        changes,
-        abort_reason: if committed { None } else { reason },
-    })
-}
-
-/// Why the commit phase could not publish the change set. Turned into a
-/// [`TxnError`] by the caller, which holds the workdir and upper paths the
-/// message names.
-enum CommitFailure {
-    Lock(LockFailure),
-    Merge(crate::error::BranchError),
+    // Exactly one of three states, so an impossible combination cannot be built.
+    // `(true, _)` committed; `(false, None)` is uniquely a dry run — every stage
+    // succeeded and the upper was discarded on purpose (a failed commit returned
+    // `Err` above, a successful one set `committed`); `(false, Some(r))` is the
+    // abort channel (`StageFailed` | `TimedOut`).
+    let disposition = match (committed, reason) {
+        (true, _) => TxnDisposition::Committed,
+        (false, None) => TxnDisposition::DryRun,
+        (false, Some(r)) => TxnDisposition::Aborted(r),
+    };
+    Ok(TxnOutcome { disposition, stages, changes })
 }
 
 /// What the commit phase did with the shared upper.
@@ -604,17 +594,25 @@ struct Finished {
     /// The change set the upper held, read before it was disposed of.
     changes: Vec<crate::dry_run::Change>,
     /// `None` when the upper was discarded rather than merged (a dry run, or an
-    /// aborted run); otherwise the result of the commit.
-    commit: Option<Result<(), CommitFailure>>,
+    /// aborted run); otherwise the result of the locked commit.
+    commit: Option<Result<(), CommitError>>,
 }
 
 /// Read the shared upper's change set and dispose of it — the entire blocking
 /// half of a transaction, run on a blocking thread.
 ///
 /// Both halves are unbounded in the caller's data: `changes()` walks the whole
-/// upper, and `commit()` walks it again copying file-by-file and fsyncing
-/// directories. Neither may run on an executor worker, and the commit half holds
-/// a cross-process `flock` while it does.
+/// upper, and the commit walks it again copying file-by-file and fsyncing
+/// directories. Neither may run on an executor worker.
+///
+/// The workdir commit lock is taken DOWN in
+/// [`SeccompCowBranch::commit_with_lock_polling`](crate::cow::seccomp::SeccompCowBranch),
+/// not here: it is the single lock layer that BOTH this coordinator and a plain
+/// `Sandbox` merging its own branch into the same workdir serialize on, so the
+/// two can no longer interleave and tear the workdir. This coordinator (already
+/// designed to wait) uses the full `commit_lock_wait` and surfaces contention as
+/// `TxnError::Conflict`; a plain `Sandbox`'s `Drop` uses a shorter bound. On
+/// contention the branch is preserved as `CommitDeferred` inside the commit.
 ///
 /// The branch is **moved in**, and that is what makes the commit phase
 /// uncancellable. Dropping the `run()` future — a `tokio::time::timeout` around
@@ -622,12 +620,11 @@ struct Finished {
 /// rather than stopping it, so the owned branch is never dropped in
 /// `BranchState::Open` by a cancellation and the change set of a run whose stages
 /// all succeeded is always either published or preserved. Dropping the branch at
-/// the end of this function is right in every case: `commit()` leaves it
-/// `Finished` on success and `Preserved` on failure, and the lock path preserves
-/// it explicitly.
+/// the end of this function is right in every case: the commit leaves it
+/// `Finished` on success and `Preserved` on failure, and the contended path
+/// preserves it explicitly.
 fn finish_branch(
     mut branch: crate::cow::seccomp::SeccompCowBranch,
-    workdir: &std::path::Path,
     commit_lock_wait: Duration,
     commit: bool,
 ) -> Finished {
@@ -638,82 +635,24 @@ fn finish_branch(
         let _ = branch.abort();
         return Finished { changes, commit: None };
     }
-
-    // Serialize the merge against any other transaction committing into this
-    // workdir. commit() rewrites the workdir file-by-file, so two merges
-    // interleaving would tear it. This is mutual exclusion between merges, NOT
-    // serializable isolation: a transaction that snapshotted before another one
-    // committed still merges over that result (last writer wins per file). The
-    // lock is also scoped to transactions — a plain Sandbox committing its own
-    // branch into the same workdir does not take it.
-    let lock = match acquire_commit_lock(workdir, commit_lock_wait) {
-        Ok(l) => l,
-        Err(f) => {
-            // Every stage exited 0, so the upper holds a full, mergeable change
-            // set that only failed to be published. Returning here would
-            // otherwise drop an `Open` branch and reclaim it — losing the work of
-            // a run that did nothing wrong. Hand the storage over instead, for
-            // the caller to name in the error.
-            branch.preserve(crate::cow::seccomp::PreserveReason::CommitDeferred);
-            return Finished { changes, commit: Some(Err(CommitFailure::Lock(f))) };
-        }
-    };
-    // `commit()` preserves the upper itself when it fails partway — it marks the
-    // branch before touching the workdir.
-    let merged = branch.commit().map_err(CommitFailure::Merge);
-    drop(lock); // release the workdir lock after the merge
-    Finished { changes, commit: Some(merged) }
+    // The lock (and preserve-on-contention) lives inside the branch now, so both
+    // this coordinator and a plain Sandbox serialize on the one workdir flock.
+    let r = branch.commit_with_lock_polling(commit_lock_wait, std::thread::sleep);
+    Finished { changes, commit: Some(r) }
 }
 
-/// Take an exclusive lock on the workdir, waiting up to `deadline_after` for a
-/// concurrent commit merge to release it. `flock` has no timed variant, so this
-/// is a bounded poll over the non-blocking form.
-///
-/// Waiting rather than failing fast is deliberate: a transaction that has run
-/// every stage successfully should publish its work, not discard it because
-/// another merge happened to be in flight for a few milliseconds. Expiring the
-/// wait does not discard it either — the caller preserves the upper.
-///
-/// Blocking, and only ever called from [`finish_branch`] on a blocking thread:
-/// the merge it guards is blocking too, so making the wait cancellable would buy
-/// nothing and would put the branch back on a droppable await.
-fn acquire_commit_lock(
-    workdir: &std::path::Path,
-    deadline_after: Duration,
-) -> Result<std::fs::File, LockFailure> {
-    acquire_commit_lock_polling(workdir, deadline_after, std::thread::sleep)
-}
+/// Cap on the bytes captured from one stage's stderr. Head+tail biased around
+/// this bound, so a stage that floods stderr (a compiler, a verbose runner)
+/// still surfaces its terminal error line, which is where the actionable
+/// diagnostic almost always is.
+const STAGE_STDERR_CAP: usize = 64 * 1024;
 
-/// [`acquire_commit_lock`] with the poll sleep injected, so a test can observe
-/// how many times — if at all — the loop actually waited.
-fn acquire_commit_lock_polling(
-    workdir: &std::path::Path,
-    deadline_after: Duration,
-    mut sleep: impl FnMut(Duration),
-) -> Result<std::fs::File, LockFailure> {
-    let lock = std::fs::File::open(workdir).map_err(LockFailure::Io)?;
-    let deadline = std::time::Instant::now() + deadline_after;
-    loop {
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(lock);
-        }
-        let err = std::io::Error::last_os_error();
-        // EWOULDBLOCK (== EAGAIN on Linux) means another commit holds the lock.
-        // Any other errno is a real failure and must not be retried.
-        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(LockFailure::Io(err));
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(LockFailure::Contended(deadline_after));
-        }
-        sleep(COMMIT_LOCK_POLL);
-    }
-}
-
-/// Run each stage to completion in order over the shared upper, with no
-/// inter-stage pipes (all stdio inherited). Stops at the first non-zero exit:
-/// under a sequential shared-workspace model stage N+1's inputs do not exist if
-/// stage N failed, and the transaction is going to abort regardless.
+/// Run each stage to completion in order over the shared upper. Stdout is
+/// inherited (streamed live to the parent's fd 1); stderr is teed live to the
+/// parent's fd 2 AND captured, bounded, into the stage's `RunResult`. Stops at
+/// the first non-zero exit: under a sequential shared-workspace model stage
+/// N+1's inputs do not exist if stage N failed, and the transaction is going to
+/// abort regardless.
 ///
 /// Each result is published to `results` as soon as its stage finishes, so the
 /// coordinator still has them if this future is cancelled by a timeout.
@@ -722,14 +661,51 @@ async fn drive_txn_stages(
     shared: crate::sandbox::SharedCow,
     results: std::sync::Arc<std::sync::Mutex<Vec<RunResult>>>,
 ) -> Result<Option<AbortReason>, TxnError> {
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    // An INDEPENDENT, non-blocking open file description onto the parent's fd 2,
+    // cloned per stage to tee each stage's captured stderr back to fd 2
+    // (best-effort). See `open_stderr_tee` for why it must not be a dup of fd 2.
+    let tee_fd: Option<OwnedFd> = open_stderr_tee();
+
     for (i, stage) in stages.into_iter().enumerate() {
         let at = |source: SandlockError| TxnError::Stage { index: i, source };
         let cmd_refs: Vec<&str> = stage.args.iter().map(|s| s.as_str()).collect();
         let mut sb = stage.sandbox.with_name(format!("txn-stage-{i}"));
         sb.set_shared_cow(shared.clone()).map_err(at)?;
-        sb.create_with_io(&cmd_refs, None, None, None).await.map_err(at)?;
+
+        // Redirect the stage's fd 2 onto a pipe the coordinator drains, keeping
+        // fd 1 inherited (None). The child dup2's the write end onto fd 2 before
+        // execve.
+        let (read_fd, write_fd) = crate::sandbox::make_cloexec_pipe()
+            .map_err(|e| at(SandboxRuntimeError::Io(e).into()))?;
+        sb.create_with_io(&cmd_refs, None, None, Some(write_fd.as_raw_fd())).await.map_err(at)?;
+        // Close the parent's copy of the write end now (the fork is done), or the
+        // read end never sees EOF on child exit and the drain hangs.
+        drop(write_fd);
         sb.start().map_err(at)?;
-        let result = sb.wait().await.map_err(at)?;
+
+        // Drain CONCURRENTLY with wait(): a stage that writes more than a pipe
+        // buffer (64 KiB) to stderr would otherwise block in write() and never
+        // exit, so reading only after wait() would deadlock. spawn_blocking works
+        // on a current-thread runtime and never starves the notif supervisor.
+        let tee = tee_fd.as_ref().and_then(|t| t.try_clone().ok());
+        let drain =
+            tokio::task::spawn_blocking(move || drain_capped_tee(read_fd, STAGE_STDERR_CAP, tee));
+
+        let mut result = sb.wait().await.map_err(at)?;
+        // Kill the stage's process group before awaiting the drain. The stage's
+        // fd 2 is a pipe (dup2 cleared its CLOEXEC), so a backgrounded descendant
+        // (`sh -c 'sleep 300 & exit 0'`) keeps the pipe's write end open after the
+        // direct child is reaped; there is no PID namespace on this path to reap
+        // it, so `drain` — which waits for EOF, i.e. every fd-2 holder to close —
+        // would otherwise block forever. `Sandbox::kill` SIGKILLs the child's
+        // whole process group (the child is the group leader), releasing any such
+        // holder. Best-effort: a group already gone is fine.
+        let _ = sb.kill();
+        // wait() returns stderr: None on the inherit path; the captured bytes are
+        // authoritative.
+        result.stderr = Some(drain.await.unwrap_or_default());
 
         let status = result.exit_status.clone();
         if let Ok(mut guard) = results.lock() {
@@ -742,9 +718,127 @@ async fn drive_txn_stages(
     Ok(None)
 }
 
+/// Open an INDEPENDENT, non-blocking write description onto the parent's fd 2 for
+/// the best-effort live stderr tee, or `None` if it cannot be opened (the tee is
+/// then absent and stages are capture-only).
+///
+/// It must NOT be a dup of fd 2 (`fcntl(F_DUPFD*)`): a dup shares fd 2's open file
+/// description and its blocking file-status flags, so it could not be made
+/// non-blocking without also flipping the parent's real stderr. Opening
+/// `/proc/self/fd/2` yields a FRESH description we own, and `O_NONBLOCK` on it
+/// makes a slow, blocked or stalled reader on fd 2 (`prog 2>&1 | slow_reader`,
+/// ssh, `tee`) fail the tee write with `EAGAIN` — which the drain loop drops —
+/// instead of blocking the loop, which would stop draining the child's 64 KiB
+/// stderr pipe, fill it, and deadlock the child in `write()` (so `wait()` never
+/// returns). `O_NONBLOCK` is a property of the open file description, so a
+/// `try_clone` per stage inherits it.
+fn open_stderr_tee() -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let raw = unsafe {
+        libc::open(
+            c"/proc/self/fd/2".as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if raw >= 0 {
+        Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+    } else {
+        None
+    }
+}
+
+/// Drain a stage's stderr pipe to EOF, teeing every byte live to `tee` (the
+/// parent's fd 2, best-effort) and capturing a bounded, tail-biased copy: the
+/// first `cap/2` bytes and the last `cap/2` bytes, joined by a truncation marker
+/// only when the total exceeded `cap`.
+///
+/// Reading to EOF — not stopping at `cap` — is mandatory: a stage that writes
+/// past the pipe buffer would block in `write()` and never exit, so the drain
+/// must keep consuming (and discarding) past the cap. Tee writes are best-effort
+/// and truly non-stalling: `tee` is an INDEPENDENT, `O_NONBLOCK` description onto
+/// the parent's fd 2 (opened in `drive_txn_stages`), and each chunk is teed with
+/// a SINGLE `write` whose result is discarded — a full pipe returns `EAGAIN`, a
+/// gone reader `EPIPE`, and either way the byte is dropped and the loop keeps
+/// draining. So a slow, blocked or closed parent fd 2 can neither stall capture
+/// nor let the child's stderr pipe fill; the captured bytes are the
+/// authoritative record while live passthrough is a courtesy.
+fn drain_capped_tee(
+    fd: std::os::fd::OwnedFd,
+    cap: usize,
+    tee: Option<std::os::fd::OwnedFd>,
+) -> Vec<u8> {
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+
+    let mut file = std::fs::File::from(fd);
+    let mut tee_file = tee.map(std::fs::File::from);
+    let head_cap = cap / 2;
+    let tail_cap = cap - head_cap;
+    let mut head: Vec<u8> = Vec::new();
+    let mut tail: VecDeque<u8> = VecDeque::with_capacity(tail_cap);
+    let mut total: usize = 0;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let chunk = &buf[..n];
+        if let Some(t) = tee_file.as_mut() {
+            // Best-effort live passthrough: ONE non-blocking write, and the
+            // chunk is dropped on `EAGAIN`/`WouldBlock` or any other error. A
+            // slow or closed parent fd 2 must never stall this loop — a stall
+            // would stop draining the child's stderr pipe, fill it, and deadlock
+            // the child in `write()` — so the tee is a courtesy while the
+            // captured bytes below are the authoritative record. (The fd carries
+            // `O_NONBLOCK`, set on the independent description opened above.)
+            let _ = t.write(chunk);
+        }
+        total += n;
+        if head.len() < head_cap {
+            let take = (head_cap - head.len()).min(n);
+            head.extend_from_slice(&chunk[..take]);
+        }
+        if tail_cap > 0 {
+            for &b in chunk {
+                if tail.len() == tail_cap {
+                    tail.pop_front();
+                }
+                tail.push_back(b);
+            }
+        }
+    }
+
+    if total > cap {
+        let mut out = head;
+        out.extend_from_slice(b"\n[stderr truncated]\n");
+        out.extend(tail);
+        out
+    } else {
+        // Reconstruct the exact bytes: `head` holds [0..head.len()], `tail` holds
+        // the last `tail.len()` bytes, i.e. [total - tail.len() .. total]. Append
+        // only the tail suffix that comes after `head`.
+        let tail_bytes: Vec<u8> = tail.into_iter().collect();
+        let tail_start = total - tail_bytes.len();
+        let mut out = head;
+        if out.len() >= tail_start {
+            let skip = out.len() - tail_start;
+            if skip < tail_bytes.len() {
+                out.extend_from_slice(&tail_bytes[skip..]);
+            }
+        } else {
+            out.extend_from_slice(&tail_bytes);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cow::seccomp::{acquire_commit_lock_polling, LockFailure};
     use crate::sandbox::{BranchAction, ByteSize, Sandbox};
     use std::os::unix::io::AsRawFd;
 
@@ -1294,15 +1388,227 @@ mod tests {
             "a timeout must say so, got: {}",
             AbortReason::TimedOut
         );
-        let dry = AbortReason::DryRun.to_string();
-        assert!(
-            dry.contains("dry run") && dry.contains("not committed"),
-            "a dry run must say the changes were reported rather than committed, got: {dry}"
-        );
 
         let rendered: std::collections::HashSet<String> =
-            [stage_failed, AbortReason::TimedOut.to_string(), dry].into_iter().collect();
-        assert_eq!(rendered.len(), 3, "each abort reason must render differently: {rendered:?}");
+            [stage_failed, AbortReason::TimedOut.to_string()].into_iter().collect();
+        assert_eq!(rendered.len(), 2, "each abort reason must render differently: {rendered:?}");
+    }
+
+    /// `exit_code()`/`committed()` are pinned for each of the four terminal
+    /// states, so the disposition mapping cannot silently drift.
+    #[test]
+    fn disposition_is_total_and_exclusive() {
+        let cases = [
+            (TxnDisposition::Committed, true, 0),
+            (TxnDisposition::DryRun, false, 0),
+            (TxnDisposition::Aborted(AbortReason::TimedOut), false, 124),
+            (
+                TxnDisposition::Aborted(AbortReason::StageFailed {
+                    index: 0,
+                    status: ExitStatus::Code(5),
+                }),
+                false,
+                5,
+            ),
+        ];
+        for (disposition, committed, code) in cases {
+            let outcome = TxnOutcome {
+                disposition: disposition.clone(),
+                stages: Vec::new(),
+                changes: Vec::new(),
+            };
+            assert_eq!(outcome.committed(), committed, "committed() for {disposition:?}");
+            assert_eq!(outcome.exit_code(), code, "exit_code() for {disposition:?}");
+        }
+    }
+
+    /// `drain_capped_tee` is tail-biased and marks truncation: input over the
+    /// cap keeps the head AND the tail (so the terminal error line survives),
+    /// with a marker; input under the cap is returned verbatim with no marker;
+    /// and every byte is teed to the sink either way.
+    #[test]
+    fn drain_capped_tee_is_tail_biased_and_marks_truncation() {
+        use std::io::Read;
+
+        // Drain `input` through `drain_capped_tee` with `cap`, returning
+        // (captured, teed). Writer and tee-reader run concurrently so neither
+        // pipe can fill and deadlock.
+        fn run(input: &[u8], cap: usize) -> (Vec<u8>, Vec<u8>) {
+            let (src_r, src_w) = crate::sandbox::make_cloexec_pipe().unwrap();
+            let (tee_r, tee_w) = crate::sandbox::make_cloexec_pipe().unwrap();
+            let data = input.to_vec();
+            let writer = std::thread::spawn(move || {
+                use std::io::Write;
+                let mut w = std::fs::File::from(src_w);
+                let _ = w.write_all(&data);
+            });
+            let tee_reader = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = std::fs::File::from(tee_r).read_to_end(&mut buf);
+                buf
+            });
+            let captured = drain_capped_tee(src_r, cap, Some(tee_w));
+            writer.join().unwrap();
+            let teed = tee_reader.join().unwrap();
+            (captured, teed)
+        }
+
+        let cap = STAGE_STDERR_CAP;
+        let marker = b"[stderr truncated]";
+        let sentinel = b"\nFATAL-LAST-LINE-SENTINEL\n";
+
+        // Over the cap: the terminal sentinel MUST survive (tail-bias), the
+        // capture is bounded, and it carries the truncation marker.
+        let mut big = vec![b'x'; cap * 2];
+        big.extend_from_slice(sentinel);
+        let (captured, teed) = run(&big, cap);
+        assert!(captured.len() <= cap + 64, "capture must be bounded, got {}", captured.len());
+        assert!(
+            captured.windows(sentinel.len()).any(|w| w == sentinel),
+            "the tail (terminal error line) must survive truncation"
+        );
+        assert!(
+            captured.windows(marker.len()).any(|w| w == marker),
+            "an over-cap capture must carry the truncation marker"
+        );
+        assert_eq!(teed.len(), big.len(), "every byte must be teed to the sink");
+
+        // Under the cap: exact bytes, no marker.
+        let small = b"just a little stderr\n";
+        let (captured, teed) = run(small, cap);
+        assert_eq!(captured, small, "an under-cap capture must be verbatim");
+        assert!(
+            !captured.windows(marker.len()).any(|w| w == marker),
+            "an under-cap capture must not carry the marker"
+        );
+        assert_eq!(teed, small, "the sink must receive the exact bytes too");
+    }
+
+    /// Drive `drain_capped_tee` over `input` with the production cap, returning the
+    /// captured bytes (and the teed copy when `tee` is set). The writer runs on its
+    /// own thread so an input larger than the pipe buffer cannot fill the pipe and
+    /// deadlock the drain.
+    fn drain_bytes(input: &[u8], tee: bool) -> (Vec<u8>, Option<Vec<u8>>) {
+        use std::io::{Read, Write};
+        let (src_r, src_w) = crate::sandbox::make_cloexec_pipe().unwrap();
+        let data = input.to_vec();
+        let writer = std::thread::spawn(move || {
+            let mut w = std::fs::File::from(src_w);
+            let _ = w.write_all(&data);
+        });
+        let (tee_w, tee_reader) = if tee {
+            let (tee_r, tee_w) = crate::sandbox::make_cloexec_pipe().unwrap();
+            let jh = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = std::fs::File::from(tee_r).read_to_end(&mut buf);
+                buf
+            });
+            (Some(tee_w), Some(jh))
+        } else {
+            (None, None)
+        };
+        let captured = drain_capped_tee(src_r, STAGE_STDERR_CAP, tee_w);
+        writer.join().unwrap();
+        let teed = tee_reader.map(|jh| jh.join().unwrap());
+        (captured, teed)
+    }
+
+    /// GAP-2: with 32 KiB < total <= 64 KiB the head window (first 32 KiB) and the
+    /// tail window (last 32 KiB) OVERLAP, and the under-cap branch stitches them by
+    /// appending only the tail suffix that comes after the head. A position-encoded
+    /// input turns any off-by-one at that seam (`tail_bytes[skip..]`, 0 < skip <
+    /// 32 KiB) into a byte mismatch: the whole capture must be verbatim, with no
+    /// duplication across the seam and no truncation marker.
+    #[test]
+    fn drain_capped_tee_stitches_the_head_tail_seam_without_duplication() {
+        assert_eq!(STAGE_STDERR_CAP, 64 * 1024, "this test's arithmetic assumes a 64 KiB cap");
+        let total = 48 * 1024; // 32K < 48K <= 64K: head and tail overlap by 16 KiB.
+        let input: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let (captured, _) = drain_bytes(&input, false);
+        assert_eq!(
+            captured.len(),
+            input.len(),
+            "an under-cap capture must reconstruct the input without duplicating the overlap",
+        );
+        assert_eq!(captured, input, "the head/tail seam must reconstruct the input byte-for-byte");
+        let marker = b"[stderr truncated]";
+        assert!(
+            !captured.windows(marker.len()).any(|w| w == marker),
+            "an under-cap capture must carry no truncation marker",
+        );
+    }
+
+    /// GAP-3: the truncation boundary is exactly `total > STAGE_STDERR_CAP`. At
+    /// total == cap the capture is verbatim with no marker; at total == cap + 1 it
+    /// truncates — marker present and tail-biased. Mutating the `>` to `>=` breaks
+    /// the first case; widening it to `> cap + 1` breaks the second.
+    #[test]
+    fn drain_capped_tee_boundary_at_cap() {
+        let cap = STAGE_STDERR_CAP;
+        let marker = b"[stderr truncated]";
+
+        let exact: Vec<u8> = (0..cap).map(|i| (i % 251) as u8).collect();
+        let (captured, _) = drain_bytes(&exact, false);
+        assert_eq!(captured, exact, "total == cap must pass through verbatim");
+        assert!(
+            !captured.windows(marker.len()).any(|w| w == marker),
+            "total == cap must not carry the marker",
+        );
+
+        let mut over = exact.clone();
+        over.push(0xAB);
+        let (captured, _) = drain_bytes(&over, false);
+        assert!(
+            captured.windows(marker.len()).any(|w| w == marker),
+            "total == cap + 1 must carry the truncation marker",
+        );
+        assert!(captured.len() <= cap + 32, "an over-cap capture is bounded, got {}", captured.len());
+        assert_eq!(
+            *captured.last().unwrap(),
+            0xAB,
+            "the last byte written must survive (tail-biased)",
+        );
+    }
+
+    /// GAP-10: the tee is a courtesy that can never compromise the capture.
+    /// (a) a tee whose reader closed first fails each write with EPIPE, which the
+    /// drain drops — the capture is still complete; (b) with no tee the capture is
+    /// byte-identical; (c) an empty source yields an empty capture, no marker, and
+    /// nothing teed.
+    #[test]
+    fn drain_capped_tee_tee_is_best_effort_and_never_corrupts_capture() {
+        use std::io::Write;
+        let marker = b"[stderr truncated]";
+
+        // (a) tee reader closed before the drain writes: EPIPE, dropped.
+        {
+            let (src_r, src_w) = crate::sandbox::make_cloexec_pipe().unwrap();
+            let (tee_r, tee_w) = crate::sandbox::make_cloexec_pipe().unwrap();
+            drop(tee_r); // reader gone -> each tee write fails EPIPE
+            let data = b"complete capture despite a dead tee\n".to_vec();
+            let expect = data.clone();
+            let writer = std::thread::spawn(move || {
+                let mut w = std::fs::File::from(src_w);
+                let _ = w.write_all(&data);
+            });
+            let captured = drain_capped_tee(src_r, STAGE_STDERR_CAP, Some(tee_w));
+            writer.join().unwrap();
+            assert_eq!(captured, expect, "a dead tee must not truncate the capture");
+        }
+
+        // (b) no tee: capture byte-identical.
+        let (captured, teed) = drain_bytes(b"no tee here\n", false);
+        assert_eq!(captured, b"no tee here\n", "a capture with no tee is verbatim");
+        assert!(teed.is_none(), "no tee was requested");
+
+        // (c) empty source: empty capture, no marker, nothing teed.
+        let (captured, teed) = drain_bytes(b"", true);
+        assert!(captured.is_empty(), "an empty source yields an empty capture");
+        assert!(
+            !captured.windows(marker.len()).any(|w| w == marker),
+            "an empty capture carries no marker",
+        );
+        assert_eq!(teed.unwrap(), Vec::<u8>::new(), "nothing is teed for an empty source");
     }
 
     // ------------------------------------------------------------
@@ -1341,12 +1647,15 @@ mod tests {
     fn finish_branch_preserves_the_upper_when_the_workdir_cannot_be_locked_at_all() {
         let (workdir, _storage, branch) = branch_holding_one_added_file();
         let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
-        let gone = workdir.path().join("no-such-workdir");
+        // Remove the workdir out from under the branch, so the commit's flock
+        // cannot even open it: an I/O failure, not contention. The storage
+        // (holding the upper) is a separate tempdir and survives.
+        std::fs::remove_dir_all(workdir.path()).unwrap();
 
-        let finished = finish_branch(branch, &gone, Duration::from_millis(50), true);
+        let finished = finish_branch(branch, Duration::from_millis(50), true);
 
         assert!(
-            matches!(finished.commit, Some(Err(CommitFailure::Lock(LockFailure::Io(_))))),
+            matches!(finished.commit, Some(Err(CommitError::Lock(_)))),
             "a workdir that cannot be opened is an I/O failure, not contention"
         );
         let survived = std::fs::read_to_string(branch_dir.join("upper").join("a.txt"))
@@ -1434,7 +1743,7 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let err = acquire_commit_lock(dir.path(), Duration::from_millis(200))
+        let err = acquire_commit_lock_polling(dir.path(), Duration::from_millis(200), std::thread::sleep)
             .expect_err("a lock that is never released must time out");
         let waited = started.elapsed();
         drop(held);
@@ -1455,7 +1764,7 @@ mod tests {
     fn commit_lock_reports_a_missing_workdir_as_io() {
         let dir = tempfile::tempdir().unwrap();
         let gone = dir.path().join("no-such-workdir");
-        let err = acquire_commit_lock(&gone, Duration::from_millis(200))
+        let err = acquire_commit_lock_polling(&gone, Duration::from_millis(200), std::thread::sleep)
             .expect_err("a workdir that does not exist cannot be locked");
         assert!(
             matches!(err, LockFailure::Io(_)),
@@ -1631,10 +1940,9 @@ mod tests {
 
     fn aborted(reason: AbortReason) -> TxnOutcome {
         TxnOutcome {
-            committed: false,
+            disposition: TxnDisposition::Aborted(reason),
             stages: Vec::new(),
             changes: Vec::new(),
-            abort_reason: Some(reason),
         }
     }
 
@@ -1670,18 +1978,26 @@ mod tests {
     }
 
     /// A transaction that did what was asked reports success — including a dry
-    /// run, which does not commit but did not fail either.
+    /// run, which does not commit but did not fail either. Both are 0, and
+    /// neither is `committed()` for a dry run.
     #[test]
     fn a_committed_transaction_and_a_completed_dry_run_both_report_success() {
         let committed = TxnOutcome {
-            committed: true,
+            disposition: TxnDisposition::Committed,
             stages: Vec::new(),
             changes: Vec::new(),
-            abort_reason: None,
         };
+        assert!(committed.committed(), "a committed transaction is committed()");
         assert_eq!(committed.exit_code(), 0, "a committed transaction succeeded");
+
+        let dry = TxnOutcome {
+            disposition: TxnDisposition::DryRun,
+            stages: Vec::new(),
+            changes: Vec::new(),
+        };
+        assert!(!dry.committed(), "a dry run did not commit");
         assert_eq!(
-            aborted(AbortReason::DryRun).exit_code(),
+            dry.exit_code(),
             0,
             "a dry run reported its changes as asked; not committing is not a failure"
         );
@@ -1713,7 +2029,7 @@ mod tests {
         let (workdir, _storage, branch) = branch_holding_one_added_file();
         let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
 
-        let finished = finish_branch(branch, workdir.path(), Duration::from_secs(30), false);
+        let finished = finish_branch(branch, Duration::from_secs(30), false);
 
         assert!(
             finished.commit.is_none(),
@@ -1745,7 +2061,7 @@ mod tests {
         let (workdir, _storage, branch) = branch_holding_one_added_file();
         let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
 
-        let finished = finish_branch(branch, workdir.path(), Duration::from_secs(30), true);
+        let finished = finish_branch(branch, Duration::from_secs(30), true);
 
         assert!(
             matches!(finished.commit, Some(Ok(()))),
@@ -1786,13 +2102,13 @@ mod tests {
             "test setup: could not take the workdir lock"
         );
 
-        let finished = finish_branch(branch, workdir.path(), Duration::from_millis(50), true);
+        let finished = finish_branch(branch, Duration::from_millis(50), true);
         drop(held);
 
         assert!(
             matches!(
                 finished.commit,
-                Some(Err(CommitFailure::Lock(LockFailure::Contended(d)))) if d == Duration::from_millis(50)
+                Some(Err(CommitError::Contended(d))) if d == Duration::from_millis(50)
             ),
             "a lock held for the whole wait must be reported as contention"
         );
@@ -1835,10 +2151,10 @@ mod tests {
         let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
         std::fs::write(branch.upper_dir().join("x"), "built\n").unwrap();
 
-        let finished = finish_branch(branch, workdir.path(), Duration::from_secs(30), true);
+        let finished = finish_branch(branch, Duration::from_secs(30), true);
 
         assert!(
-            matches!(finished.commit, Some(Err(CommitFailure::Merge(_)))),
+            matches!(finished.commit, Some(Err(CommitError::Merge(_)))),
             "a merge that cannot write an entry into the workdir must report a merge failure"
         );
         let remainder = std::fs::read_to_string(branch_dir.join("upper").join("x"))
@@ -1853,5 +2169,93 @@ mod tests {
             crate::cow::seccomp::PreserveReason::MergeInterrupted,
             "the workdir may be partially merged, so this is not CommitDeferred"
         );
+    }
+
+    // ------------------------------------------------------------
+    // M1: the stderr tee never stalls the drain
+    // ------------------------------------------------------------
+
+    /// M1 (load-bearing): the tee description opened for live stderr passthrough
+    /// is INDEPENDENT of fd 2 and carries `O_NONBLOCK`, and that flag is inherited
+    /// by the per-stage `try_clone`. The pre-fix implementation dup'd fd 2
+    /// (`fcntl(F_DUPFD_CLOEXEC)`), which SHARES fd 2's open file description and so
+    /// could NOT carry `O_NONBLOCK` without flipping the parent's real stderr —
+    /// this test fails on that path (the flag is absent) and passes on the fix.
+    #[test]
+    fn stderr_tee_is_nonblocking_and_clone_inherits_it() {
+        let tee = open_stderr_tee().expect("opening /proc/self/fd/2 must succeed under test");
+        let nonblock = |fd: std::os::fd::BorrowedFd<'_>| {
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0, "F_GETFL failed: {}", std::io::Error::last_os_error());
+            flags & libc::O_NONBLOCK != 0
+        };
+        use std::os::fd::AsFd;
+        assert!(nonblock(tee.as_fd()), "the tee description must be non-blocking");
+        let clone = tee.try_clone().expect("per-stage clone must succeed");
+        assert!(
+            nonblock(clone.as_fd()),
+            "O_NONBLOCK is a file-description flag, so the per-stage clone must inherit it",
+        );
+    }
+
+    /// M1: `drain_capped_tee` must keep draining the child's stderr pipe to EOF
+    /// even when the tee's reader NEVER reads — a full, unread, non-blocking tee
+    /// makes each tee write fail with `EAGAIN`, which is dropped, so the loop keeps
+    /// progressing instead of stalling (which would fill the child's stderr pipe
+    /// and deadlock it). The over-cap capture must also stay intact and tail-biased.
+    #[test]
+    fn drain_does_not_stall_on_a_full_unread_tee_and_capture_is_tail_biased() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        // The tee: a pipe whose read end is held open but NEVER read. Make the
+        // write end non-blocking, exactly as `open_stderr_tee` guarantees in
+        // production, so a full tee returns EAGAIN rather than blocking.
+        let (tee_r, tee_w) = crate::sandbox::make_cloexec_pipe().expect("tee pipe");
+        let flags = unsafe { libc::fcntl(tee_w.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(tee_w.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "could not set O_NONBLOCK on the tee write end",
+        );
+
+        // The source: an over-cap payload delivered from a separate thread (the
+        // pipe buffer is smaller than the payload, so the writer must run
+        // concurrently with the drain or it would block).
+        let (src_r, src_w) = crate::sandbox::make_cloexec_pipe().expect("src pipe");
+        let mut payload = Vec::with_capacity(200 * 1024);
+        payload.extend_from_slice(b"HEADSTART");
+        payload.resize(200 * 1024 - 7, b'.');
+        payload.extend_from_slice(b"TAILEND");
+        let writer = std::thread::spawn(move || {
+            let mut w = std::fs::File::from(src_w);
+            let _ = w.write_all(&payload);
+            // dropping `w` closes the write end -> EOF for the drain
+        });
+
+        // Bound the whole thing in a watchdog: without the fix a full unread tee
+        // would stall the drain, so this call would never return.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let drain = std::thread::spawn(move || {
+            let out = drain_capped_tee(src_r, STAGE_STDERR_CAP, Some(tee_w));
+            let _ = done_tx.send(());
+            out
+        });
+        match done_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(()) => {}
+            Err(_) => panic!("drain_capped_tee stalled on a full unread tee (M1 regression)"),
+        }
+        writer.join().unwrap();
+        let out = drain.join().unwrap();
+        drop(tee_r); // never read
+
+        assert!(out.starts_with(b"HEADSTART"), "the head of the capture must be preserved");
+        assert!(out.ends_with(b"TAILEND"), "the tail of the capture must be preserved");
+        assert!(
+            out.windows(b"[stderr truncated]".len()).any(|w| w == b"[stderr truncated]"),
+            "an over-cap capture must carry the truncation marker",
+        );
+        assert!(out.len() < 200 * 1024, "the capture must be bounded by the cap, not the full flood");
     }
 }
