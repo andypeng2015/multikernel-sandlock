@@ -416,28 +416,63 @@ impl SeccompCowBranch {
     /// (issue #160). Each entry goes through the same confined,
     /// quota-accounted single-entry copy-up, so symlinks are copied verbatim
     /// and never followed (issue #112).
-    fn copy_up_tree(&mut self, rel: &str) -> Result<(), BranchError> {
-        self.ensure_cow_copy(rel)?;
-        let st = match crate::sys::fs::statat_in_root(&self.workdir, rel, false) {
-            Ok(st) => st,
-            Err(_) => return Ok(()),
-        };
-        if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return Ok(());
+    ///
+    /// Staging is all-or-nothing: a mid-tree failure (EACCES, EIO, quota)
+    /// must propagate rather than truncate the copy, because the caller
+    /// whiteouts the source afterwards and untraversed children would be
+    /// silently lost at commit. On failure every upper entry this staging
+    /// created is removed again and the quota re-derived.
+    fn copy_up_tree(&mut self, rel: &str) -> Result<(), i32> {
+        let mut created: Vec<String> = Vec::new();
+        let result = self.stage_tree(rel, &mut created);
+        if result.is_err() {
+            for c in created.iter().rev() {
+                let is_dir = crate::sys::fs::statat_in_root(&self.upper, c, false)
+                    .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+                    .unwrap_or(false);
+                if is_dir {
+                    let _ = crate::sys::fs::remove_dir_all_in_root(&self.upper, c);
+                } else {
+                    let _ = crate::sys::fs::unlinkat_in_root(&self.upper, c, false);
+                }
+            }
+            self.recalc_disk_used();
         }
-        let names: Vec<String> = match fs::read_dir(self.workdir.join(rel)) {
-            Ok(rd) => rd
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect(),
-            Err(_) => return Ok(()),
-        };
-        for name in names {
-            let child = format!("{}/{}", rel, name);
-            if self.deleted.covers(&child) && !self.upper_has(&child) {
+        result
+    }
+
+    /// The traversal half of `copy_up_tree`: an explicit worklist (child
+    /// directory depth must not become supervisor stack depth) that records
+    /// every upper entry it creates into `created` for rollback.
+    fn stage_tree(&mut self, root: &str, created: &mut Vec<String>) -> Result<(), i32> {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(root.to_string());
+        while let Some(rel) = queue.pop_front() {
+            let was_in_upper = self.upper_has(&rel);
+            self.ensure_cow_copy(&rel).map_err(branch_errno)?;
+            if !was_in_upper && self.upper_has(&rel) {
+                created.push(rel.clone());
+            }
+            let st = match crate::sys::fs::statat_in_root(&self.workdir, &rel, false) {
+                Ok(st) => st,
+                // Upper-only entry: nothing below it in the lower to stage.
+                Err(libc::ENOENT) => continue,
+                Err(e) => return Err(e),
+            };
+            if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
                 continue;
             }
-            self.copy_up_tree(&child)?;
+            let rd = fs::read_dir(self.workdir.join(&rel))
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            for entry in rd {
+                let entry = entry.map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let child = format!("{}/{}", rel, name);
+                if self.deleted.covers(&child) && !self.upper_has(&child) {
+                    continue;
+                }
+                queue.push_back(child);
+            }
         }
         Ok(())
     }
@@ -786,7 +821,7 @@ impl SeccompCowBranch {
                 _ => {}
             }
         }
-        self.copy_up_tree(&old_rel).map_err(branch_errno)?;
+        self.copy_up_tree(&old_rel)?;
         if let Some(p) = parent_rel(&new_rel) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
@@ -2346,6 +2381,82 @@ mod tests {
             ),
             Err(libc::ENOENT)
         );
+    }
+
+    #[test]
+    fn rename_staging_failure_fails_rename_and_rolls_back() {
+        // A mid-tree staging error used to be swallowed, after which the
+        // source was whiteouted anyway and the untraversed children were
+        // lost at commit. The rename must fail, leave the merged view
+        // untouched, and leave no partially staged destination behind.
+        use std::os::unix::fs::PermissionsExt;
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/top.txt"), "top").unwrap();
+        fs::create_dir(wd.join("d/inner")).unwrap();
+        fs::write(wd.join("d/inner/deep.txt"), "deep").unwrap();
+        fs::set_permissions(wd.join("d/inner"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        let result = branch.handle_rename(
+            &format!("{}/d", wd.display()),
+            &format!("{}/moved", wd.display()),
+        );
+        fs::set_permissions(wd.join("d/inner"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(result, Err(libc::EACCES));
+        assert!(!branch.is_deleted("d"), "failed rename must not whiteout the source");
+        assert!(!branch.upper_dir().join("d").exists(), "partial staging left behind");
+        let merged = branch.list_merged_dir("d");
+        assert!(merged.contains(&"inner".to_string()));
+        assert!(merged.contains(&"top.txt".to_string()));
+        branch.commit().unwrap();
+        assert_eq!(fs::read_to_string(wd.join("d/inner/deep.txt")).unwrap(), "deep");
+    }
+
+    #[test]
+    fn rename_quota_failure_leaves_no_partial_staging() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/f1"), vec![b'x'; 50]).unwrap();
+        // Quota fits the staged directory (4096) but not the file after it.
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 4100).unwrap();
+        assert_eq!(
+            branch.handle_rename(&format!("{}/d", wd.display()), &format!("{}/m", wd.display())),
+            Err(libc::ENOSPC)
+        );
+        assert!(!branch.is_deleted("d"));
+        assert!(!branch.upper_dir().join("d").exists(), "partial staging left behind");
+        // The rollback must also return the reserved quota: a small write
+        // elsewhere still fits.
+        assert!(branch.ensure_cow_copy("existing.txt").is_ok());
+    }
+
+    #[test]
+    fn rename_deep_tree_stages_iteratively() {
+        // The staging walk is a worklist, not recursion: child-controlled
+        // directory depth must not become supervisor stack depth.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        let mut rel = String::from("d");
+        fs::create_dir(wd.join(&rel)).unwrap();
+        for _ in 0..400 {
+            rel.push_str("/d");
+            fs::create_dir(wd.join(&rel)).unwrap();
+        }
+        fs::write(wd.join(format!("{}/leaf.txt", rel)), "LEAF").unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(&format!("{}/d", wd.display()), &format!("{}/m", wd.display())),
+            Ok(true)
+        );
+        branch.commit().unwrap();
+        let deep = format!("m{}", &rel[1..]);
+        assert_eq!(fs::read_to_string(wd.join(format!("{}/leaf.txt", deep))).unwrap(), "LEAF");
+        assert!(!wd.join("d").exists());
     }
 
     #[test]
