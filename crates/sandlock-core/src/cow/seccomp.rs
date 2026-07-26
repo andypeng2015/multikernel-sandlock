@@ -464,13 +464,20 @@ impl SeccompCowBranch {
     /// seccomp supervisor) and prevents new opens once the quota is
     /// exhausted.
     pub fn handle_open(&mut self, path: &str, flags: u64) -> Result<Option<PathBuf>, BranchError> {
-        if flags & O_DIRECTORY != 0 {
-            return Ok(None);
-        }
         let rel = match self.safe_rel(path) {
             Some(r) => r,
             None => return Ok(None),
         };
+        if flags & O_DIRECTORY != 0 {
+            // A whiteouted directory must not fall through to the kernel:
+            // the lower directory still exists, so opendir would hand the
+            // child a live fd (and fstat its inode) where the merged answer
+            // is ENOENT.
+            if self.is_deleted(&rel) {
+                return Err(BranchError::Deleted);
+            }
+            return Ok(None);
+        }
 
         let is_write = flags & WRITE_FLAGS != 0;
 
@@ -531,6 +538,12 @@ impl SeccompCowBranch {
                 Some(r) => r,
                 None => return Ok(CowOpenPlan::Skip),
             };
+            // Same whiteout gate as the non-directory path: Skip would let
+            // the kernel open the still-existing lower directory where the
+            // merged answer is ENOENT.
+            if self.is_deleted(&rel) {
+                return Ok(CowOpenPlan::Deleted);
+            }
             let upper_dir = self.upper.join(&rel);
             let lower_dir = self.workdir.join(&rel);
             if upper_dir.is_dir() && !lower_dir.is_dir() {
@@ -1972,6 +1985,38 @@ mod tests {
         // Sibling boundary: d2 is not covered by the d whiteout.
         fs::write(workdir.path().join("d2"), "kept").unwrap();
         assert!(!branch.is_deleted("d2"));
+    }
+
+    #[test]
+    fn o_directory_open_of_whiteouted_dir_reports_deleted() {
+        // #159 review follow-up: opendir takes the O_DIRECTORY early-return,
+        // which used to skip the whiteout check entirely; the child got a
+        // live fd on the surviving lower directory (and could fstat its
+        // inode) where stat on the same path already said ENOENT.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/x"), "x").unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("d");
+        let path = format!("{}/d", wd.display());
+        let dirflag = libc::O_DIRECTORY as u64;
+        assert!(matches!(
+            branch.handle_open(&path, dirflag),
+            Err(BranchError::Deleted)
+        ));
+        assert!(matches!(
+            branch.prepare_open(&path, dirflag),
+            Ok(CowOpenPlan::Deleted)
+        ));
+        // Re-created in the upper: the shadow makes it visible again and the
+        // open goes back to the normal resolution.
+        assert!(branch.handle_mkdir(&path).unwrap());
+        assert!(matches!(branch.handle_open(&path, dirflag), Ok(None)));
+        assert!(!matches!(
+            branch.prepare_open(&path, dirflag),
+            Ok(CowOpenPlan::Deleted)
+        ));
     }
 
     #[test]
