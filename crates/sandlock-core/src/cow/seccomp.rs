@@ -27,6 +27,18 @@ fn parent_rel(rel: &str) -> Option<&str> {
     rel.trim_end_matches('/').rfind('/').map(|i| &rel[..i])
 }
 
+/// Errno for a branch failure, for handlers that answer the child directly
+/// (the `handle_unlink` convention) rather than returning a `BranchError`.
+fn branch_errno(e: BranchError) -> i32 {
+    match e {
+        BranchError::QuotaExceeded => libc::ENOSPC,
+        BranchError::Denied => libc::EPERM,
+        BranchError::Deleted => libc::ENOENT,
+        BranchError::Exists => libc::EEXIST,
+        BranchError::Operation(_) | BranchError::Conflict(_) => libc::EIO,
+    }
+}
+
 /// Plan for a COW copy — returned by `prepare_copy()` to separate metadata
 /// updates (under lock) from potentially expensive file I/O (outside lock).
 #[derive(Debug)]
@@ -709,10 +721,31 @@ impl SeccompCowBranch {
         Ok(ok)
     }
 
+    /// Merged-view classification of `rel`: `Some(is_dir)` when the child can
+    /// see an entry there, `None` when the merged answer is ENOENT. The upper
+    /// is consulted first because upper presence shadows both the lower entry
+    /// and any whiteout; a trailing symlink classifies as a non-directory
+    /// (rename never follows it).
+    fn merged_entry_is_dir(&self, rel: &str) -> Option<bool> {
+        if let Ok(st) = crate::sys::fs::statat_in_root(&self.upper, rel, false) {
+            return Some(st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+        }
+        if self.deleted.covers(rel) {
+            return None;
+        }
+        crate::sys::fs::statat_in_root(&self.workdir, rel, false)
+            .ok()
+            .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    }
+
     /// Handle rename.
     ///
-    /// Returns `Err(QuotaExceeded)` when the COW copy would exceed `max_disk`.
-    pub fn handle_rename(&mut self, old_path: &str, new_path: &str) -> Result<bool, BranchError> {
+    /// Returns `Ok(true)` on success, `Ok(false)` when the branch does not
+    /// handle the path, or `Err(errno)` when the merged view forbids the
+    /// rename (ENOENT for an absent or whiteouted source, ENOTEMPTY for a
+    /// non-empty directory destination, EISDIR/ENOTDIR for type mismatches,
+    /// ENOSPC for quota).
+    pub fn handle_rename(&mut self, old_path: &str, new_path: &str) -> Result<bool, i32> {
         let old_rel = match self.safe_rel(old_path) {
             Some(r) => r,
             None => return Ok(false),
@@ -721,19 +754,41 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        if self.is_deleted(&old_rel) {
-            return Err(BranchError::Deleted);
+        let src_is_dir = match self.merged_entry_is_dir(&old_rel) {
+            Some(d) => d,
+            None => return Err(libc::ENOENT),
+        };
+        // Destination semantics come from the merged view: renaming onto an
+        // existing directory must replace it or refuse, never publish the
+        // union of the renamed tree and the pre-existing one (issue #160
+        // review). The kernel cannot give these answers because it sees only
+        // one layer at a time.
+        if let Some(dest_is_dir) = self.merged_entry_is_dir(&new_rel) {
+            match (src_is_dir, dest_is_dir) {
+                (false, true) => return Err(libc::EISDIR),
+                (true, false) => return Err(libc::ENOTDIR),
+                (true, true) if !self.list_merged_dir(&new_rel).is_empty() => {
+                    return Err(libc::ENOTEMPTY)
+                }
+                _ => {}
+            }
         }
-        self.copy_up_tree(&old_rel)?;
+        self.copy_up_tree(&old_rel).map_err(branch_errno)?;
         if let Some(p) = parent_rel(&new_rel) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
         if crate::sys::fs::renameat_in_root(&self.upper, &old_rel, &new_rel).is_err() {
             return Ok(false);
         }
-        let lower_old = self.workdir.join(&old_rel);
-        if lower_old.exists() || lower_old.is_symlink() {
+        // A surviving lower entry under either name gets a whiteout: the
+        // source so it stops existing, the destination so commit removes it
+        // before publishing the renamed entry instead of merging into it.
+        // The staged upper entry shadows the destination whiteout until then.
+        if crate::sys::fs::statat_in_root(&self.workdir, &old_rel, false).is_ok() {
             self.mark_deleted(&old_rel);
+        }
+        if crate::sys::fs::statat_in_root(&self.workdir, &new_rel, false).is_ok() {
+            self.mark_deleted(&new_rel);
         }
         Ok(true)
     }
@@ -1345,7 +1400,7 @@ mod tests {
         let old = abs(&branch, "existing.txt");
         let new = abs(&branch, "renamed.txt");
         let err = branch.handle_rename(&old, &new).unwrap_err();
-        assert!(matches!(err, BranchError::QuotaExceeded));
+        assert_eq!(err, libc::ENOSPC);
     }
 
     #[test]
@@ -2113,13 +2168,139 @@ mod tests {
         let wd = workdir.path().canonicalize().unwrap();
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         branch.mark_deleted("existing.txt");
-        assert!(matches!(
+        assert_eq!(
             branch.handle_rename(
                 &format!("{}/existing.txt", wd.display()),
                 &format!("{}/moved.txt", wd.display())
             ),
-            Err(BranchError::Deleted)
-        ));
+            Err(libc::ENOENT)
+        );
+    }
+
+    #[test]
+    fn rename_onto_nonempty_dir_is_enotempty() {
+        // #160 review follow-up: with lower-only a/{a1} and b/{b1}, a
+        // dir-onto-dir rename must refuse with ENOTEMPTY, never publish the
+        // union b = {a1, b1}.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("a")).unwrap();
+        fs::write(wd.join("a/a1"), "A").unwrap();
+        fs::create_dir(wd.join("b")).unwrap();
+        fs::write(wd.join("b/b1"), "B").unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(&format!("{}/a", wd.display()), &format!("{}/b", wd.display())),
+            Err(libc::ENOTEMPTY)
+        );
+        // The refusal must leave no trace: nothing staged, nothing whiteouted.
+        assert!(!branch.is_deleted("a"));
+        assert_eq!(branch.list_merged_dir("b"), vec!["b1".to_string()]);
+        branch.commit().unwrap();
+        assert_eq!(fs::read_to_string(wd.join("a/a1")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(wd.join("b/b1")).unwrap(), "B");
+        assert!(!wd.join("b/a1").exists());
+    }
+
+    #[test]
+    fn rename_onto_empty_dir_replaces() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("a")).unwrap();
+        fs::write(wd.join("a/a1"), "A").unwrap();
+        fs::create_dir(wd.join("b")).unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(&format!("{}/a", wd.display()), &format!("{}/b", wd.display())),
+            Ok(true)
+        );
+        assert!(branch.is_deleted("a"));
+        assert_eq!(branch.list_merged_dir("b"), vec!["a1".to_string()]);
+        branch.commit().unwrap();
+        assert!(!wd.join("a").exists());
+        assert_eq!(fs::read_to_string(wd.join("b/a1")).unwrap(), "A");
+    }
+
+    #[test]
+    fn rename_onto_lower_file_replaces_not_merges() {
+        // The destination's lower bytes must be gone after commit, replaced
+        // by the renamed entry, and the source name must stop existing.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::write(wd.join("target.txt"), "OLD").unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/target.txt", wd.display())
+            ),
+            Ok(true)
+        );
+        branch.commit().unwrap();
+        assert!(!wd.join("existing.txt").exists());
+        assert_eq!(fs::read_to_string(wd.join("target.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn rename_type_mismatch_refused() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        // File onto directory: EISDIR. Directory onto file: ENOTDIR.
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/d", wd.display())
+            ),
+            Err(libc::EISDIR)
+        );
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/d", wd.display()),
+                &format!("{}/existing.txt", wd.display())
+            ),
+            Err(libc::ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn rename_onto_whiteouted_dest_is_plain_rename() {
+        // A whiteouted destination is absent in the merged view; the rename
+        // must succeed and expose only the renamed content.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("b")).unwrap();
+        fs::write(wd.join("b/b1"), "B").unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(branch.handle_unlink(&format!("{}/b/b1", wd.display()), false), Ok(true));
+        assert_eq!(branch.handle_unlink(&format!("{}/b", wd.display()), true), Ok(true));
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/b", wd.display())
+            ),
+            Ok(true)
+        );
+        branch.commit().unwrap();
+        let meta = fs::metadata(wd.join("b")).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(fs::read_to_string(wd.join("b")).unwrap(), "hello");
+        assert!(!wd.join("existing.txt").exists());
+    }
+
+    #[test]
+    fn rename_absent_source_is_enoent() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/nope", wd.display()),
+                &format!("{}/dest", wd.display())
+            ),
+            Err(libc::ENOENT)
+        );
     }
 
     #[test]

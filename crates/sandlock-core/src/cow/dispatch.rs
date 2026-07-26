@@ -498,7 +498,7 @@ fn cow_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
     }
 }
 
-/// Map an unlink result (returns errno directly) to a NotifAction.
+/// Map an errno-style handler result (unlink, rename) to a NotifAction.
 fn unlink_result(r: Result<bool, i32>) -> NotifAction {
     match r {
         Ok(true) => NotifAction::ReturnValue(0),
@@ -631,7 +631,7 @@ pub(crate) async fn handle_cow_write(
         }
         CowWriteOp::Rename { ref old_path, ref new_path } => {
             if !cow.matches(old_path) { return NotifAction::Continue; }
-            cow_result(cow.handle_rename(old_path, new_path))
+            unlink_result(cow.handle_rename(old_path, new_path))
         }
         CowWriteOp::Symlink { ref target, ref linkpath } => {
             if !cow.matches(linkpath) { return NotifAction::Continue; }
