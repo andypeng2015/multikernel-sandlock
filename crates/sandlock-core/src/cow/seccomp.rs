@@ -2322,6 +2322,41 @@ mod tests {
     }
 
     #[test]
+    fn rename_onto_lower_symlink_dest_commits_as_regular_file() {
+        // The discriminating case for the destination whiteout: an empty-dir
+        // or regular-file destination commits identical bytes whether the
+        // rename replaces or merges, so only a special-file destination can
+        // tell the two apart. Without the whiteout the lower symlink survives
+        // into commit, whose O_NOFOLLOW publish refuses to write through it
+        // (and a FIFO destination would hang it, the #158 class).
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::write(wd.join("real.txt"), "REAL").unwrap();
+        std::os::unix::fs::symlink("real.txt", wd.join("dest")).unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/dest", wd.display())
+            ),
+            Ok(true)
+        );
+        branch.commit().unwrap();
+
+        let meta = fs::symlink_metadata(wd.join("dest")).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "dest must be the renamed regular file, not the surviving symlink"
+        );
+        assert_eq!(fs::read_to_string(wd.join("dest")).unwrap(), "hello");
+        assert!(!wd.join("existing.txt").exists());
+        // The link's old target is untouched: the rename replaced the link
+        // itself and never wrote through it.
+        assert_eq!(fs::read_to_string(wd.join("real.txt")).unwrap(), "REAL");
+    }
+
+    #[test]
     fn rename_type_mismatch_refused() {
         let (workdir, storage) = setup_workdir();
         let wd = workdir.path().canonicalize().unwrap();
