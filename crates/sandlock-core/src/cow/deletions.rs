@@ -30,6 +30,10 @@ fn escape(raw: &str) -> String {
         match c {
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
+            // BufRead::lines strips a trailing \r on replay; unescaped, a
+            // path ending in \r would round-trip to the \r-less sibling,
+            // hiding that one and resurrecting the deleted path.
+            '\r' => out.push_str("\\r"),
             _ => out.push(c),
         }
     }
@@ -46,6 +50,7 @@ fn unescape(raw: &str) -> String {
         }
         match it.next() {
             Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
             Some(other) => out.push(other),
             None => out.push('\\'),
         }
@@ -53,12 +58,26 @@ fn unescape(raw: &str) -> String {
     out
 }
 
+/// Persist the log's directory entry. `insert` only fdatasyncs the file
+/// itself, which does not cover the name in the parent directory: without
+/// this, a power loss after the first deletion can drop the whole log, the
+/// exact crash class it exists for. Best-effort like every other log write.
+fn sync_parent_dir(p: &Path) {
+    if let Some(dir) = p.parent() {
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+}
+
 impl DeletionSet {
     /// Open a fresh set. `log_path` is opened for appending; `None`, or a
     /// path that cannot be created, gives a RAM-only set.
     pub fn create(log_path: Option<&Path>) -> Self {
         let log = log_path.and_then(|p| {
-            fs::OpenOptions::new().create(true).append(true).open(p).ok()
+            let f = fs::OpenOptions::new().create(true).append(true).open(p).ok()?;
+            sync_parent_dir(p);
+            Some(f)
         });
         Self { entries: BTreeSet::new(), log }
     }
@@ -78,7 +97,12 @@ impl DeletionSet {
                 }
             }
         }
-        let log = fs::OpenOptions::new().create(true).append(true).open(log_path).ok();
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .ok()
+            .inspect(|_| sync_parent_dir(log_path));
         Self { entries, log }
     }
 
@@ -164,6 +188,25 @@ mod tests {
             vec!["back\\slash", "dir/with\nnewline", "plain.txt"]
         );
         assert!(replayed.covers("dir/with\nnewline/child"));
+    }
+
+    #[test]
+    fn log_roundtrip_carriage_return() {
+        // A trailing \r is stripped by the line reader; without escaping,
+        // "d/file\r" would replay as "d/file", after which covers() hides
+        // the wrong sibling and the actually-deleted path resurrects.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("deleted.log");
+        {
+            let mut s = DeletionSet::create(Some(&log));
+            s.insert("d/file\r");
+            s.insert("mid\rdle");
+        }
+        let replayed = DeletionSet::load(&log);
+        assert!(replayed.covers("d/file\r"));
+        assert!(!replayed.covers("d/file"));
+        assert!(replayed.covers("mid\rdle"));
+        assert!(replayed.covers("mid\rdle/child"));
     }
 
     #[test]
