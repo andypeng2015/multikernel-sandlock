@@ -848,11 +848,11 @@ impl Sandbox {
     /// descendant that inherited the write end keeps the join blocked for as
     /// long as it lives, which is exactly when a caller's timeout fires. So
     /// each handle is joined in place and only unparked once that join
-    /// completes; see `join_parked_drain`.
+    /// completes; see `finish_parked_drain`.
     ///
     /// `None` means the stream was never piped, was taken by the caller, or was
     /// already collected by an earlier `wait()`; a drain that panicked or was
-    /// aborted yields no output rather than failing the run.
+    /// aborted reports empty bytes rather than failing the run.
     async fn collect_pipe_drains(&mut self) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
         // Finish both first — each stores its bytes into the runtime as it
         // completes — and only then take them out. A cancellation between the
@@ -2321,29 +2321,12 @@ unsafe fn wire_child_stdio(mode: StdioMode, target: i32, pipe_src: Option<i32>, 
     }
 }
 
-/// Spawn a task that reads one capture pipe to EOF, for `wait` to join once the
-/// child has been reaped.
-///
-/// An ordinary task, not `spawn_blocking`: a blocking read would hold a thread
-/// of the shared blocking pool for the child's entire lifetime — even for a
-/// child that writes nothing — and that pool is also what the COW copier and
-/// the fork-tracking worker need *while* a child is alive, so a saturated pool
-/// is a deadlock rather than a slowdown.
-///
-/// `Receiver::from_owned_fd` sets O_NONBLOCK on this fd and registers it with
-/// the runtime's I/O driver (which `wait` needs anyway, for the pidfd). The
-/// flag belongs to the open file description behind the *read* end; the child
-/// writes to the write end, a separate description, so its `write()`s stay
-/// blocking — which is what keeps the pipe applying back-pressure rather than
-/// dropping output. The conversion can only fail if the fd is not a readable
-/// pipe, which cannot happen for the pipes `do_create_stdio` creates; if it
-/// somehow did, the stream is left uncaptured rather than the run failing.
 /// A capture pipe's drain, parked on the `Runtime`: the task while it reads,
 /// then the bytes it read.
 ///
 /// Both states have to be parked, not just the first. Handing the finished
 /// bytes back to the `wait()` future and clearing the slot would leave them in
-/// a stack local of a cancellable future — and the sibling stream is joined
+/// a stack local of a cancellable future, and the sibling stream is joined
 /// after it, which is a suspension point whenever that one is still draining.
 /// A timeout landing there would then destroy a capture that had already been
 /// read in full, with nothing left on the runtime to recover it from.
@@ -2352,6 +2335,23 @@ enum ParkedDrain {
     Done(Vec<u8>),
 }
 
+/// Spawn a task that reads one capture pipe to EOF, for `wait` to join once the
+/// child has been reaped.
+///
+/// An ordinary task, not `spawn_blocking`: a blocking read would hold a thread
+/// of the shared blocking pool for the child's entire lifetime (even for a
+/// child that writes nothing), and that pool is also what the COW copier and
+/// the fork-tracking worker need *while* a child is alive, so a saturated pool
+/// is a deadlock rather than a slowdown.
+///
+/// `Receiver::from_owned_fd` sets O_NONBLOCK on this fd and registers it with
+/// the runtime's I/O driver (which `wait` needs anyway, for the pidfd). The
+/// flag belongs to the open file description behind the *read* end; the child
+/// writes to the write end, a separate description, so its `write()`s stay
+/// blocking, which is what keeps the pipe applying back-pressure rather than
+/// dropping output. The conversion can only fail if the fd is not a readable
+/// pipe, which cannot happen for the pipes `do_create_stdio` creates; if it
+/// somehow did, the stream is left uncaptured rather than the run failing.
 fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<ParkedDrain> {
     let mut rx = match tokio::net::unix::pipe::Receiver::from_owned_fd(fd) {
         Ok(rx) => rx,
@@ -2365,27 +2365,25 @@ fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<ParkedDrain> {
     })))
 }
 
-/// Join one parked capture drain, leaving it parked if the join is cancelled.
-///
-/// The handle is awaited *through* the slot and the slot is cleared only once
-/// the await has produced a value. Taking the handle out first would hand it to
-/// the awaiting future, so dropping that future — which is all a caller's
-/// `timeout` or `select!` does — would drop the handle with it and every later
-/// `wait()` would report no output. This join is not instantaneous: the child
-/// is reaped by the time it runs, but a descendant still holding the write end
-/// keeps the read short of EOF, which is precisely the case a caller times out
-/// on. Dropping the returned future does not abort the drain task, so the
-/// handle left behind is still reading and a later `wait()` picks it up.
-///
-/// `None` means there was nothing parked. A drain that panicked or was aborted
-/// yields no output rather than failing the run, and is unparked all the same.
 /// Drive one parked drain to completion, leaving its bytes in the slot.
 ///
-/// The store happens in the same step as the await resolving, so there is no
-/// point at which the bytes exist only inside this future: cancelling it leaves
-/// either the still-running task or the finished bytes parked for the next
-/// `wait()`. `JoinHandle` is `Unpin`, so it can be polled through `&mut`, and
-/// dropping this future does not abort the task.
+/// The handle is awaited *through* the slot, and the store happens in the same
+/// step as the await resolving, so there is no point at which the bytes exist
+/// only inside this future: cancelling it leaves either the still-running task
+/// or the finished bytes parked for the next `wait()`. Taking the handle out
+/// first would hand it to the awaiting future, so dropping that future (which
+/// is all a caller's `timeout` or `select!` does) would drop the handle with
+/// it and every later `wait()` would report no output.
+///
+/// This join is not instantaneous: the child is reaped by the time it runs,
+/// but a descendant still holding the write end keeps the read short of EOF,
+/// which is precisely the case a caller times out on. `JoinHandle` is `Unpin`,
+/// so it can be polled through `&mut`, and dropping this future does not abort
+/// the task: the drain left behind is still reading and a later `wait()` picks
+/// it up.
+///
+/// A drain that panicked or was aborted parks empty bytes, so the run reports
+/// an empty capture rather than failing.
 async fn finish_parked_drain(slot: &mut Option<ParkedDrain>) {
     if let Some(ParkedDrain::Running(handle)) = slot.as_mut() {
         let buf = handle.await.unwrap_or_default();
