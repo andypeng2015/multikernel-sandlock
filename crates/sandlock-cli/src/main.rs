@@ -264,11 +264,18 @@ async fn main() -> Result<()> {
                     println!("No running sandboxes.");
                 }
                 Ok(sandboxes) => {
-                    println!("{:<32} {:>8}  {:>12}  {}", "NAME", "PID", "UPTIME", "CMD");
+                    println!(
+                        "{:<32} {:>8}  {:>12}  {:<24}  {}",
+                        "NAME", "PID", "UPTIME", "PORTS", "CMD"
+                    );
                     for (name, pid) in &sandboxes {
                         let uptime = proc_uptime(*pid).unwrap_or_else(|| "?".to_string());
                         let cmd = proc_cmdline(*pid).unwrap_or_else(|| "?".to_string());
-                        println!("{:<32} {:>8}  {:>12}  {}", name, pid, uptime, cmd);
+                        let ports = query_ports(name);
+                        println!(
+                            "{:<32} {:>8}  {:>12}  {:<24}  {}",
+                            name, pid, uptime, ports, cmd
+                        );
                     }
                 }
                 Err(e) => {
@@ -350,6 +357,11 @@ async fn main() -> Result<()> {
             // it's in a different process group.
             unsafe { libc::killpg(child_pid, libc::SIGKILL) };
             unsafe { libc::kill(supervisor_pid, libc::SIGKILL) };
+
+            // SIGKILL bypasses Drop, so the supervisor never runs its own
+            // cleanup.  Remove the runtime dir here so it doesn't linger
+            // until the next `sandlock ps` prunes it.
+            sandlock_core::control::cleanup_runtime_dir(&dir);
 
             println!(
                 "Killed sandbox '{}' (child PID {}, supervisor PID {})",
@@ -920,6 +932,36 @@ fn parse_branch_action(flag: &str, s: &str) -> Result<BranchAction> {
 // /proc helpers for sandlock ps
 // ============================================================
 
+/// Query the control socket for the virtual→real port map, returning a
+/// compact display string or `"-"` when the socket is missing (e.g.
+/// `--no-supervisor` or `control_socket = false`).
+fn query_ports(name: &str) -> String {
+    use sandlock_core::control::send_control_request;
+    match send_control_request(name, "ports", serde_json::Value::Object(Default::default())) {
+        Ok(resp) if resp.ok => {
+            if let Some(data) = resp.data {
+                let map: std::collections::HashMap<u16, u16> =
+                    match serde_json::from_value(data) {
+                        Ok(m) => m,
+                        Err(_) => return "-".to_string(),
+                    };
+                if map.is_empty() {
+                    return "-".to_string();
+                }
+                let mut entries: Vec<String> = map
+                    .iter()
+                    .map(|(v, r)| format!("{}→{}", v, r))
+                    .collect();
+                entries.sort();
+                entries.join(", ")
+            } else {
+                "-".to_string()
+            }
+        }
+        _ => "-".to_string(),
+    }
+}
+
 /// Read /proc/<pid>/stat and return a human-readable uptime string.
 fn proc_uptime(pid: i32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
@@ -970,10 +1012,13 @@ fn proc_cmdline(pid: i32) -> Option<String> {
     if args.is_empty() {
         Some("?".to_string())
     } else {
-        // Truncate to ~60 chars for display.
+        // Truncate to ~60 chars for display.  Slice on a character
+        // boundary — &joined[..57] would panic if byte 57 falls in the
+        // middle of a multi-byte UTF-8 codepoint.
         let joined = args.join(" ");
         if joined.len() > 60 {
-            Some(format!("{}…", &joined[..57]))
+            let end = joined.floor_char_boundary(57);
+            Some(format!("{}…", &joined[..end]))
         } else {
             Some(joined)
         }

@@ -80,23 +80,50 @@ fn read_supervisor_pid(dir: &Path) -> Option<i32> {
 // Runtime dir lifecycle — called from sandbox-core
 // ============================================================
 
-/// Create the per-sandbox runtime directory, write the pid file, and bind the
-/// control socket.  Returns the `UnixListener` (to be passed to
-/// `spawn_control_loop`) and the dir path.
-///
-/// Must be called after the child is forked (so `child_pid` is known) but
-/// before `do_start` releases the child to execve.
+/// Create the per-sandbox runtime directory and write the pid file — shared
+/// by the supervisor and no_supervisor paths.  Returns the dir path.
 ///
 /// # Name collision
 ///
 /// If a runtime directory already exists for `name` and its supervisor is
 /// still alive, this returns `ErrorKind::AlreadyExists`.  Stale dirs (dead
 /// supervisor) are removed and recreated.
+///
+/// # no_supervisor callers
+///
+/// The `no_supervisor` path in `do_spawn` calls this directly (without the
+/// socket) instead of duplicating a bare `remove_dir_all` + `create_dir_all`
+/// that had no liveness check and would wipe a live sandbox's pid file on a
+/// name collision.
 pub fn setup_runtime_dir(
     name: &str,
     child_pid: i32,
     supervisor_pid: i32,
 ) -> Result<(UnixListener, PathBuf), std::io::Error> {
+    let dir = setup_runtime_dir_no_socket(name, child_pid, supervisor_pid)?;
+
+    // Bind control socket.
+    let sp = sock_path(&dir);
+    let listener = UnixListener::bind(&sp)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sp, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok((listener, dir))
+}
+
+/// Create the per-sandbox runtime directory and write the pid file, without
+/// binding a control socket.  Used by the `no_supervisor` path (no socket
+/// exists) and as the common prefix of `setup_runtime_dir` for the supervisor
+/// path.
+pub fn setup_runtime_dir_no_socket(
+    name: &str,
+    child_pid: i32,
+    supervisor_pid: i32,
+) -> Result<PathBuf, std::io::Error> {
     let dir = sandbox_dir(name);
 
     // Check for name collision: if the dir exists and the sandbox is still
@@ -129,17 +156,7 @@ pub fn setup_runtime_dir(
     std::fs::write(&tmp_path, format!("{}\n{}\n", child_pid, supervisor_pid))?;
     std::fs::rename(&tmp_path, &pid_path)?;
 
-    // Bind control socket.
-    let sp = sock_path(&dir);
-    let listener = UnixListener::bind(&sp)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&sp, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    Ok((listener, dir))
+    Ok(dir)
 }
 
 /// Remove the per-sandbox runtime directory. Best-effort: failures are logged
@@ -310,6 +327,7 @@ async fn serve_one(
 
     match req.verb.as_str() {
         "config" => handle_config(&mut stream, ctx, sandbox).await,
+        "ports" => handle_ports(&mut stream, ctx).await,
         _ => {
             let resp = ControlResponse {
                 v: 1,
@@ -340,6 +358,42 @@ async fn handle_config(
     // Emit JSON.  Wrap in a "policy" key so the top-level response is
     // structured; the data field is the full ProfileInput.
     let data = match serde_json::to_value(&profile) {
+        Ok(v) => v,
+        Err(e) => {
+            let resp = ControlResponse {
+                v: 1,
+                ok: false,
+                data: None,
+                err: Some(format!("serialize error: {}", e)),
+            };
+            let _ = write_response(stream, &resp).await;
+            return;
+        }
+    };
+
+    let resp = ControlResponse {
+        v: 1,
+        ok: true,
+        data: Some(data),
+        err: None,
+    };
+    let _ = write_response(stream, &resp).await;
+}
+
+async fn handle_ports(
+    stream: &mut tokio::net::UnixStream,
+    ctx: &Arc<SupervisorCtx>,
+) {
+    // Read the current virtual→real port map from the supervisor's
+    // NetworkState.  This is the live mapping at request-time — more
+    // accurate than a static registry that only refreshes on bind and
+    // goes stale on SIGKILL.
+    let ports: std::collections::HashMap<u16, u16> = {
+        let ns = ctx.network.lock().await;
+        ns.port_map.virtual_to_real.clone()
+    };
+
+    let data = match serde_json::to_value(&ports) {
         Ok(v) => v,
         Err(e) => {
             let resp = ControlResponse {
@@ -534,6 +588,15 @@ pub fn send_control_request(
     let sp = sock_path(&dir);
     let mut stream = UnixStream::connect(&sp)
         .map_err(|e| format!("connect to {:?}: {}", sp, e))?;
+
+    // Set a 2-second timeout on reads so a wedged supervisor does not
+    // block the CLI forever.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .map_err(|e| format!("set_read_timeout: {}", e))?;
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .map_err(|e| format!("set_write_timeout: {}", e))?;
 
     let req = serde_json::json!({
         "v": 1,

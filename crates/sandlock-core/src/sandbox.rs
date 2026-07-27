@@ -328,6 +328,12 @@ impl BindPorts {
     }
 }
 
+/// Serde default for `control_socket` — deserialized configs that don't
+/// mention the field still get introspection enabled.
+fn default_control_socket() -> bool {
+    true
+}
+
 /// Sandbox configuration.
 #[derive(Serialize, Deserialize)]
 pub struct Sandbox {
@@ -479,7 +485,7 @@ pub struct Sandbox {
     /// Enable the per-sandbox control socket for introspection (`sandlock ps`,
     /// `sandlock config`, etc.). Defaults to `true`. Set to `false` to skip
     /// the runtime dir, pid file, and control-socket tokio task entirely.
-    #[serde(skip)]
+    #[serde(skip_serializing, default = "default_control_socket")]
     pub control_socket: bool,
 
     // User-namespace identity (run-as uid/gid)
@@ -1855,19 +1861,28 @@ impl Sandbox {
         // can discover and list them.  The control socket is only created when
         // a supervisor exists (inside the if-let below).  Honour the
         // control_socket opt-out knob.
+        //
+        // Use setup_runtime_dir_no_socket to get the liveness check — a
+        // no-supervisor sandbox with the same name as a live sandbox must
+        // refuse to start rather than unconditionally remove_dir_all the
+        // live one's pid file.
         if no_supervisor && self.control_socket {
             let sandbox_name = self.rt().name.clone();
             let supervisor_pid = std::process::id() as i32;
-            let dir = crate::control::sandbox_dir(&sandbox_name);
-            if dir.exists() {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
-            if std::fs::create_dir_all(&dir).is_ok() {
-                let pid_path = crate::control::pid_path(&dir);
-                let tmp_path = dir.join(".pid.tmp");
-                let _ = std::fs::write(&tmp_path, format!("{}\n{}\n", pid, supervisor_pid));
-                let _ = std::fs::rename(&tmp_path, &pid_path);
-                self.rt_mut().control_dir = Some(dir);
+            match crate::control::setup_runtime_dir_no_socket(
+                &sandbox_name,
+                pid,
+                supervisor_pid,
+            ) {
+                Ok(dir) => {
+                    self.rt_mut().control_dir = Some(dir);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "sandlock: runtime dir setup failed for '{}': {}",
+                        sandbox_name, e
+                    );
+                }
             }
         }
 
@@ -1920,7 +1935,22 @@ impl Sandbox {
                         self.rt_mut().control_dir = Some(control_dir);
                         control_listener = Some(listener);
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // Name collision with a live sandbox — hard-fail.
+                        // A second sandbox with the same name would be
+                        // invisible to ps and its Drop would remove the
+                        // first one's runtime dir.
+                        return Err(SandboxRuntimeError::Child(format!(
+                            "sandbox '{}' is already running: {}",
+                            sandbox_name, e
+                        ))
+                        .into());
+                    }
                     Err(e) => {
+                        // Best-effort: in nested sandboxes /dev/shm may be
+                        // restricted by the outer sandlock's landlock policy.
+                        // Warn and continue without a control socket rather
+                        // than failing the sandbox.
                         eprintln!(
                             "sandlock: control socket setup failed for '{}': {} \
                              (introspection unavailable for this sandbox)",
