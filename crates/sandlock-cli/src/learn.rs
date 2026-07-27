@@ -16,7 +16,7 @@ use sandlock_core::Sandbox;
 
 /// Protected: no legitimate sandboxed workload needs a recursive grant here.
 /// Write collapse to these is skipped + error. Read collapse never fires here.
-const PROTECTED_PATHS: &[&[u8]] = &[b"/root"];
+const PROTECTED_PATHS: &[&[u8]] = &[b"/", b"/root"];
 const PROTECTED_CRED_SUFFIXES: &[&[u8]] = &[b"/.ssh", b"/.aws", b"/.kube", b"/.gnupg"];
 
 /// Guarded: write grants are sometimes necessary but warrant operator awareness.
