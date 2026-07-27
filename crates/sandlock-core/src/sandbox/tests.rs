@@ -325,3 +325,36 @@ fn relocate_high_moves_fd_above_stdio_range() {
 
     unsafe { libc::close(hi) };
 }
+
+/// A `wait()` cancelled while it is joining the drains must leave the handle
+/// parked, so a later `wait()` still returns the capture. Reaching that state
+/// end-to-end needs a descendant holding the write end past the child's exit,
+/// which is inherently racy (the integration test retries for it), so the
+/// contract itself is pinned here: joining through the slot, and clearing it
+/// only once the await has produced a value.
+#[tokio::test]
+async fn join_parked_drain_keeps_the_handle_when_cancelled() {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let mut slot = Some(tokio::spawn(async move {
+        let _ = rx.await;
+        b"hello".to_vec()
+    }));
+
+    // The task cannot finish while the sender is held, so this join is still
+    // pending when the timeout drops it — that drop is the cancellation.
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        join_parked_drain(&mut slot),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the join must still have been pending");
+    assert!(slot.is_some(), "a cancelled join must leave the handle parked");
+
+    // Releasing the task: the parked handle still yields what it read.
+    tx.send(()).unwrap();
+    assert_eq!(
+        join_parked_drain(&mut slot).await.as_deref(),
+        Some(&b"hello"[..]),
+    );
+    assert!(slot.is_none(), "a completed join must clear the slot");
+}

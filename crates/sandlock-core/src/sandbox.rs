@@ -752,7 +752,10 @@ impl Sandbox {
     /// Dropping the returned future does not cost the captured output: the pipe
     /// drains belong to the `Sandbox`, so a caller that cancels this `wait()`
     /// (a `timeout` or `select!` around it) and calls `wait()` again still gets
-    /// what the child wrote.
+    /// what the child wrote. That holds wherever the cancellation lands —
+    /// before the drains start, while the child is still running, or while the
+    /// final join is blocked because a descendant is still holding the write
+    /// end open past the child's own exit.
     pub async fn wait(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
         use crate::result::RunResult;
@@ -762,8 +765,9 @@ impl Sandbox {
         // Already reaped: hand back the same status again, plus whatever the
         // drains collected. They outlive the `wait()` that started them, so a
         // second call still reports the output of a first one that was
-        // cancelled — or that already returned it, in which case they are gone
-        // and both streams are `None`.
+        // cancelled — including one cancelled while joining them here, since a
+        // join only unparks a drain once it has completed. A `wait()` that ran
+        // to the end took them with it, and both streams are then `None`.
         let stopped = match self.rt().state {
             RuntimeState::Stopped(ref es) => Some(es.clone()),
             _ => None,
@@ -839,21 +843,20 @@ impl Sandbox {
     /// Join the capture-pipe drains, if this runtime still holds them.
     ///
     /// Only called once the child has been reaped, so the EOF each drain is
-    /// reading towards is already reachable. `None` means the stream was never
-    /// piped, was taken by the caller, or was already collected by an earlier
-    /// `wait()`; a drain that panicked or was aborted yields no output rather
-    /// than failing the run.
+    /// reading towards is already reachable — but not necessarily *reached*: a
+    /// descendant that inherited the write end keeps the join blocked for as
+    /// long as it lives, which is exactly when a caller's timeout fires. So
+    /// each handle is joined in place and only unparked once that join
+    /// completes; see `join_parked_drain`.
+    ///
+    /// `None` means the stream was never piped, was taken by the caller, or was
+    /// already collected by an earlier `wait()`; a drain that panicked or was
+    /// aborted yields no output rather than failing the run.
     async fn collect_pipe_drains(&mut self) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-        let out = self.rt_mut().stdout_drain.take();
-        let err = self.rt_mut().stderr_drain.take();
-        let stdout = match out {
-            Some(h) => Some(h.await.unwrap_or_default()),
-            None => None,
-        };
-        let stderr = match err {
-            Some(h) => Some(h.await.unwrap_or_default()),
-            None => None,
-        };
+        // One statement per stream: each borrow of the runtime ends with it, so
+        // the second join is free to borrow again.
+        let stdout = join_parked_drain(&mut self.rt_mut().stdout_drain).await;
+        let stderr = join_parked_drain(&mut self.rt_mut().stderr_drain).await;
         (stdout, stderr)
     }
 
@@ -2338,6 +2341,28 @@ fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<JoinHandle<Vec<u
         let _ = rx.read_to_end(&mut buf).await;
         buf
     }))
+}
+
+/// Join one parked capture drain, leaving it parked if the join is cancelled.
+///
+/// The handle is awaited *through* the slot and the slot is cleared only once
+/// the await has produced a value. Taking the handle out first would hand it to
+/// the awaiting future, so dropping that future — which is all a caller's
+/// `timeout` or `select!` does — would drop the handle with it and every later
+/// `wait()` would report no output. This join is not instantaneous: the child
+/// is reaped by the time it runs, but a descendant still holding the write end
+/// keeps the read short of EOF, which is precisely the case a caller times out
+/// on. Dropping the returned future does not abort the drain task, so the
+/// handle left behind is still reading and a later `wait()` picks it up.
+///
+/// `None` means there was nothing parked. A drain that panicked or was aborted
+/// yields no output rather than failing the run, and is unparked all the same.
+async fn join_parked_drain(slot: &mut Option<JoinHandle<Vec<u8>>>) -> Option<Vec<u8>> {
+    let handle = slot.as_mut()?;
+    // `JoinHandle` is `Unpin`, so it can be polled through `&mut`.
+    let buf = handle.await.unwrap_or_default();
+    *slot = None;
+    Some(buf)
 }
 
 fn sandbox_read_fd_to_end(fd: std::os::fd::OwnedFd) -> Vec<u8> {

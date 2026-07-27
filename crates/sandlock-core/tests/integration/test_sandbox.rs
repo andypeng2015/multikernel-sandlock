@@ -830,6 +830,63 @@ async fn test_cancelled_wait_keeps_the_capture_for_the_next_wait() {
     );
 }
 
+/// The same promise, for a `wait()` cancelled while it is *joining* the drains.
+///
+/// The child exits promptly, so the exit wait completes and `wait()` gets as
+/// far as the final join — which then blocks, because a background subshell
+/// inherited the write end of stdout and the read cannot reach EOF while it
+/// lives. That is the documented slow case, and it is where a caller's timeout
+/// lands. A join that took the handles out of the runtime before awaiting them
+/// would drop them with the cancelled future, and the next `wait()` would
+/// report no output at all even though the drain had read it.
+///
+/// Keeping that survivor alive takes some care. It has to be a subshell rather
+/// than a backgrounded external command, because an `execve` from a background
+/// job is not guaranteed to succeed under every policy — and a survivor that
+/// never starts leaves the join unblocked and this test vacuous. A shell also
+/// reopens a background job's stdin before running it, and the supervisor stops
+/// answering once the top-level child is reaped, so the shell is kept busy for
+/// a while after forking to let that finish first. An attempt whose first
+/// `wait()` completes anyway says nothing about the join and is retried;
+/// never blocking at all is a failure, not a pass. The contract this exercises
+/// is also pinned deterministically as a unit test on `join_parked_drain`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_wait_cancelled_during_the_drain_join_keeps_the_capture() {
+    // The subshell holds fd 1 open and execs nothing of its own; the counting
+    // loop is the parent shell outliving its own background job's start-up.
+    const CMD: &str =
+        "printf hello; (while :; do :; done) & i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done";
+
+    for _ in 0..8 {
+        let mut sb = capture_policy().with_name("drain-join-cancel");
+        sb.spawn(&["sh", "-c", CMD]).await.unwrap();
+
+        // The child exits, but the drain cannot: this cancellation lands on the
+        // join. A wait that completes means no survivor took the write end.
+        let first = tokio::time::timeout(std::time::Duration::from_millis(500), sb.wait()).await;
+        if first.is_ok() {
+            continue;
+        }
+
+        // Kills the whole process group, so the surviving subshell releases the
+        // write end and the parked drain can finally see EOF.
+        sb.kill().unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait())
+            .await
+            .expect("the second wait() hung")
+            .unwrap();
+
+        assert_eq!(
+            result.stdout.as_deref(),
+            Some(&b"hello"[..]),
+            "a wait() cancelled during the join must leave the drain parked for the next one",
+        );
+        return;
+    }
+    panic!("no attempt kept a descendant on the write end: the join was never cancelled");
+}
+
 /// A capture-mode `wait()` must not park threads of the shared blocking pool
 /// for the child's whole lifetime.
 ///
