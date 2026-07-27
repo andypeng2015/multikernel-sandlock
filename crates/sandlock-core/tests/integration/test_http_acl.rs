@@ -137,7 +137,7 @@ async fn test_http_allow_get() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -162,7 +162,7 @@ async fn test_http_deny_non_matching() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/denied", port), &out);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -188,7 +188,7 @@ async fn test_http_deny_precedence() {
 
     // GET /public — should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/public", port), &out_allowed);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -197,7 +197,7 @@ async fn test_http_deny_precedence() {
 
     // GET /secret — should be denied
     let script = http_script(&format!("http://127.0.0.1:{}/secret", port), &out_denied);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -222,7 +222,7 @@ async fn test_http_no_acl_unrestricted() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -248,7 +248,7 @@ async fn test_http_method_filtering() {
 
     // GET should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/anything", port), &out_get);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -257,7 +257,7 @@ async fn test_http_method_filtering() {
 
     // POST should be denied
     let script = post_script(&format!("http://127.0.0.1:{}/anything", port), &out_post);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -285,7 +285,7 @@ async fn test_http_multiple_allow_rules() {
 
     // GET /get — should succeed (matches first rule)
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out_get);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -294,7 +294,7 @@ async fn test_http_multiple_allow_rules() {
 
     // GET /anything — should be denied (not in allow list)
     let script = http_script(&format!("http://127.0.0.1:{}/anything", port), &out_other);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -322,7 +322,7 @@ async fn test_http_wildcard_host() {
 
     // GET /get — should succeed
     let script = http_script(&format!("http://127.0.0.1:{}/get", port), &out_get);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -331,7 +331,7 @@ async fn test_http_wildcard_host() {
 
     // GET /admin/settings — should be denied
     let script = http_script(&format!("http://127.0.0.1:{}/admin/settings", port), &out_denied);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -384,7 +384,7 @@ async fn test_http_non_intercepted_port() {
         port = port,
     );
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     srv.join().unwrap();
@@ -412,7 +412,7 @@ async fn test_http_acl_ipv6_allow() {
         .unwrap();
 
     let script = http_script(&format!("http://[::1]:{}/get", port), &out);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -436,7 +436,7 @@ async fn test_http_acl_ipv6_deny() {
         .unwrap();
 
     let script = http_script(&format!("http://[::1]:{}/denied", port), &out);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "exit={:?}", result.code());
@@ -483,7 +483,7 @@ async fn test_http_ipv6_non_intercepted_port() {
         port = port,
     );
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     srv.join().unwrap();
@@ -509,7 +509,7 @@ async fn test_http_acl_ipv6_method_filtering() {
 
     // GET should succeed
     let script = http_script(&format!("http://[::1]:{}/anything", port), &out_get);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -518,7 +518,7 @@ async fn test_http_acl_ipv6_method_filtering() {
 
     // POST should be denied
     let script = post_script(&format!("http://[::1]:{}/anything", port), &out_post);
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success());
@@ -575,7 +575,7 @@ async fn test_credential_injected_into_upstream() {
     std::fs::write(&secret_file, "sk-phase1-secret\n").unwrap();
     let (port, srv, captured) = spawn_capturing_http_server();
 
-    let policy = base_policy()
+    let mut policy = base_policy()
         .http_allow("GET 127.0.0.1/*")
         .http_port(port)
         .credential("api", &format!("file:{}", secret_file.display()))
@@ -584,7 +584,7 @@ async fn test_credential_injected_into_upstream() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/data", port), &out);
-    let result = policy.with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.run_interactive(&["python3", "-c", &script])
         .await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
@@ -617,7 +617,7 @@ async fn test_denied_request_does_not_inject_credential() {
 
     // ACL allows only /allowed; the inject rule matches every path. A GET to
     // /secret is denied by the ACL, so injection must not run.
-    let policy = base_policy()
+    let mut policy = base_policy()
         .http_allow("GET 127.0.0.1/allowed")
         .http_port(port)
         .credential("api", &format!("file:{}", secret_file.display()))
@@ -626,7 +626,7 @@ async fn test_denied_request_does_not_inject_credential() {
         .unwrap();
 
     let script = http_script(&format!("http://127.0.0.1:{}/secret", port), &out);
-    let result = policy.with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.run_interactive(&["python3", "-c", &script])
         .await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
@@ -650,7 +650,7 @@ async fn test_env_sourced_credential_stripped_from_child() {
     std::env::set_var("SANDLOCK_TEST_SECRET_ENV", "sk-env-secret");
     let out = temp_file("cred-envstrip");
     let (port, _srv) = spawn_http_server(0); // just to obtain a valid intercept port
-    let policy = base_policy()
+    let mut policy = base_policy()
         .http_allow("GET 127.0.0.1/*")
         .http_port(port)
         .credential("api", "env:SANDLOCK_TEST_SECRET_ENV")
@@ -662,7 +662,7 @@ async fn test_env_sourced_credential_stripped_from_child() {
         "import os; open('{}', 'w').write(os.environ.get('SANDLOCK_TEST_SECRET_ENV', 'ABSENT'))",
         out.display()
     );
-    let result = policy.with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.run_interactive(&["python3", "-c", &script])
         .await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 

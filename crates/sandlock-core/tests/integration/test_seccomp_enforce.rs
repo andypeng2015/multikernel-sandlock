@@ -35,7 +35,7 @@ async fn test_mount_blocked() {
         out.display()
     );
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().with_name("test").run_interactive(&["sh", "-c", &cmd_str])
+    let result = policy.clone().run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
 
@@ -60,7 +60,7 @@ async fn test_ptrace_blocked() {
         out.display()
     );
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().with_name("test").run_interactive(&["sh", "-c", &cmd_str])
+    let result = policy.clone().run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
 
@@ -92,7 +92,7 @@ async fn test_personality_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -127,7 +127,7 @@ async fn test_raw_socket_blocked() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -170,7 +170,7 @@ async fn test_raw_icmp_always_denied() {
         .net_allow("icmp://*")
         .build()
         .unwrap();
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -209,7 +209,7 @@ async fn test_icmp_dgram_allowed_with_icmp_rule() {
         .net_allow("icmp://*")
         .build()
         .unwrap();
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -252,7 +252,7 @@ async fn test_udp_allowed_when_opted_in() {
         .net_allow("udp://*:*")
         .build()
         .unwrap();
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -287,7 +287,7 @@ async fn test_udp_denied_by_default() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -325,7 +325,7 @@ async fn test_sysv_shmget_denied_by_default() {
     ), out = out.display());
 
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -364,7 +364,7 @@ async fn test_sysv_shmget_allowed_when_opted_in() {
         .extra_allow_syscalls(vec!["sysv_ipc".into()])
         .build()
         .unwrap();
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 
@@ -401,7 +401,7 @@ async fn test_tcp_always_allowed() {
     let policy = base_policy()
         .build()
         .unwrap();
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
 

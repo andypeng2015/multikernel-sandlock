@@ -18,10 +18,10 @@ async fn test_random_seed_deterministic() {
         .unwrap();
 
     // Read 16 bytes from /dev/urandom via od — exercises the openat interception path.
-    let r1 = policy.clone().with_name("test").run(&["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
+    let r1 = policy.clone().run(&["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
         .await
         .unwrap();
-    let r2 = policy.clone().with_name("test").run(&["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
+    let r2 = policy.clone().run(&["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"])
         .await
         .unwrap();
 
@@ -66,8 +66,8 @@ async fn test_random_seed_different_seeds() {
         .unwrap();
 
     let cmd = &["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"];
-    let r1 = p1.clone().with_name("test").run(cmd).await.unwrap();
-    let r2 = p2.clone().with_name("test").run(cmd).await.unwrap();
+    let r1 = p1.clone().run(cmd).await.unwrap();
+    let r2 = p2.clone().run(cmd).await.unwrap();
     assert!(r1.success());
     assert!(r2.success());
 
@@ -101,7 +101,7 @@ async fn test_time_start_frozen() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["date", "+%Y"]).await.unwrap();
+    let result = policy.clone().run(&["date", "+%Y"]).await.unwrap();
     assert!(result.success(), "date command failed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "2000", "Expected year 2000, got: {:?}", stdout.trim());
@@ -121,7 +121,7 @@ async fn test_time_start_basic_commands_work() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["echo", "hello"]).await.unwrap();
+    let result = policy.clone().run(&["echo", "hello"]).await.unwrap();
     assert!(result.success());
 }
 
@@ -141,7 +141,7 @@ async fn test_combined_determinism() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["echo", "deterministic"]).await.unwrap();
+    let result = policy.clone().run(&["echo", "deterministic"]).await.unwrap();
     assert!(result.success());
 }
 
@@ -164,8 +164,8 @@ async fn test_deterministic_dirs() {
     // the sandbox's getdents virtualization. Some minimal ls implementations
     // do not support `-f`, so avoid depending on ls option support here.
     let scan = "python3 - <<'PY'\nimport os\nprint('\\n'.join(e.name for e in os.scandir('/etc')))\nPY";
-    let r1 = policy.clone().with_name("test").run(&["sh", "-c", scan]).await.unwrap();
-    let r2 = policy.clone().with_name("test").run(&["sh", "-c", scan]).await.unwrap();
+    let r1 = policy.clone().run(&["sh", "-c", scan]).await.unwrap();
+    let r2 = policy.clone().run(&["sh", "-c", scan]).await.unwrap();
     assert!(
         r1.success(),
         "First directory scan failed: {}",

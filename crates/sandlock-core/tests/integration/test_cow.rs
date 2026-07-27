@@ -38,7 +38,7 @@ async fn test_seccomp_cow_create_file() {
 
     let new_file = workdir.join("new.txt");
     let cmd = format!("touch {}", new_file.display());
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(r) => {
             assert!(r.success(), "touch should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
@@ -68,7 +68,7 @@ async fn test_seccomp_cow_abort() {
 
     let new_file = workdir.join("aborted.txt");
     let cmd = format!("touch {}", new_file.display());
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(_) => {
             // After abort, new file should NOT exist
@@ -105,7 +105,7 @@ async fn test_seccomp_cow_relative_path_abort() {
         .unwrap();
 
     // Use relative paths (triggers AT_FDCWD in openat) — the child's cwd is set via .cwd().
-    let result = policy.clone().with_name("test").run(&[
+    let result = policy.clone().run(&[
         "sh", "-c", "echo MUTATED >> orig.txt; echo leak > leaked.txt"
     ]).await;
     match result {
@@ -139,7 +139,7 @@ async fn test_seccomp_cow_relative_path_commit() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&[
+    let result = policy.clone().run(&[
         "sh", "-c", "echo APPENDED >> orig.txt; echo new > created.txt"
     ]).await;
     match result {
@@ -190,7 +190,7 @@ async fn test_seccomp_cow_open_directory() {
         ),
         out_file.display()
     );
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &script]).await;
+    let result = policy.clone().run(&["sh", "-c", &script]).await;
     match result {
         Ok(r) => {
             assert!(r.success(), "script should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
@@ -238,7 +238,7 @@ async fn test_seccomp_cow_chdir_to_created_dir() {
         ),
         out_file.display()
     );
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &script]).await;
+    let result = policy.clone().run(&["sh", "-c", &script]).await;
     match result {
         Ok(r) => {
             assert!(r.success(), "script should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
@@ -302,7 +302,7 @@ async fn test_seccomp_cow_legacy_open_syscall() {
         "    open('{out}', 'w').write(f'FAILED:errno={{err}}')\n",
     ), wd = workdir.display(), out = out_file.display());
 
-    let result = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
     let content = fs::read_to_string(&out_file).unwrap_or_default();
     assert_eq!(content, "created via raw open", "raw open ABI should work with COW");
@@ -413,7 +413,7 @@ async fn test_seccomp_cow_excl_after_unlink() {
         "    open('{out}', 'w').write(f'OPEN_FAILED:{{err}}')\n",
     ), wd = workdir.display(), out = out_file.display());
 
-    let result = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
     let content = fs::read_to_string(&out_file).unwrap_or_default();
     assert_eq!(content, "OK", "O_EXCL after unlink should succeed, got: {}", content);
@@ -446,7 +446,7 @@ async fn test_seccomp_cow_read_existing() {
         workdir.join("data.txt").display(),
         out_file.display()
     );
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(r) => {
             assert!(r.success(), "cat should succeed");
@@ -500,7 +500,7 @@ async fn test_seccomp_cow_read_deleted_file_is_enoent() {
         marker = out_file.display(),
     );
 
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
     let marker = fs::read_to_string(&out_file).unwrap_or_default();
     let leaked = fs::read_to_string(&leak_file).unwrap_or_default();
@@ -557,7 +557,7 @@ async fn test_seccomp_cow_statx_created_file() {
         "open('{out}', 'w').write('OK' if ret == 0 else f'FAIL:errno={{err}}')\n",
     ), out = out_file.display());
 
-    let result = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
     let content = fs::read_to_string(&out_file).unwrap_or_default();
     assert_eq!(content, "OK", "statx on COW-created file should succeed, got: {}", content);
@@ -596,7 +596,7 @@ async fn test_seccomp_cow_exec_created_file() {
     // argv[0], so rewriting the path to /proc/self/fd/N must relocate
     // argv[0], or the helper sees basename "N" and exits 127.
     let cmd = format!("cp {} echo && ./echo EXEC_OK", helper.display());
-    let result = policy.clone().with_name("test").run(&[
+    let result = policy.clone().run(&[
         "sh", "-c", &cmd,
     ]).await.unwrap();
 
@@ -649,7 +649,7 @@ async fn test_seccomp_cow_exec_packed_argv_relocation() {
         "raise SystemExit('execve failed errno=%d' % ctypes.get_errno())\n",
     ), helper = helper.display());
 
-    let result = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
 
     assert!(
         result.success(),

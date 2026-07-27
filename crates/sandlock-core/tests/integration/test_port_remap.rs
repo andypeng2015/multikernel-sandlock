@@ -41,7 +41,7 @@ async fn test_port_remap_bind() {
         out = out.display()
     );
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "OK");
@@ -90,7 +90,7 @@ async fn test_port_remap_loopback() {
         out = out.display()
     );
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "PASS");
@@ -120,7 +120,7 @@ async fn test_port_remap_getsockname() {
         out = out.display()
     );
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, port.to_string(), "getsockname should return bound port");
@@ -159,7 +159,7 @@ async fn test_port_remap_conflict() {
         out = out.display()
     );
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     // Remap must be transparent: child asked for occupied_port and must
@@ -241,7 +241,7 @@ async fn test_port_remap_loopback_under_conflict() {
         out = out.display()
     );
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "PASS", "loopback under conflict failed: {}", content);

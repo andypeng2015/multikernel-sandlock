@@ -32,7 +32,7 @@ async fn test_can_read_allowed_path() {
         .unwrap();
 
     let cmd_str = format!("cat {} > {}", input.display(), out.display());
-    let result = policy.clone().with_name("test").run_interactive(&["sh", "-c", &cmd_str])
+    let result = policy.clone().run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
     assert!(result.success(), "cat should succeed for allowed path");
@@ -58,7 +58,7 @@ async fn test_cannot_read_outside_allowed() {
         .unwrap();
 
     // /etc is NOT in fs_read, so cat /etc/group should fail
-    let result = policy.clone().with_name("test").run(&["cat", "/etc/group"])
+    let result = policy.clone().run(&["cat", "/etc/group"])
         .await
         .unwrap();
     assert!(!result.success(), "cat should fail without /etc in fs_read");
@@ -81,7 +81,7 @@ async fn test_can_write_to_writable_path() {
         .unwrap();
 
     let cmd_str = format!("echo hello > {}", out.display());
-    let result = policy.clone().with_name("test").run_interactive(&["sh", "-c", &cmd_str])
+    let result = policy.clone().run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
     assert!(result.success(), "writing to /tmp should succeed");
@@ -114,7 +114,7 @@ async fn test_cannot_write_to_readonly_path() {
 
     // dir is read-only, writing should fail
     let cmd_str = format!("echo nope > {} 2>/dev/null", target.display());
-    let result = policy.clone().with_name("test").run_interactive(&["sh", "-c", &cmd_str])
+    let result = policy.clone().run_interactive(&["sh", "-c", &cmd_str])
         .await
         .unwrap();
     assert!(!result.success(), "writing to read-only dir should fail");
@@ -143,7 +143,7 @@ async fn test_denied_path_blocks_read() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["cat", input.to_str().unwrap()])
+    let result = policy.clone().run(&["cat", input.to_str().unwrap()])
         .await
         .unwrap();
     assert!(!result.success(), "cat should fail on denied path");
@@ -166,7 +166,7 @@ async fn test_denied_path_blocks_exec() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["/bin/cat", "/etc/hostname"]).await.unwrap();
+    let result = policy.clone().run(&["/bin/cat", "/etc/hostname"]).await.unwrap();
     assert!(!result.success(), "exec should fail on denied binary path");
 }
 
@@ -196,7 +196,7 @@ async fn test_path_rule_on_regular_file() {
 
     let result = policy
         .clone()
-        .with_name("test")
+        
         .run(&["cat", file.to_str().unwrap()])
         .await
         .unwrap();
@@ -228,7 +228,7 @@ async fn test_path_rule_on_device_node() {
 
     let result = policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["sh", "-c", "echo hi > /dev/null"])
         .await
         .unwrap();
@@ -266,7 +266,7 @@ async fn test_path_rule_on_fifo_does_not_block() {
         .build()
         .unwrap();
 
-    let mut sandbox = policy.clone().with_name("test");
+    let mut sandbox = policy.clone();
     let run = sandbox.run(&["/bin/true"]);
     let result = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
     assert!(
@@ -354,7 +354,7 @@ async fn test_isolate_ipc() {
         .build()
         .unwrap();
 
-    let _result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &child_script])
+    let _result = policy.clone().run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();
 
@@ -473,7 +473,7 @@ async fn test_abstract_unix_socket_contained() {
 
     policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();
@@ -593,7 +593,7 @@ async fn test_named_unix_socket_connect_denied_without_fs_write() {
 
     policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();
@@ -695,7 +695,7 @@ async fn test_named_unix_socket_connect_allowed_with_fs_write() {
 
     policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();
@@ -813,7 +813,7 @@ async fn test_named_unix_socket_symlink_escape_denied() {
 
     policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();
@@ -913,7 +913,7 @@ async fn test_named_unix_dgram_sendto_denied_without_fs_write() {
 
     policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();
@@ -1010,7 +1010,7 @@ async fn test_named_unix_dgram_sendmsg_denied_without_fs_write() {
 
     policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();
@@ -1131,7 +1131,7 @@ async fn dgram_allow_delivers(which: &str, tag: &str, net_allow: Option<&str>) {
 
     policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();
@@ -1270,7 +1270,7 @@ async fn test_named_unix_dgram_sendmmsg_denied_without_fs_write() {
 
     policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();
@@ -1400,7 +1400,7 @@ async fn test_named_unix_dgram_sendmmsg_allowed_delivers() {
 
     policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();
@@ -1468,7 +1468,7 @@ async fn test_isolate_signals_blocks_parent() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "python script should exit 0");
@@ -1519,7 +1519,7 @@ async fn test_isolate_signals_allows_self() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
     assert!(result.success(), "python script should exit 0");
@@ -1747,7 +1747,7 @@ async fn test_abstract_unix_dgram_sendto_refused_under_destination_policy() {
 
     policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["python3", "-c", &child_script])
         .await
         .unwrap();

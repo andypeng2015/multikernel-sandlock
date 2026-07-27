@@ -18,7 +18,7 @@ async fn test_fork_basic() {
     let out = out_dir.clone();
 
     let mut sb = base_policy()
-        .with_name("test")
+        
         .with_init_fn(|| {})
         .with_work_fn(move |clone_id| {
             let _ = std::fs::write(out.join(format!("{}", clone_id)), clone_id.to_string());
@@ -53,7 +53,7 @@ async fn test_fork_cow_sharing() {
     let out = out_dir.clone();
 
     let mut sb = base_policy()
-        .with_name("test")
+        
         .with_init_fn(|| { SHARED.store(42, Ordering::Relaxed); })
         .with_work_fn(move |clone_id| {
             let val = SHARED.load(Ordering::Relaxed);
@@ -79,7 +79,7 @@ async fn test_fork_clone_id_env() {
     let out = out_dir.clone();
 
     let mut sb = base_policy()
-        .with_name("test")
+        
         .with_init_fn(|| {})
         .with_work_fn(move |_| {
             let id = std::env::var("CLONE_ID").unwrap_or_default();
@@ -102,7 +102,7 @@ async fn test_fork_clone_id_env() {
 async fn test_fork_reduce() {
     // Map: each clone prints its square to stdout (captured via pipe)
     let mut mapper = base_policy()
-        .with_name("test")
+        
         .with_init_fn(|| {})
         .with_work_fn(|clone_id| {
             // Write to stdout — goes to per-clone pipe
@@ -113,7 +113,7 @@ async fn test_fork_reduce() {
     let mut clones = mapper.fork(4).await.unwrap();
 
     // Reduce: reads all clone pipes, feeds to reducer stdin
-    let reducer = base_policy().with_name("test");
+    let reducer = base_policy();
     let result = reducer.reduce(
         &["python3", "-c", "import sys; print(sum(int(l) for l in sys.stdin))"],
         &mut clones,
@@ -132,7 +132,7 @@ async fn test_fork_clone_exit_status() {
     let out = out_dir.clone();
 
     let mut sb = base_policy()
-        .with_name("test")
+        
         .with_init_fn(|| {})
         .with_work_fn(move |clone_id| {
             let _ = std::fs::write(out.join(format!("{}", clone_id)), "done");
