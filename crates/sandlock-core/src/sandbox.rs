@@ -485,7 +485,7 @@ pub struct Sandbox {
     /// Enable the per-sandbox control socket for introspection (`sandlock ps`,
     /// `sandlock config`, etc.). Defaults to `true`. Set to `false` to skip
     /// the runtime dir, pid file, and control-socket tokio task entirely.
-    #[serde(skip_serializing, default = "default_control_socket")]
+    #[serde(skip, default = "default_control_socket")]
     pub control_socket: bool,
 
     // User-namespace identity (run-as uid/gid)
