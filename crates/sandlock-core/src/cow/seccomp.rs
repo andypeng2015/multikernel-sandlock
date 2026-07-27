@@ -320,6 +320,12 @@ impl SeccompCowBranch {
             )
             .map_err(|e| BranchError::Operation(format!("create cow stub: {}", e)))?;
             unsafe { libc::close(fd) };
+            // Whiteout the lower entry the stub replaces. The stub already
+            // shadows it in the merged view; the whiteout makes commit
+            // unlink it before the publish walk, which would otherwise
+            // O_WRONLY-open the surviving FIFO and block on a reader that
+            // never comes (the publish half of issue #158).
+            self.mark_deleted(rel_path);
             return Ok(CowCopyPlan::Ready(upper_file));
         }
 
@@ -2571,6 +2577,42 @@ mod tests {
         let meta = fs::metadata(branch.upper_dir().join("pipe")).unwrap();
         assert!(meta.file_type().is_file(), "upper stub must be a regular file");
         assert_eq!(meta.len(), 0);
+    }
+
+    #[test]
+    fn commit_replaces_lower_fifo_with_stub_bytes() {
+        // The publish half of issue #158: the stub must whiteout the lower
+        // FIFO so commit's deletion pass unlinks it. Without the whiteout
+        // the publish walk O_WRONLY-opens the surviving FIFO as its
+        // destination and blocks on a reader that never comes. Commit runs
+        // on a thread with a timeout so a regression fails the test
+        // instead of hanging the suite.
+        let (workdir, storage) = setup_workdir();
+        let fifo = workdir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        let wd = workdir.path().to_path_buf();
+        let sd = storage.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut b = SeccompCowBranch::create(&wd, Some(&sd), 0).unwrap();
+            let wds = b.workdir_str().to_string();
+            let resolved = b
+                .handle_open(&format!("{}/pipe", wds), libc::O_WRONLY as u64)
+                .unwrap()
+                .unwrap();
+            fs::write(&resolved, "published").unwrap();
+            let _ = tx.send(b.commit());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("commit failed: {:?}", e),
+            Err(_) => panic!("commit hung on the lower FIFO (issue #158)"),
+        }
+        let meta = fs::symlink_metadata(workdir.path().join("pipe")).unwrap();
+        assert!(meta.file_type().is_file(), "lower FIFO must be replaced by the stub");
+        assert_eq!(fs::read_to_string(workdir.path().join("pipe")).unwrap(), "published");
     }
 
     #[test]
