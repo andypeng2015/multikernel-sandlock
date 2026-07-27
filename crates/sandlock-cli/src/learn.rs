@@ -3,7 +3,7 @@
 //! Runs a workload under observation and emits a sandlock profile TOML
 //! usable by `sandlock run -p`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -285,6 +285,9 @@ struct LearnObserver {
     /// /proc/<pid>/exe. Pins [program].exec to an absolute path; argv[0] may
     /// be relative (resolved through $PATH by execvp) and useless to `run`.
     first_exe: Arc<Mutex<Option<PathBuf>>>,
+    /// UDP connect() calls pending confirmation by a subsequent send().
+    /// Key: (pid, fd). Value: formatted "udp://host:port" entry.
+    pending_udp_connects: Arc<Mutex<HashMap<(u32, i64), String>>>,
 }
 
 impl LearnObserver {
@@ -296,6 +299,7 @@ impl LearnObserver {
             binds: Arc::new(Mutex::new(BTreeSet::new())),
             pending_maps: Arc::new(Mutex::new(HashSet::new())),
             first_exe: Arc::new(Mutex::new(None)),
+            pending_udp_connects: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -415,13 +419,30 @@ impl LearnObserver {
             "connect" | "sendto" | "sendmsg" | "sendmmsg" => {
                 if let (Some(ip), Some(port), Some(proto)) = (event.host, event.port, event.protocol) {
                     if proto != "icmp" {
-                        // Skip UDP connect to port 80: glibc getaddrinfo uses connect() on a
-                        // temporary UDP socket to port 80 purely to probe routing, no data sent.
-                        if proto == "udp" && port == 80 && event.syscall == "connect" {
-                            // phantom address-sorting probe — skip
+                        let host = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
+                        let entry = format!("{proto}://{host}:{port}");
+                        if proto == "udp" && event.syscall == "connect" {
+                            // Park UDP connect() in pending: if a send() follows on the
+                            // same socket it is real traffic; if not it was an
+                            // address-sorting probe (e.g. glibc getaddrinfo) and is
+                            // discarded when the workload exits.
+                            if let Some(fd) = event.fd {
+                                self.pending_udp_connects.lock().unwrap()
+                                    .insert((event.pid, fd), entry);
+                            }
                         } else {
-                            let host = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
-                            self.connects.lock().unwrap().insert(format!("{proto}://{host}:{port}"));
+                            // For UDP send*, promote any pending connect() on the
+                            // same (pid, fd) to confirmed traffic.
+                            if proto == "udp" {
+                                if let Some(fd) = event.fd {
+                                    if let Some(pending) = self.pending_udp_connects
+                                        .lock().unwrap().remove(&(event.pid, fd))
+                                    {
+                                        self.connects.lock().unwrap().insert(pending);
+                                    }
+                                }
+                            }
+                            self.connects.lock().unwrap().insert(entry);
                         }
                     }
                 }

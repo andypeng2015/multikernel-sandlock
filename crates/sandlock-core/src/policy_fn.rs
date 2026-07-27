@@ -121,6 +121,9 @@ pub struct SyscallEvent {
     /// One of "tcp", "udp", "icmp". `None` for non-network syscalls or when
     /// protocol resolution fails.
     pub protocol: Option<String>,
+    /// Socket file descriptor for network syscalls (connect, send*, bind).
+    /// `None` for non-network syscalls.
+    pub fd: Option<i64>,
 }
 
 impl SyscallEvent {
@@ -506,6 +509,7 @@ mod tests {
             path2: None,
             flags: None,
             protocol: None,
+            fd: None,
         };
         assert!(event.argv_contains("python3"));
         assert!(event.argv_contains("-c"));
@@ -529,6 +533,7 @@ mod tests {
             path2: None,
             flags: None,
             protocol: None,
+            fd: None,
         };
         assert!(!event.argv_contains("anything"));
     }

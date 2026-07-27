@@ -1864,6 +1864,7 @@ fn decode_sendmmsg_extras(
             path2: None,
             flags: None,
             protocol: protocol.clone(),
+            fd: Some(notif.data.args[0] as i64),
         });
     }
     extras
@@ -2013,6 +2014,15 @@ async fn emit_policy_event(
         notif, notif_fd, nr, name, category, parent_pid, denied, &protocol,
     );
 
+    let sock_fd = if nr == libc::SYS_connect || nr == libc::SYS_sendto
+        || nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg
+        || nr == libc::SYS_bind
+    {
+        Some(notif.data.args[0] as i64)
+    } else {
+        None
+    };
+
     let event = crate::policy_fn::SyscallEvent {
         syscall: name.to_string(),
         category,
@@ -2027,6 +2037,7 @@ async fn emit_policy_event(
         path2,
         flags,
         protocol,
+        fd: sock_fd,
     };
 
     // Hold syscalls where the callback's verdict matters: exec, every open
