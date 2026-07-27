@@ -1522,12 +1522,14 @@ fn syscall_name(nr: i64) -> &'static str {
         n if n == libc::SYS_getrandom => "getrandom",
         n if n == libc::SYS_unlinkat => "unlinkat",
         n if n == libc::SYS_mkdirat => "mkdirat",
+        n if n == libc::SYS_mknodat => "mknodat",
         n if n == libc::SYS_renameat2 => "renameat2",
         n if n == libc::SYS_linkat => "linkat",
         n if n == libc::SYS_symlinkat => "symlinkat",
         n if n == libc::SYS_truncate => "truncate",
         // Legacy single-path variants (x86_64 only).
         n if Some(n) == arch::sys_mkdir() => "mkdirat",
+        n if Some(n) == arch::sys_mknod() => "mknodat",
         n if Some(n) == arch::sys_rmdir() => "unlinkat",
         n if Some(n) == arch::sys_unlink() => "unlinkat",
         n if Some(n) == arch::sys_symlink() => "symlinkat",
@@ -1543,7 +1545,7 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
     use crate::policy_fn::SyscallCategory;
     match nr {
         n if n == libc::SYS_openat || n == arch::SYS_OPENAT2 || n == libc::SYS_unlinkat
-            || n == libc::SYS_mkdirat || n == libc::SYS_renameat2
+            || n == libc::SYS_mkdirat || n == libc::SYS_mknodat || n == libc::SYS_renameat2
             || n == libc::SYS_symlinkat || n == libc::SYS_linkat
             || n == libc::SYS_fchmodat || n == libc::SYS_fchownat
             || n == libc::SYS_truncate || n == libc::SYS_readlinkat
@@ -1551,6 +1553,7 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             || n == libc::SYS_faccessat || n == libc::SYS_getdents64
             || Some(n) == arch::sys_getdents()
             || Some(n) == arch::sys_open() || Some(n) == arch::sys_mkdir()
+            || Some(n) == arch::sys_mknod()
             || Some(n) == arch::sys_rmdir() || Some(n) == arch::sys_unlink()
             || Some(n) == arch::sys_symlink() || Some(n) == arch::sys_link()
             || Some(n) == arch::sys_rename() || Some(n) == arch::sys_renameat()
@@ -1674,6 +1677,16 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
+        // mknodat(dirfd, pathname, mode, dev)
+        n if n == libc::SYS_mknodat => {
+            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
+            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+        }
+        // mknod(pathname, mode, dev), legacy, AT_FDCWD implied.
+        n if Some(n) == arch::sys_mknod() => {
+            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+        }
         // unlinkat(dirfd, pathname, flags)
         n if n == libc::SYS_unlinkat => {
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
@@ -1748,6 +1761,17 @@ fn resolve_second_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Optio
     }
 }
 
+/// Extract the `sun_path` from an `AF_UNIX` sockaddr in child memory.
+fn read_unix_bind_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd)
+    -> Option<std::path::PathBuf>
+{
+    let addr = notif.data.args[1];
+    let len  = notif.data.args[2] as usize;
+    if addr == 0 || len < 3 { return None; }
+    let bytes = read_child_mem(notif_fd, notif.id, notif.pid, addr, len.min(110)).ok()?;
+    crate::network::materialize::named_unix_socket_path(&bytes)
+}
+
 /// Extract IP and port from a sockaddr in child memory. Parsing (including
 /// v4-mapped canonicalization) is shared with the enforcement path so the
 /// policy_fn callback judges the same address the policy layer does.
@@ -1802,8 +1826,50 @@ fn resolve_held_gate(
     }
 }
 
-/// Emit a syscall event to the policy_fn callback thread (if active).
-/// Returns the callback's verdict for held syscalls.
+/// Decode sendmmsg entries 1..vlen into observation-only `SyscallEvent`s.
+/// Entry 0 is handled by the main `emit_policy_event` path; this covers the rest.
+fn decode_sendmmsg_extras(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    nr: i64,
+    name: &str,
+    category: crate::policy_fn::SyscallCategory,
+    parent_pid: Option<u32>,
+    denied: bool,
+    protocol: &Option<String>,
+) -> Vec<crate::policy_fn::SyscallEvent> {
+    let mut extras = Vec::new();
+    if nr != libc::SYS_sendmmsg { return extras; }
+    let vlen = notif.data.args[2] as usize;
+    let base_ptr = notif.data.args[1];
+    for i in 1..vlen {
+        let entry_ptr = crate::network::materialize::mmsg_entry_ptr(base_ptr, i);
+        let Ok(hdr) = read_child_mem(notif_fd, notif.id, notif.pid, entry_ptr, 12) else { continue };
+        if hdr.len() < 12 { continue; }
+        let name_ptr = u64::from_ne_bytes(hdr[0..8].try_into().unwrap());
+        let name_len = u32::from_ne_bytes(hdr[8..12].try_into().unwrap()) as usize;
+        let (host, port) = read_sockaddr_for_event(notif, name_ptr, name_len, notif_fd);
+        if host.is_none() { continue; }
+        extras.push(crate::policy_fn::SyscallEvent {
+            syscall: name.to_string(),
+            category,
+            pid: notif.pid,
+            parent_pid,
+            host,
+            port,
+            size: None,
+            argv: None,
+            denied,
+            path: None,
+            path2: None,
+            flags: None,
+            protocol: protocol.clone(),
+            fd: Some(notif.data.args[0] as i64),
+        });
+    }
+    extras
+}
+
 async fn emit_policy_event(
     notif: &SeccompNotif,
     action: &NotifAction,
@@ -1867,6 +1933,11 @@ async fn emit_policy_event(
         port = p;
     }
 
+    // AF_UNIX named bind: no IP/port, but the sun_path needs a MAKE_SOCK grant on its parent directory.
+    if nr == libc::SYS_bind && host.is_none() {
+        path = read_unix_bind_path_for_notif(notif, notif_fd);
+    }
+
     // sendto(fd, buf, len, flags, addr, addrlen): sockaddr in args[4]/args[5].
     if nr == libc::SYS_sendto {
         let (h, p) = read_sockaddr_for_event(notif, notif.data.args[4], notif.data.args[5] as usize, notif_fd);
@@ -1877,8 +1948,7 @@ async fn emit_policy_event(
     // sendmsg/sendmmsg: sockaddr is inside struct msghdr at args[1].
     // msghdr layout: msg_name ptr (u64 @ offset 0), msg_namelen u32 (@ offset 8).
     // For sendmmsg the first mmsghdr entry's msghdr starts at offset 0, same layout.
-    // TODO: only the first of args[2] mmsghdr entries is decoded; remaining
-    // destinations are missed. Full fix requires returning Vec<SyscallEvent>.
+    // Remaining entries (1..vlen) are emitted as observation-only events below.
     if nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg {
         if let Ok(hdr) = read_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], 12) {
             if hdr.len() >= 12 {
@@ -1922,12 +1992,14 @@ async fn emit_policy_event(
         }
     }
 
-    // mkdirat, unlinkat, symlinkat, truncate: single resolved path.
+    // mkdirat, unlinkat, symlinkat, truncate, mknodat: single resolved path.
     // renameat2, linkat (and their legacy equivalents): src path + dst path2.
-    let is_fs_mutating = nr == libc::SYS_mkdirat || nr == libc::SYS_unlinkat
+    let is_fs_mutating = nr == libc::SYS_mkdirat || nr == libc::SYS_mknodat
+        || nr == libc::SYS_unlinkat
         || nr == libc::SYS_symlinkat || nr == libc::SYS_truncate
         || nr == libc::SYS_renameat2 || nr == libc::SYS_linkat
-        || Some(nr) == arch::sys_mkdir() || Some(nr) == arch::sys_rmdir()
+        || Some(nr) == arch::sys_mkdir() || Some(nr) == arch::sys_mknod()
+        || Some(nr) == arch::sys_rmdir()
         || Some(nr) == arch::sys_unlink() || Some(nr) == arch::sys_symlink()
         || Some(nr) == arch::sys_link() || Some(nr) == arch::sys_rename()
         || Some(nr) == arch::sys_renameat();
@@ -1935,6 +2007,21 @@ async fn emit_policy_event(
         path = resolve_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
         path2 = resolve_second_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
     }
+
+    
+    // Decode remaining sendmmsg entries before unblocking the child.
+    let sendmmsg_extras = decode_sendmmsg_extras(
+        notif, notif_fd, nr, name, category, parent_pid, denied, &protocol,
+    );
+
+    let sock_fd = if nr == libc::SYS_connect || nr == libc::SYS_sendto
+        || nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg
+        || nr == libc::SYS_bind
+    {
+        Some(notif.data.args[0] as i64)
+    } else {
+        None
+    };
 
     let event = crate::policy_fn::SyscallEvent {
         syscall: name.to_string(),
@@ -1950,6 +2037,7 @@ async fn emit_policy_event(
         path2,
         flags,
         protocol,
+        fd: sock_fd,
     };
 
     // Hold syscalls where the callback's verdict matters: exec, every open
@@ -1966,7 +2054,7 @@ async fn emit_policy_event(
         || nr == libc::SYS_sendto || nr == libc::SYS_sendmsg
         || nr == libc::SYS_sendmmsg;
 
-    if is_held {
+    let verdict = if is_held {
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
         let _ = tx.send(crate::policy_fn::PolicyEvent {
             event,
@@ -1983,7 +2071,14 @@ async fn emit_policy_event(
             gate: None,
         });
         None
+    };
+    // Emit the remaining sendmmsg destinations as observation-only events.
+    // The verdict above already covers the whole syscall; gate: None is correct.
+    for extra in sendmmsg_extras {
+        let _ = tx.send(crate::policy_fn::PolicyEvent { event: extra, gate: None });
     }
+
+    verdict
 }
 
 // ============================================================

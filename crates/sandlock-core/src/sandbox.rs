@@ -759,6 +759,17 @@ impl Sandbox {
         HashMap::new()
     }
 
+    /// Return observed resource peaks from the supervisor state.
+    /// Returns `(peak_mem_used_bytes, peak_proc_count)`.
+    pub async fn resource_peaks(&self) -> (u64, u32) {
+        if let Some(res) = self.runtime.as_ref().and_then(|rt| rt.supervisor_resource.as_ref()) {
+            let rs = res.lock().await;
+            (rs.peak_mem_used, rs.peak_proc_count)
+        } else {
+            (0, 0)
+        }
+    }
+
     /// Wait for the child process to exit.
     ///
     /// Dropping the returned future does not cost the captured output: the pipe

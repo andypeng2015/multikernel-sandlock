@@ -64,15 +64,19 @@ and guarded paths. A warning and diff are still printed.
 
 ## Tests
 
-```bash
-# All learn tests
-cargo test -p sandlock-cli -- test_learn
-```
-
 Tests require Linux 5.6+ (seccomp notif) and Linux 5.13+ (Landlock). They run the real `sandlock` binary, so build first:
 
 ```bash
 cargo build -p sandlock-cli
+```
+Each test spawns a full sandlock process; running too many in
+parallel exhausts kernel limits and causes hangs, use `--test-threads=4`.
+```bash
+# learn output tests — verify TOML profile content
+cargo test -p sandlock-cli --test learn_test -- --test-threads=4
+
+# learn round-trip tests — learn → profile → run end-to-end
+cargo test -p sandlock-cli --test learn_integration -- --test-threads=4
 ```
 
 ## Example

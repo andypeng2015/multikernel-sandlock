@@ -583,6 +583,41 @@ impl SeccompCowBranch {
         Ok(ok)
     }
 
+    /// Handle mknodat: create a file-system node in the upper layer.
+    ///
+    /// Returns `Err(QuotaExceeded)` when the node would exceed `max_disk`.
+    /// Returns `Err(Denied)` when the node type is S_IFBLK or S_IFCHR.
+    pub fn handle_mknod(&mut self, path: &str, mode: u32, dev: u64) -> Result<bool, BranchError> {
+        // Only S_IFIFO, S_IFSOCK, S_IFREG, and 0 are permitted.
+        // S_IFBLK/S_IFCHR are rejected: the supervisor creates nodes under its
+        // own credentials, making device nodes a sandbox escape on root runs.
+        let file_type = mode & libc::S_IFMT as u32; // strips the permission bits 
+        let allowed = file_type == 0
+            || file_type == libc::S_IFREG as u32
+            || file_type == libc::S_IFIFO as u32
+            || file_type == libc::S_IFSOCK as u32;
+        if !allowed {
+            return Err(BranchError::Denied);
+        }
+        let rel = match self.safe_rel(path) {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        self.check_quota(256)?;
+        self.deleted.remove(&rel);
+        self.has_changes = true;
+        // Ensure the parent directory exists in the upper layer before creating
+        // the node (mirrors handle_symlink; parent may only exist in lower).
+        if let Some(p) = parent_rel(&rel) {
+            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
+        }
+        let ok = crate::sys::fs::mknod_in_root(&self.upper, &rel, mode, dev).is_ok();
+        if ok {
+            self.disk_used += 256;
+        }
+        Ok(ok)
+    }
+
     /// Handle rename.
     ///
     /// Returns `Err(QuotaExceeded)` when the COW copy would exceed `max_disk`.

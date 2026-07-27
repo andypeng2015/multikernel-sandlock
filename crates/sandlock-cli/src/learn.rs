@@ -3,10 +3,9 @@
 //! Runs a workload under observation and emits a sandlock profile TOML
 //! usable by `sandlock run -p`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Result};
 use sandlock_core::policy_fn::{SyscallEvent, Verdict};
@@ -80,6 +79,15 @@ fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
             continue;
         }
         let Some(ancestor) = p.ancestors().skip(1).find(|a| a.exists()) else { continue };
+        // "/" is always skipped: granting write access to the filesystem root
+        // is never useful and would override every other policy entry.
+        if ancestor.as_os_str().as_encoded_bytes() == b"/" {
+            eprintln!(
+                "sandlock learn: WARNING: write collapse for '{}' reaches filesystem root, skipping",
+                p.display()
+            );
+            continue;
+        }
         match classify_path(&ancestor) {
             PathTier::Protected => {
                 eprintln!(
@@ -226,6 +234,21 @@ fn is_write_open(flags: u64) -> bool {
     flags & (O_WRONLY | O_RDWR | O_CREAT) != 0
 }
 
+/// Returns the TGID (thread group leader PID) for a given TID.
+fn tgid_of(tid: u32) -> u32 {
+    let Ok(s) = std::fs::read_to_string(format!("/proc/{tid}/status")) else {
+        return tid;
+    };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:\t") {
+            if let Ok(tgid) = rest.trim().parse::<u32>() {
+                return tgid;
+            }
+        }
+    }
+    tid
+}
+
 /// Read all file-backed r-xp (executable) mappings from `/proc/<pid>/maps`.
 /// This captures the dynamic linker, all shared libraries, and the main binary
 /// as actually mapped by the kernel. 
@@ -253,6 +276,7 @@ struct LearnObserver {
     reads: Arc<Mutex<BTreeSet<PathBuf>>>,
     writes: Arc<Mutex<BTreeSet<PathBuf>>>,
     connects: Arc<Mutex<BTreeSet<String>>>,
+    binds: Arc<Mutex<BTreeSet<u16>>>,
     /// PIDs with an exec attempt observed but the post-exec maps scan still
     /// pending; the scan runs on the pid's first non-exec event, which is
     /// guaranteed to run under the new image.
@@ -261,6 +285,9 @@ struct LearnObserver {
     /// /proc/<pid>/exe. Pins [program].exec to an absolute path; argv[0] may
     /// be relative (resolved through $PATH by execvp) and useless to `run`.
     first_exe: Arc<Mutex<Option<PathBuf>>>,
+    /// UDP connect() calls pending confirmation by a subsequent send().
+    /// Key: (pid, fd). Value: formatted "udp://host:port" entry.
+    pending_udp_connects: Arc<Mutex<HashMap<(u32, i64), String>>>,
 }
 
 impl LearnObserver {
@@ -269,8 +296,10 @@ impl LearnObserver {
             reads: Arc::new(Mutex::new(BTreeSet::new())),
             writes: Arc::new(Mutex::new(BTreeSet::new())),
             connects: Arc::new(Mutex::new(BTreeSet::new())),
+            binds: Arc::new(Mutex::new(BTreeSet::new())),
             pending_maps: Arc::new(Mutex::new(HashSet::new())),
             first_exe: Arc::new(Mutex::new(None)),
+            pending_udp_connects: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -307,10 +336,14 @@ impl LearnObserver {
                 if let Some(path) = event.path {
                     self.reads.lock().unwrap().insert(path);
                 }
-                self.pending_maps.lock().unwrap().insert(event.pid);
+            
+                /// When a non-leader thread calls execve, the new process runs under the TGID,
+                /// so we must insert the TGID into pending_maps.
+                self.pending_maps.lock().unwrap().insert(tgid_of(event.pid));
             }
             "openat" | "open" => {
                 if let Some(path) = event.path {
+                    let path = canonicalize_or_keep(path);
                     if let Some(fl) = event.flags {
                         if is_write_open(fl) {
                             self.writes.lock().unwrap().insert(path);
@@ -320,29 +353,44 @@ impl LearnObserver {
                     }
                 }
             }
-            // mkdir/unlink/rmdir/symlink: Landlock MAKE_*/REMOVE_* are directory
+            // mkdir/unlink/rmdir/symlink/mknod: Landlock MAKE_*/REMOVE_* are directory
             // rights, so the parent dir is what sandlock run needs, not the target.
-            "mkdirat" | "unlinkat" | "symlinkat" => {
+            "mkdirat" | "mknodat" => {
                 if let Some(p) = event.path {
+                    let p = canonicalize_or_keep(p);
+                    if let Some(parent) = p.parent() {
+                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    }
+                }
+            }
+            // unlinkat/symlinkat operate on the link itself, not its target, so
+            // only the parent is canonicalized to avoid following the symlink.
+            "unlinkat" | "symlinkat" => {
+                if let Some(p) = event.path {
+                    let p = canonicalize_parent_or_keep(p);
                     if let Some(parent) = p.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
                 }
             }
             // rename: needs RENAME_OLD on parent of old path + RENAME_NEW on parent of new path.
+            // Both operate on the link itself, not its target.
             "renameat2" => {
                 for p in [event.path, event.path2].into_iter().flatten() {
+                    let p = canonicalize_parent_or_keep(p);
                     if let Some(parent) = p.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
                 }
             }
             // link: source needs read access (ln doesn't open() it); dst parent needs MAKE_HARDLINK.
+            // dst operates on the link itself, so only the parent is canonicalized.
             "linkat" => {
                 if let Some(src) = event.path {
-                    self.reads.lock().unwrap().insert(src);
+                    self.reads.lock().unwrap().insert(canonicalize_or_keep(src));
                 }
                 if let Some(dst) = event.path2 {
+                    let dst = canonicalize_parent_or_keep(dst);
                     if let Some(parent) = dst.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
@@ -351,13 +399,51 @@ impl LearnObserver {
             // truncate: LANDLOCK_ACCESS_FS_TRUNCATE applies to the file itself.
             "truncate" => {
                 if let Some(p) = event.path {
-                    self.writes.lock().unwrap().insert(p);
+                    self.writes.lock().unwrap().insert(canonicalize_or_keep(p));
+                }
+            }
+            "bind" => {
+                if let Some(port) = event.port {
+                    if port > 0 {
+                        self.binds.lock().unwrap().insert(port);
+                    }
+                } else if let Some(p) = event.path {
+                    // AF_UNIX named bind: Landlock MAKE_SOCK is a directory right,
+                    // so the parent dir is what sandlock run needs.
+                    let p = canonicalize_or_keep(p);
+                    if let Some(parent) = p.parent() {
+                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    }
                 }
             }
             "connect" | "sendto" | "sendmsg" | "sendmmsg" => {
                 if let (Some(ip), Some(port), Some(proto)) = (event.host, event.port, event.protocol) {
                     if proto != "icmp" {
-                        self.connects.lock().unwrap().insert(format!("{proto}://{ip}:{port}"));
+                        let host = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
+                        let entry = format!("{proto}://{host}:{port}");
+                        if proto == "udp" && event.syscall == "connect" {
+                            // Park UDP connect() in pending: if a send() follows on the
+                            // same socket it is real traffic; if not it was an
+                            // address-sorting probe (e.g. glibc getaddrinfo) and is
+                            // discarded when the workload exits.
+                            if let Some(fd) = event.fd {
+                                self.pending_udp_connects.lock().unwrap()
+                                    .insert((event.pid, fd), entry);
+                            }
+                        } else {
+                            // For UDP send*, promote any pending connect() on the
+                            // same (pid, fd) to confirmed traffic.
+                            if proto == "udp" {
+                                if let Some(fd) = event.fd {
+                                    if let Some(pending) = self.pending_udp_connects
+                                        .lock().unwrap().remove(&(event.pid, fd))
+                                    {
+                                        self.connects.lock().unwrap().insert(pending);
+                                    }
+                                }
+                            }
+                            self.connects.lock().unwrap().insert(entry);
+                        }
                     }
                 }
             }
@@ -367,6 +453,27 @@ impl LearnObserver {
     }
 }
 
+
+/// Resolve symlinks to get the canonical path. Falls back to the original
+/// if the path doesn't exist yet (e.g. COW-intercepted creates).
+fn canonicalize_or_keep(p: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&p).unwrap_or(p)
+}
+
+/// Canonicalize only the parent directory and rejoin the final component.
+/// Used for syscalls that operate on the link itself (unlink, rename, symlink).
+fn canonicalize_parent_or_keep(p: PathBuf) -> PathBuf {
+    let file_name = match p.file_name() {
+        Some(n) => n.to_owned(),
+        None => return p,
+    };
+    let parent = match p.parent() {
+        Some(par) => par,
+        None => return p,
+    };
+    let canonical_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    canonical_parent.join(file_name)
+}
 
 pub async fn run(args: LearnArgs) -> Result<()> {
     if args.cmd.is_empty() {
@@ -402,6 +509,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .net_allow("*")
         .net_allow("udp://*")
         .net_allow("icmp://*")
+        .max_memory(sandlock_core::sandbox::ByteSize(1 << 43)) // 8 TiB
         .policy_fn(move |event, _ctx| observer_cb.on_event(event))
         .build()
         .map_err(|e| anyhow!("failed to build sandbox policy: {e}"))?;
@@ -417,46 +525,12 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     sandbox.start()
         .map_err(|e| anyhow!("sandbox error: {e}"))?;
 
-    // Resource peak sampler: polls /proc/<pid> every 100ms until the process exits.
-    let max_threads = Arc::new(AtomicU64::new(0));
-    let max_fds = Arc::new(AtomicU64::new(0));
-    let peak_rss_kb_atomic = Arc::new(AtomicU64::new(0));
-    let (max_threads_s, max_fds_s, peak_rss_s) = (
-        Arc::clone(&max_threads), Arc::clone(&max_fds), Arc::clone(&peak_rss_kb_atomic),
-    );
-    let sampler = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            match std::fs::read_to_string(format!("/proc/{child_pid}/status")) {
-                Err(_) => break, // process gone
-                Ok(s) => {
-                    for line in s.lines() {
-                        if let Some(v) = line.strip_prefix("Threads:") {
-                            if let Ok(n) = v.trim().parse::<u64>() {
-                                max_threads_s.fetch_max(n, Ordering::Relaxed);
-                            }
-                        }
-                        if let Some(v) = line.strip_prefix("VmHWM:") {
-                            if let Ok(n) = v.trim().trim_end_matches("kB").trim().parse::<u64>() {
-                                peak_rss_s.fetch_max(n, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            }
-            if let Ok(entries) = std::fs::read_dir(format!("/proc/{child_pid}/fd")) {
-                max_fds_s.fetch_max(entries.count() as u64, Ordering::Relaxed);
-            }
-        }
-    });
-
     // Wait for the process, optionally with a timeout.
     let timed_out = if let Some(secs) = args.timeout {
         let deadline = std::time::Duration::from_secs(secs);
         match tokio::time::timeout(deadline, sandbox.wait()).await {
             Ok(r) => {
                 let result = r.map_err(|e| anyhow!("sandbox error: {e}"))?;
-                sampler.abort();
                 require_clean_exit(&result.exit_status)?;
                 false
             }
@@ -466,14 +540,12 @@ pub async fn run(args: LearnArgs) -> Result<()> {
                 unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
                 // Drain without timeout so the supervisor releases its resources cleanly.
                 let _ = sandbox.wait().await;
-                sampler.abort();
                 true
             }
         }
     } else {
         let result = sandbox.wait().await
             .map_err(|e| anyhow!("sandbox error: {e}"))?;
-        sampler.abort();
         require_clean_exit(&result.exit_status)?;
         false
     };
@@ -482,11 +554,9 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         eprintln!("sandlock learn: writing partial profile from observations before timeout");
     }
 
-    let peak_rss_kb = peak_rss_kb_atomic.load(Ordering::Relaxed);
-    let threads = max_threads.load(Ordering::Relaxed);
-    let fds = max_fds.load(Ordering::Relaxed);
+    let (peak_mem_bytes, peak_procs) = sandbox.resource_peaks().await;
 
-    // Build the profile.
+    // Build the profile from observations.
     let mut profile_out = ProfileInput::default();
 
     // Record the observed command so `sandlock run -p profile.toml` works
@@ -542,18 +612,77 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         ..Default::default()
     };
     profile_out.network.allow = observer.connects.lock().unwrap().iter().cloned().collect();
+    profile_out.network.allow_bind = observer.binds.lock().unwrap().iter()
+        .map(|&p| sandlock_core::profile::PortSpec::Port(p))
+        .collect();
 
     // Fill limits with observed peaks + headroom so the profile is usable with sandlock run.
-    if peak_rss_kb > 0 {
-        let mib = (peak_rss_kb + 1023) / 1024;          // ceil to MiB
-        let headroom = (mib * 5 / 4).max(16);            // +25%, min 16M
+    // Memory: tracked via the sentinel max_memory in the builder, which activates handle_memory
+    // so peak_mem_bytes uses the same virtual-anonymous accounting that sandlock run enforces.
+    if peak_mem_bytes > 0 {
+        let mib = (peak_mem_bytes / (1024 * 1024)).max(1);
+        let headroom = (mib * 5 / 4).max(16);
         profile_out.limits.memory = Some(format!("{headroom}M"));
     }
-    if threads > 0 {
-        profile_out.limits.processes = Some((threads * 2).max(4) as u32);
+    if peak_procs > 0 {
+        profile_out.limits.processes = Some((peak_procs * 2).max(4));
     }
-    if fds > 0 {
-        profile_out.limits.open_files = Some((fds * 2).max(32) as u32);
+    // TODO: learn limits.open_files via supervisor once open_files enforcement is implemented.
+
+    // --merge: union observed profile into an existing one.
+    // Start from the existing profile so all fields we don't observe 
+    // are preserved. Then union in the observed fields.
+    if let Some(ref merge_path) = args.merge {
+        let existing_toml = std::fs::read_to_string(merge_path)
+            .map_err(|e| anyhow!("failed to read merge file {}: {e}", merge_path.display()))?;
+        let existing: ProfileInput = toml::from_str(&existing_toml)
+            .map_err(|e| anyhow!("failed to parse merge file {}: {e}", merge_path.display()))?;
+
+        // Base is the existing profile; union observed fields into it.
+        let observed = profile_out;
+        profile_out = existing.clone();
+
+        // Union filesystem paths, re-run dedup after merging.
+        let merged_reads: Vec<PathBuf> = {
+            let mut set: BTreeSet<PathBuf> = observed.filesystem.read.iter().cloned().collect();
+            set.extend(existing.filesystem.read.iter().cloned());
+            dedup_subsumed(set.into_iter().collect())
+        };
+        let merged_writes: Vec<PathBuf> = {
+            let mut set: BTreeSet<PathBuf> = observed.filesystem.write.iter().cloned().collect();
+            set.extend(existing.filesystem.write.iter().cloned());
+            dedup_subsumed(set.into_iter().collect())
+        };
+        profile_out.filesystem.read = merged_reads;
+        profile_out.filesystem.write = merged_writes;
+
+        // Union network.allow.
+        let mut allow_set: std::collections::BTreeSet<String> =
+            observed.network.allow.iter().cloned().collect();
+        allow_set.extend(existing.network.allow.iter().cloned());
+        profile_out.network.allow = allow_set.into_iter().collect();
+
+        // Union allow_bind: preserve PortSpec verbatim (ranges, named specs).
+        // Dedup by canonical string: Port(n) -> "n", Spec(s) -> s.
+        let port_key = |p: &sandlock_core::profile::PortSpec| -> String {
+            match p {
+                sandlock_core::profile::PortSpec::Port(n) => n.to_string(),
+                sandlock_core::profile::PortSpec::Spec(s) => s.clone(),
+            }
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut merged_bind: Vec<sandlock_core::profile::PortSpec> = Vec::new();
+        for p in observed.network.allow_bind.iter().chain(existing.network.allow_bind.iter()) {
+            if seen.insert(port_key(p)) {
+                merged_bind.push(p.clone());
+            }
+        }
+        profile_out.network.allow_bind = merged_bind;
+
+        // Limits: take the max of old vs observed.
+        profile_out.limits.memory = max_bytesize(existing.limits.memory.as_deref(), observed.limits.memory.as_deref());
+        profile_out.limits.processes = max_opt(existing.limits.processes, observed.limits.processes);
+        profile_out.limits.open_files = max_opt(existing.limits.open_files, observed.limits.open_files);
     }
 
     let kernel = std::fs::read_to_string("/proc/version")
@@ -577,8 +706,10 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .map_err(|e| anyhow!("failed to serialize profile: {e}"))?;
     let toml_out = format!("{header}{body}");
 
-    match args.output {
-        Some(ref path) => {
+    // Output target: -o overrides --merge's file; --merge writes back in place.
+    let output_path = args.output.as_ref().or(args.merge.as_ref());
+    match output_path {
+        Some(path) => {
             std::fs::write(path, &toml_out)
                 .map_err(|e| anyhow!("failed to write {}: {e}", path.display()))?;
             eprintln!("sandlock learn: profile written to {}", path.display());
@@ -587,4 +718,42 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+
+/// Parse a bytesize string like "128M", "1G", "512K" into bytes.
+fn parse_bytesize_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(n) = s.strip_suffix('G') {
+        (n, 1024 * 1024 * 1024u64)
+    } else if let Some(n) = s.strip_suffix('M') {
+        (n, 1024 * 1024u64)
+    } else if let Some(n) = s.strip_suffix('K') {
+        (n, 1024u64)
+    } else {
+        (s, 1u64)
+    };
+    num.trim().parse::<u64>().ok().map(|n| n * mult)
+}
+
+/// Return the larger of two optional bytesize strings.
+fn max_bytesize(a: Option<&str>, b: Option<&str>) -> Option<String> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(s), None) | (None, Some(s)) => Some(s.to_string()),
+        (Some(sa), Some(sb)) => {
+            let va = parse_bytesize_bytes(sa).unwrap_or(0);
+            let vb = parse_bytesize_bytes(sb).unwrap_or(0);
+            Some(if va >= vb { sa.to_string() } else { sb.to_string() })
+        }
+    }
+}
+
+/// Return the larger of two optional u32 values.
+fn max_opt(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (Some(va), Some(vb)) => Some(va.max(vb)),
+    }
 }
