@@ -407,7 +407,7 @@ class Sandbox:
     # Runtime kwargs — not part of policy serialization.
     name: str | None = field(default=None, repr=False, metadata={"runtime": True})
     """Sandbox name (also exposed as the virtual hostname inside the sandbox).
-    Auto-generated as ``sandbox-{pid}`` when omitted."""
+    Auto-generated as ``sandbox-{pid}-{counter}`` when omitted."""
 
     policy_fn: Callable | None = field(default=None, repr=False, metadata={"runtime": True})
     """Optional callback for dynamic per-event policy decisions."""
@@ -435,12 +435,27 @@ class Sandbox:
                               # non-owning busy marker
         self._restore_skipped = []  # SkippedFd entries from the last restore
 
+    _name_counter: int = 0
+    _name_lock = None  # threading.Lock, lazily created
+
+    @classmethod
+    def _next_name(cls) -> str:
+        """Generate a unique sandbox name: sandbox-{pid}-{counter}."""
+        import os
+
+        if cls._name_lock is None:
+            import threading
+
+            cls._name_lock = threading.Lock()
+        with cls._name_lock:
+            cls._name_counter += 1
+            return f"sandbox-{os.getpid()}-{cls._name_counter}"
+
     def _resolve_name(self) -> str:
         """Resolve sandbox name: explicit > auto-generated."""
-        import os
         if self.name is not None:
             return self.name
-        return f"sandbox-{os.getpid()}"
+        return self._next_name()
 
     def _ensure_native(self):
         """Build a fresh native policy from this dataclass.
