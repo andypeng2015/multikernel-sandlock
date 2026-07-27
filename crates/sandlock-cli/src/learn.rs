@@ -351,7 +351,7 @@ impl LearnObserver {
             }
             // mkdir/unlink/rmdir/symlink/mknod: Landlock MAKE_*/REMOVE_* are directory
             // rights, so the parent dir is what sandlock run needs, not the target.
-            "mkdirat" | "mknodat" | "unlinkat" | "symlinkat" => {
+            "mkdirat" | "mknodat" => {
                 if let Some(p) = event.path {
                     let p = canonicalize_or_keep(p);
                     if let Some(parent) = p.parent() {
@@ -359,22 +359,34 @@ impl LearnObserver {
                     }
                 }
             }
+            // unlinkat/symlinkat operate on the link itself, not its target, so
+            // only the parent is canonicalized to avoid following the symlink.
+            "unlinkat" | "symlinkat" => {
+                if let Some(p) = event.path {
+                    let p = canonicalize_parent_or_keep(p);
+                    if let Some(parent) = p.parent() {
+                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    }
+                }
+            }
             // rename: needs RENAME_OLD on parent of old path + RENAME_NEW on parent of new path.
+            // Both operate on the link itself, not its target.
             "renameat2" => {
                 for p in [event.path, event.path2].into_iter().flatten() {
-                    let p = canonicalize_or_keep(p);
+                    let p = canonicalize_parent_or_keep(p);
                     if let Some(parent) = p.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
                 }
             }
             // link: source needs read access (ln doesn't open() it); dst parent needs MAKE_HARDLINK.
+            // dst operates on the link itself, so only the parent is canonicalized.
             "linkat" => {
                 if let Some(src) = event.path {
                     self.reads.lock().unwrap().insert(canonicalize_or_keep(src));
                 }
                 if let Some(dst) = event.path2 {
-                    let dst = canonicalize_or_keep(dst);
+                    let dst = canonicalize_parent_or_keep(dst);
                     if let Some(parent) = dst.parent() {
                         self.writes.lock().unwrap().insert(parent.to_path_buf());
                     }
@@ -425,6 +437,21 @@ impl LearnObserver {
 /// if the path doesn't exist yet (e.g. COW-intercepted creates).
 fn canonicalize_or_keep(p: PathBuf) -> PathBuf {
     std::fs::canonicalize(&p).unwrap_or(p)
+}
+
+/// Canonicalize only the parent directory and rejoin the final component.
+/// Used for syscalls that operate on the link itself (unlink, rename, symlink).
+fn canonicalize_parent_or_keep(p: PathBuf) -> PathBuf {
+    let file_name = match p.file_name() {
+        Some(n) => n.to_owned(),
+        None => return p,
+    };
+    let parent = match p.parent() {
+        Some(par) => par,
+        None => return p,
+    };
+    let canonical_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    canonical_parent.join(file_name)
 }
 
 pub async fn run(args: LearnArgs) -> Result<()> {
