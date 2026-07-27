@@ -403,12 +403,16 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         }
     }
 
-    // Save exec+args for the denial hint before profile_program_spec is consumed below.
-    let profile_hint_cmd: Option<String> = profile_program_spec.as_ref().and_then(|spec| {
-        let exec = spec.exec.as_ref()?.display().to_string();
-        let args_str = spec.args.join(" ");
-        Some(if args_str.is_empty() { exec } else { format!("{exec} {args_str}") })
-    });
+    // Save exec+args for the denial hint.
+    let profile_hint_cmd: Option<String> = if !args.cmd.is_empty() {
+        Some(args.cmd.join(" "))
+    } else {
+        profile_program_spec.as_ref().and_then(|spec| {
+            let exec = spec.exec.as_ref()?.display().to_string();
+            let args_str = spec.args.join(" ");
+            Some(if args_str.is_empty() { exec } else { format!("{exec} {args_str}") })
+        })
+    };
 
     // Start from profile or default
     let mut builder = if let Some(base) = base_from_profile {
