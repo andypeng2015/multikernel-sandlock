@@ -937,3 +937,44 @@ fn test_capture_wait_does_not_park_blocking_pool_threads() {
         assert_eq!(result.stdout.as_deref(), Some(&b"hi\n"[..]));
     });
 }
+
+/// The streams are joined one after the other, so the second join is a
+/// suspension point for a capture the first one has already read in full. A
+/// caller's timeout landing there must not destroy it.
+///
+/// The survivor closes fd 1 but keeps fd 2, so stdout reaches EOF while stderr
+/// cannot: the first join completes, the second blocks, and the cancellation
+/// lands exactly between them. An attempt whose first `wait()` completes had no
+/// survivor and is retried; never reaching that state at all is a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_a_finished_capture_survives_a_cancel_at_the_other_join() {
+    // `exec 1>&-` closes the subshell's stdout, so only stderr stays held. The
+    // counting loop keeps the parent shell alive past its background job's
+    // start-up (a survivor racing the parent's exit never takes the fd).
+    const CMD: &str =
+        "printf hello; (exec 1>&-; while :; do :; done) & i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done";
+
+    for _ in 0..8 {
+        let mut sb = capture_policy().with_name("sibling-join-cancel");
+        sb.spawn(&["sh", "-c", CMD]).await.unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_millis(600), sb.wait()).await;
+        if first.is_ok() {
+            continue;
+        }
+
+        sb.kill().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait())
+            .await
+            .expect("the second wait() hung")
+            .unwrap();
+
+        assert_eq!(
+            result.stdout.as_deref(),
+            Some(&b"hello"[..]),
+            "a capture that finished before the cancellation must survive it",
+        );
+        return;
+    }
+    panic!("no attempt reached the cancellation between the two joins");
+}

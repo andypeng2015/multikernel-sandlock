@@ -326,35 +326,70 @@ fn relocate_high_moves_fd_above_stdio_range() {
     unsafe { libc::close(hi) };
 }
 
-/// A `wait()` cancelled while it is joining the drains must leave the handle
+/// A `wait()` cancelled while it is joining the drains must leave the drain
 /// parked, so a later `wait()` still returns the capture. Reaching that state
-/// end-to-end needs a descendant holding the write end past the child's exit,
+/// end to end needs a descendant holding the write end past the child's exit,
 /// which is inherently racy (the integration test retries for it), so the
-/// contract itself is pinned here: joining through the slot, and clearing it
-/// only once the await has produced a value.
+/// contract itself is pinned here: a pending join leaves the task parked, a
+/// finished one leaves the bytes parked, and only an explicit take hands them
+/// over.
 #[tokio::test]
-async fn join_parked_drain_keeps_the_handle_when_cancelled() {
+async fn a_cancelled_join_leaves_the_drain_parked() {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let mut slot = Some(tokio::spawn(async move {
+    let mut slot = Some(ParkedDrain::Running(tokio::spawn(async move {
         let _ = rx.await;
         b"hello".to_vec()
-    }));
+    })));
 
     // The task cannot finish while the sender is held, so this join is still
     // pending when the timeout drops it — that drop is the cancellation.
     let cancelled = tokio::time::timeout(
         std::time::Duration::from_millis(50),
-        join_parked_drain(&mut slot),
+        finish_parked_drain(&mut slot),
     )
     .await;
     assert!(cancelled.is_err(), "the join must still have been pending");
-    assert!(slot.is_some(), "a cancelled join must leave the handle parked");
-
-    // Releasing the task: the parked handle still yields what it read.
-    tx.send(()).unwrap();
-    assert_eq!(
-        join_parked_drain(&mut slot).await.as_deref(),
-        Some(&b"hello"[..]),
+    assert!(
+        matches!(slot, Some(ParkedDrain::Running(_))),
+        "a cancelled join must leave the task parked",
     );
-    assert!(slot.is_none(), "a completed join must clear the slot");
+
+    // Releasing it parks the bytes rather than handing them out.
+    tx.send(()).unwrap();
+    finish_parked_drain(&mut slot).await;
+    assert!(
+        matches!(slot, Some(ParkedDrain::Done(ref buf)) if buf == b"hello"),
+        "a finished join must park its bytes in the slot",
+    );
+
+    assert_eq!(take_drained(&mut slot).as_deref(), Some(&b"hello"[..]));
+    assert!(slot.is_none(), "taking the bytes must empty the slot");
+}
+
+/// The reason the bytes are parked rather than returned: the two streams are
+/// joined one after the other, so the second join is a suspension point for a
+/// capture the first one has already read in full. A cancellation there must
+/// not take it.
+#[tokio::test]
+async fn a_finished_capture_survives_a_cancellation_at_the_sibling_join() {
+    let mut stdout = Some(ParkedDrain::Running(tokio::spawn(async { b"hello".to_vec() })));
+    // Held for the whole test, so this drain never finishes.
+    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let mut stderr = Some(ParkedDrain::Running(tokio::spawn(async move {
+        let _ = rx.await;
+        Vec::new()
+    })));
+
+    // The shape of `collect_pipe_drains`: finish one, then the other.
+    let cancelled = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+        finish_parked_drain(&mut stdout).await;
+        finish_parked_drain(&mut stderr).await;
+    })
+    .await;
+    assert!(cancelled.is_err(), "the second join must still have been pending");
+
+    assert!(
+        matches!(stdout, Some(ParkedDrain::Done(ref buf)) if buf == b"hello"),
+        "a capture that finished before the cancellation must still be parked",
+    );
 }

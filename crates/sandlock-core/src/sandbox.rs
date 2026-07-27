@@ -255,11 +255,12 @@ struct Runtime {
     loadavg_handle: Option<JoinHandle<()>>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
-    // Tasks draining the capture pipes above while the child runs (see `wait`).
-    // They belong to the runtime, not to the `wait()` that started them, so a
-    // cancelled `wait()` does not take the output with it.
-    stdout_drain: Option<JoinHandle<Vec<u8>>>,
-    stderr_drain: Option<JoinHandle<Vec<u8>>>,
+    // Drains of the capture pipes above, each holding either the task still
+    // reading or the bytes it finished with (see `wait`). Both states belong to
+    // the runtime rather than to the `wait()` that started them, so a cancelled
+    // `wait()` takes neither the reader nor what it has already produced.
+    stdout_drain: Option<ParkedDrain>,
+    stderr_drain: Option<ParkedDrain>,
     // Parent-held write end of a piped stdin (popen). The caller takes it via
     // `Process::take_stdin`; closing it signals EOF to the child.
     _stdin_write: Option<std::os::fd::OwnedFd>,
@@ -853,10 +854,14 @@ impl Sandbox {
     /// already collected by an earlier `wait()`; a drain that panicked or was
     /// aborted yields no output rather than failing the run.
     async fn collect_pipe_drains(&mut self) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-        // One statement per stream: each borrow of the runtime ends with it, so
-        // the second join is free to borrow again.
-        let stdout = join_parked_drain(&mut self.rt_mut().stdout_drain).await;
-        let stderr = join_parked_drain(&mut self.rt_mut().stderr_drain).await;
+        // Finish both first — each stores its bytes into the runtime as it
+        // completes — and only then take them out. A cancellation between the
+        // two joins therefore loses nothing: whatever finished is parked.
+        // One statement per stream: each borrow of the runtime ends with it.
+        finish_parked_drain(&mut self.rt_mut().stdout_drain).await;
+        finish_parked_drain(&mut self.rt_mut().stderr_drain).await;
+        let stdout = take_drained(&mut self.rt_mut().stdout_drain);
+        let stderr = take_drained(&mut self.rt_mut().stderr_drain);
         (stdout, stderr)
     }
 
@@ -2151,8 +2156,11 @@ impl Drop for Sandbox {
             if let Some(h) = rt.throttle_handle.take() { h.abort(); }
             if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
             // Nobody is left to collect these; aborting closes the read ends.
-            if let Some(h) = rt.stdout_drain.take() { h.abort(); }
-            if let Some(h) = rt.stderr_drain.take() { h.abort(); }
+            // A drain that already finished holds only bytes, dropped with the
+            // runtime.
+            for slot in [rt.stdout_drain.take(), rt.stderr_drain.take()] {
+                if let Some(ParkedDrain::Running(h)) = slot { h.abort(); }
+            }
 
             let is_error = matches!(
                 rt.state,
@@ -2330,17 +2338,31 @@ unsafe fn wire_child_stdio(mode: StdioMode, target: i32, pipe_src: Option<i32>, 
 /// dropping output. The conversion can only fail if the fd is not a readable
 /// pipe, which cannot happen for the pipes `do_create_stdio` creates; if it
 /// somehow did, the stream is left uncaptured rather than the run failing.
-fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<JoinHandle<Vec<u8>>> {
+/// A capture pipe's drain, parked on the `Runtime`: the task while it reads,
+/// then the bytes it read.
+///
+/// Both states have to be parked, not just the first. Handing the finished
+/// bytes back to the `wait()` future and clearing the slot would leave them in
+/// a stack local of a cancellable future — and the sibling stream is joined
+/// after it, which is a suspension point whenever that one is still draining.
+/// A timeout landing there would then destroy a capture that had already been
+/// read in full, with nothing left on the runtime to recover it from.
+enum ParkedDrain {
+    Running(JoinHandle<Vec<u8>>),
+    Done(Vec<u8>),
+}
+
+fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<ParkedDrain> {
     let mut rx = match tokio::net::unix::pipe::Receiver::from_owned_fd(fd) {
         Ok(rx) => rx,
         Err(_) => return None,
     };
-    Some(tokio::spawn(async move {
+    Some(ParkedDrain::Running(tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
         let _ = rx.read_to_end(&mut buf).await;
         buf
-    }))
+    })))
 }
 
 /// Join one parked capture drain, leaving it parked if the join is cancelled.
@@ -2357,12 +2379,31 @@ fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<JoinHandle<Vec<u
 ///
 /// `None` means there was nothing parked. A drain that panicked or was aborted
 /// yields no output rather than failing the run, and is unparked all the same.
-async fn join_parked_drain(slot: &mut Option<JoinHandle<Vec<u8>>>) -> Option<Vec<u8>> {
-    let handle = slot.as_mut()?;
-    // `JoinHandle` is `Unpin`, so it can be polled through `&mut`.
-    let buf = handle.await.unwrap_or_default();
-    *slot = None;
-    Some(buf)
+/// Drive one parked drain to completion, leaving its bytes in the slot.
+///
+/// The store happens in the same step as the await resolving, so there is no
+/// point at which the bytes exist only inside this future: cancelling it leaves
+/// either the still-running task or the finished bytes parked for the next
+/// `wait()`. `JoinHandle` is `Unpin`, so it can be polled through `&mut`, and
+/// dropping this future does not abort the task.
+async fn finish_parked_drain(slot: &mut Option<ParkedDrain>) {
+    if let Some(ParkedDrain::Running(handle)) = slot.as_mut() {
+        let buf = handle.await.unwrap_or_default();
+        *slot = Some(ParkedDrain::Done(buf));
+    }
+}
+
+/// Unpark the bytes of a drain that has finished. Not async on purpose: it runs
+/// after every join, so no cancellation can land between the two streams.
+fn take_drained(slot: &mut Option<ParkedDrain>) -> Option<Vec<u8>> {
+    match slot.take() {
+        Some(ParkedDrain::Done(buf)) => Some(buf),
+        // Still running (nothing joined it) — leave it parked.
+        other => {
+            *slot = other;
+            None
+        }
+    }
 }
 
 fn sandbox_read_fd_to_end(fd: std::os::fd::OwnedFd) -> Vec<u8> {
