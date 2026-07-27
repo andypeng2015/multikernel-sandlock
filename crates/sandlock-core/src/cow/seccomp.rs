@@ -586,7 +586,19 @@ impl SeccompCowBranch {
     /// Handle mknodat: create a file-system node in the upper layer.
     ///
     /// Returns `Err(QuotaExceeded)` when the node would exceed `max_disk`.
+    /// Returns `Err(Denied)` when the node type is S_IFBLK or S_IFCHR.
     pub fn handle_mknod(&mut self, path: &str, mode: u32, dev: u64) -> Result<bool, BranchError> {
+        // Only S_IFIFO, S_IFSOCK, S_IFREG, and 0 are permitted.
+        // S_IFBLK/S_IFCHR are rejected: the supervisor creates nodes under its
+        // own credentials, making device nodes a sandbox escape on root runs.
+        let file_type = mode & libc::S_IFMT as u32; // strips the permission bits 
+        let allowed = file_type == 0
+            || file_type == libc::S_IFREG as u32
+            || file_type == libc::S_IFIFO as u32
+            || file_type == libc::S_IFSOCK as u32;
+        if !allowed {
+            return Err(BranchError::Denied);
+        }
         let rel = match self.safe_rel(path) {
             Some(r) => r,
             None => return Ok(false),
