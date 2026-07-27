@@ -582,46 +582,59 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     // TODO: learn limits.open_files via supervisor once open_files enforcement is implemented.
 
     // --merge: union observed profile into an existing one.
+    // Start from the existing profile so all fields we don't observe 
+    // are preserved. Then union in the observed fields.
     if let Some(ref merge_path) = args.merge {
         let existing_toml = std::fs::read_to_string(merge_path)
             .map_err(|e| anyhow!("failed to read merge file {}: {e}", merge_path.display()))?;
         let existing: ProfileInput = toml::from_str(&existing_toml)
             .map_err(|e| anyhow!("failed to parse merge file {}: {e}", merge_path.display()))?;
 
-        // Keep [program] from the existing profile.
-        profile_out.program = existing.program.clone();
+        // Base is the existing profile; union observed fields into it.
+        let observed = profile_out;
+        profile_out = existing.clone();
 
         // Union filesystem paths, re-run dedup after merging.
         let merged_reads: Vec<PathBuf> = {
-            let mut set: BTreeSet<PathBuf> = profile_out.filesystem.read.iter().cloned().collect();
+            let mut set: BTreeSet<PathBuf> = observed.filesystem.read.iter().cloned().collect();
             set.extend(existing.filesystem.read.iter().cloned());
             dedup_subsumed(set.into_iter().collect())
         };
         let merged_writes: Vec<PathBuf> = {
-            let mut set: BTreeSet<PathBuf> = profile_out.filesystem.write.iter().cloned().collect();
+            let mut set: BTreeSet<PathBuf> = observed.filesystem.write.iter().cloned().collect();
             set.extend(existing.filesystem.write.iter().cloned());
             dedup_subsumed(set.into_iter().collect())
         };
         profile_out.filesystem.read = merged_reads;
         profile_out.filesystem.write = merged_writes;
 
-        // Union network.allow and allow_bind.
+        // Union network.allow.
         let mut allow_set: std::collections::BTreeSet<String> =
-            profile_out.network.allow.iter().cloned().collect();
+            observed.network.allow.iter().cloned().collect();
         allow_set.extend(existing.network.allow.iter().cloned());
         profile_out.network.allow = allow_set.into_iter().collect();
 
-        let mut bind_set: std::collections::BTreeSet<u16> =
-            profile_out.network.allow_bind.iter().filter_map(port_spec_to_u16).collect();
-        bind_set.extend(existing.network.allow_bind.iter().filter_map(port_spec_to_u16));
-        profile_out.network.allow_bind = bind_set.into_iter()
-            .map(sandlock_core::profile::PortSpec::Port)
-            .collect();
+        // Union allow_bind: preserve PortSpec verbatim (ranges, named specs).
+        // Dedup by canonical string: Port(n) -> "n", Spec(s) -> s.
+        let port_key = |p: &sandlock_core::profile::PortSpec| -> String {
+            match p {
+                sandlock_core::profile::PortSpec::Port(n) => n.to_string(),
+                sandlock_core::profile::PortSpec::Spec(s) => s.clone(),
+            }
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut merged_bind: Vec<sandlock_core::profile::PortSpec> = Vec::new();
+        for p in observed.network.allow_bind.iter().chain(existing.network.allow_bind.iter()) {
+            if seen.insert(port_key(p)) {
+                merged_bind.push(p.clone());
+            }
+        }
+        profile_out.network.allow_bind = merged_bind;
 
         // Limits: take the max of old vs observed.
-        profile_out.limits.memory = max_bytesize(existing.limits.memory.as_deref(), profile_out.limits.memory.as_deref());
-        profile_out.limits.processes = max_opt(existing.limits.processes, profile_out.limits.processes);
-        profile_out.limits.open_files = max_opt(existing.limits.open_files, profile_out.limits.open_files);
+        profile_out.limits.memory = max_bytesize(existing.limits.memory.as_deref(), observed.limits.memory.as_deref());
+        profile_out.limits.processes = max_opt(existing.limits.processes, observed.limits.processes);
+        profile_out.limits.open_files = max_opt(existing.limits.open_files, observed.limits.open_files);
     }
 
     let kernel = std::fs::read_to_string("/proc/version")
@@ -659,12 +672,6 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     Ok(())
 }
 
-fn port_spec_to_u16(p: &sandlock_core::profile::PortSpec) -> Option<u16> {
-    match p {
-        sandlock_core::profile::PortSpec::Port(n) => Some(*n),
-        sandlock_core::profile::PortSpec::Spec(s) => s.trim().parse::<u16>().ok(),
-    }
-}
 
 /// Parse a bytesize string like "128M", "1G", "512K" into bytes.
 fn parse_bytesize_bytes(s: &str) -> Option<u64> {

@@ -277,28 +277,55 @@ fn test_learn_then_run_mknod() {
 /// Merged profile covers paths from both learn runs.
 #[test]
 fn test_learn_then_run_merge() {
+    // Two separate workdirs so paths don't collapse into a shared ancestor.
+    let dir_a = tempfile::TempDir::new_in("/var/tmp").expect("tempdir a");
+    let dir_b = tempfile::TempDir::new_in("/var/tmp").expect("tempdir b");
+    let file_a = dir_a.path().join("input.txt");
+    let file_b = dir_b.path().join("input.txt");
+    let secret = dir_a.path().join("secret.txt");
+    std::fs::write(&file_a, "data-a").expect("write file_a");
+    std::fs::write(&file_b, "data-b").expect("write file_b");
+    std::fs::write(&secret, "sensitive").expect("write secret");
+
     let profile = tempfile::NamedTempFile::new().expect("tempfile");
     let profile_path = profile.path().to_str().unwrap().to_owned();
 
+    // Phase 1: learn access to dir_a/input.txt.
     let learn1 = sandlock_bin()
-        .args(["learn", "-o", &profile_path, "--", "cat", "/etc/hostname"])
+        .args(["learn", "-o", &profile_path, "--", "cat", file_a.to_str().unwrap()])
         .output()
         .expect("failed to run sandlock learn");
     assert!(learn1.status.success(), "learn1 failed: {}", String::from_utf8_lossy(&learn1.stderr));
 
+    // Operator hardens the profile: deny the secret file in dir_a.
+    // Insert deny into the existing [filesystem] section.
+    let existing = std::fs::read_to_string(&profile_path).expect("read profile");
+    let deny_line = format!("deny = [\"{}\"]", secret.display());
+    let hardened = existing.replace("[filesystem]", &format!("[filesystem]\n{deny_line}"));
+    std::fs::write(&profile_path, &hardened).expect("write hardened profile");
+
+    // Phase 2: merge, learn access to dir_b/input.txt.
     let learn2 = sandlock_bin()
-        .args(["learn", "--merge", &profile_path, "--", "cat", "/etc/os-release"])
+        .args(["learn", "--merge", &profile_path, "--", "cat", file_b.to_str().unwrap()])
         .output()
         .expect("failed to run sandlock learn --merge");
     assert!(learn2.status.success(), "learn2 failed: {}", String::from_utf8_lossy(&learn2.stderr));
 
-    // Run needs both paths from both learn sessions.
-    // Use `cat` directly, the profile's [program].exec is /usr/bin/cat (from learn1).
-    let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "cat",
-               "/etc/hostname", "/etc/os-release"])
+    // Both files are readable, paths from both learn runs are in the profile.
+    let run_ok = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--",
+               "cat", file_a.to_str().unwrap(), file_b.to_str().unwrap()])
         .output()
         .expect("failed to run sandlock run");
-    assert!(run.status.success(),
-        "run with merged profile failed: {}", String::from_utf8_lossy(&run.stderr));
+    assert!(run_ok.status.success(),
+        "run with merged profile failed: {}", String::from_utf8_lossy(&run_ok.stderr));
+
+    // The deny rule survived the merge: the secret is blocked.
+    let run_deny = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--",
+               "cat", secret.to_str().unwrap()])
+        .output()
+        .expect("failed to run sandlock run (deny check)");
+    assert!(!run_deny.status.success(),
+        "secret should be blocked by deny rule after merge");
 }

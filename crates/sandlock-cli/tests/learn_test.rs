@@ -720,6 +720,25 @@ fn test_learn_merge_unions_profiles() {
         "merged profile missing /etc/os-release: {merged}");
     assert!(merged.contains("hostname"),
         "merged profile must keep [program] from first run: {merged}");
+
+    // deny rules and port ranges in the existing profile must survive a merge.
+    let existing = format!(
+        "[filesystem]\ndeny = [\"/secret\"]\n\n[network]\nallow_bind = [\"9000-9005\", 8080]\n"
+    );
+    std::fs::write(&profile_path, &existing).expect("write existing profile");
+    let learn3 = sandlock_bin()
+        .args(["learn", "--merge", &profile_path, "--", "cat", "/etc/hostname"])
+        .output()
+        .expect("failed to run sandlock learn --merge");
+    assert!(learn3.status.success(),
+        "merge with deny rules failed: {}", String::from_utf8_lossy(&learn3.stderr));
+    let merged2 = std::fs::read_to_string(&profile_path).expect("read merged profile");
+    assert!(merged2.contains("/secret"),
+        "deny rule must survive merge: {merged2}");
+    assert!(merged2.contains("9000-9005"),
+        "port range spec must survive merge verbatim: {merged2}");
+    assert!(merged2.contains("8080"),
+        "numeric port must survive merge: {merged2}");
 }
 
 /// Paths accessed through symlinks are recorded as their canonical real path.
