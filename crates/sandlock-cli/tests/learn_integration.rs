@@ -171,26 +171,44 @@ fn test_learn_then_run_unix_bind() {
 }
 
 /// Collapsed profile: directory grant covers files not individually observed during learn.
+///
+/// Uses a private tempdir rather than /usr/bin: learn canonicalizes observed
+/// paths, and on hosts where coreutils are symlinks into a multicall link farm
+/// (e.g. Ubuntu rust-coreutils on riscv64) the /usr/bin names resolve to
+/// parents that never reach the collapse threshold (issue #170).
 #[test]
 fn test_learn_then_run_collapse() {
     let profile = tempfile::NamedTempFile::new().expect("tempfile");
     let profile_path = profile.path().to_str().unwrap().to_owned();
+    let dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
 
-    // Learn touches several /usr/bin files; --collapse folds them into /usr/bin.
-    let learn = sandlock_bin()
-        .args(["learn", "--collapse", "-o", &profile_path, "--", "sh", "-c",
-               "cat /usr/bin/cat /usr/bin/sh /usr/bin/ls /usr/bin/env"])
-        .output()
-        .expect("failed to run sandlock learn");
+    // Four observed files meet the pinned collapse threshold.
+    let observed: Vec<String> = (1..=4)
+        .map(|i| {
+            let p = dir.path().join(format!("observed{i}.txt"));
+            std::fs::write(&p, "collapse me\n").expect("write observed file");
+            p.to_str().unwrap().to_owned()
+        })
+        .collect();
+    let extra = dir.path().join("unobserved.txt");
+    std::fs::write(&extra, "covered by directory grant\n").expect("write unobserved file");
+
+    let mut learn_cmd = sandlock_bin();
+    learn_cmd.args(["learn", "--collapse=4", "-o", &profile_path, "--", "cat"]);
+    learn_cmd.args(&observed);
+    let learn = learn_cmd.output().expect("failed to run sandlock learn");
     assert!(learn.status.success(), "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
 
-    // Run accesses /usr/bin/true which was not individually observed, the collapsed grant covers it.
+    // Run reads a file that was not individually observed; the collapsed
+    // directory grant covers it.
     let run = sandlock_bin()
-        .args(["run", "--profile-file", &profile_path, "--", "cat", "/usr/bin/true"])
+        .args(["run", "--profile-file", &profile_path, "--", "cat", extra.to_str().unwrap()])
         .output()
         .expect("failed to run sandlock run");
     assert!(run.status.success(),
         "run failed with collapsed profile: {}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "covered by directory grant",
+        "unexpected output from unobserved file");
 }
 
 /// Learned memory limit reflects actual anonymous allocation, not just the floor.
