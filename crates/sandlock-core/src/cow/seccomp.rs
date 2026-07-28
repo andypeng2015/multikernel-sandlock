@@ -337,6 +337,36 @@ fn tmp_storage_base(tmp: &Path, uid: u32) -> PathBuf {
     tmp.join(format!("sandlock-cow-{uid}"))
 }
 
+/// The default storage base: the XDG primary when it is usable, otherwise the
+/// per-uid `$TMPDIR` fallback, both owner- and mode-checked.
+///
+/// No pid in the base name: the default is per-uid so a sweep spans this user's
+/// dead pids. XDG is euid-gated and the tmp fallback is created 0700 with an
+/// owner/symlink check.
+///
+/// Pure like its two callees: the environment is injected, so the whole fallback
+/// chain (and its hard failure) is testable against planted directories without
+/// mutating process-global state that every other test in this binary reads.
+fn resolve_default_storage_base(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    tmp: &Path,
+    uid: u32,
+    euid: u32,
+) -> Result<PathBuf, BranchError> {
+    let primary = preferred_storage_base(xdg_runtime_dir, tmp, uid, euid);
+    match ensure_secure_base(&primary, uid) {
+        Ok(()) => Ok(primary),
+        // A stale/wrong-owner XDG (e.g. an inherited /run/user/0 after de-priv)
+        // falls back to the secure tmp base rather than hard-failing.
+        Err(_) => {
+            let fb = tmp_storage_base(tmp, uid);
+            ensure_secure_base(&fb, uid)
+                .map_err(|e| BranchError::Operation(format!("create storage base: {e}")))?;
+            Ok(fb)
+        }
+    }
+}
+
 /// Create `base` with mode 0700, or — if it already exists — require that it is
 /// a real directory (not a symlink) owned by `uid`.
 ///
@@ -528,33 +558,12 @@ impl SeccompCowBranch {
     pub fn create(workdir: &Path, storage: Option<&Path>, max_disk_bytes: u64) -> Result<Self, BranchError> {
         let storage_base = match storage {
             Some(p) => p.to_path_buf(),
-            None => {
-                // No pid in the base name: the default is per-uid so a sweep
-                // spans this user's dead pids. XDG is euid-gated and the tmp
-                // fallback is created 0700 with an owner/symlink check.
-                let uid = unsafe { libc::getuid() };
-                let euid = unsafe { libc::geteuid() };
-                let tmp = std::env::temp_dir();
-                let primary = preferred_storage_base(
-                    std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
-                    &tmp,
-                    uid,
-                    euid,
-                );
-                match ensure_secure_base(&primary, uid) {
-                    Ok(()) => primary,
-                    // A stale/wrong-owner XDG (e.g. an inherited /run/user/0 after
-                    // de-priv) falls back to the secure tmp base rather than
-                    // hard-failing.
-                    Err(_) => {
-                        let fb = tmp_storage_base(&tmp, uid);
-                        ensure_secure_base(&fb, uid).map_err(|e| {
-                            BranchError::Operation(format!("create storage base: {e}"))
-                        })?;
-                        fb
-                    }
-                }
-            }
+            None => resolve_default_storage_base(
+                std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                &std::env::temp_dir(),
+                unsafe { libc::getuid() },
+                unsafe { libc::geteuid() },
+            )?,
         };
         let branch_id = uuid::Uuid::new_v4().to_string();
         let branch_dir = storage_base.join(&branch_id);
@@ -5848,79 +5857,64 @@ mod tests {
         );
     }
 
-    /// GAP-8: when the XDG primary base cannot be secured, `create(None)` falls back
-    /// to the secure per-uid `$TMPDIR/sandlock-cow-<uid>` base — and if THAT also
-    /// cannot be secured, it HARD-ERRORS rather than silently using an insecure
-    /// base.
+    /// GAP-8: when the XDG primary base cannot be secured, the default-base
+    /// resolver falls back to the secure per-uid `$TMPDIR/sandlock-cow-<uid>`
+    /// base — and if THAT also cannot be secured, it HARD-ERRORS rather than
+    /// silently using an insecure base.
+    ///
+    /// Runs against the pure resolver with both directories injected, so it
+    /// mutates no process-global state. It used to set `XDG_RUNTIME_DIR` and
+    /// `TMPDIR` for the whole process, which is unsound under a parallel test
+    /// runner twice over: the sibling tests that call `create(None)` read the
+    /// same two variables, and the `TMPDIR` write additionally reparents every
+    /// `tempfile::tempdir()` in this binary under a directory this test then
+    /// removes. `create(None)` calling the same resolver is what
+    /// `list_preserved_default_base_spans_pids` proves end to end.
     #[test]
-    fn create_falls_back_to_tmp_when_xdg_base_is_foreign() {
+    fn default_storage_base_falls_back_off_a_foreign_xdg_and_then_hard_fails() {
         use std::os::unix::fs::PermissionsExt;
         let uid = unsafe { libc::getuid() };
-        let euid = unsafe { libc::geteuid() };
-        if uid != euid {
-            eprintln!("skipped: the XDG base is only chosen when uid == euid");
-            return;
-        }
-
-        // Restore env on scope exit, even on panic.
-        struct EnvGuard {
-            xdg: Option<std::ffi::OsString>,
-            tmp: Option<std::ffi::OsString>,
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.xdg {
-                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
-                }
-                match &self.tmp {
-                    Some(v) => std::env::set_var("TMPDIR", v),
-                    None => std::env::remove_var("TMPDIR"),
-                }
-            }
-        }
-        let _guard = EnvGuard {
-            xdg: std::env::var_os("XDG_RUNTIME_DIR"),
-            tmp: std::env::var_os("TMPDIR"),
-        };
 
         let xdg_root = tempfile::tempdir().unwrap();
         let tmp_root = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_RUNTIME_DIR", xdg_root.path());
-        std::env::set_var("TMPDIR", tmp_root.path());
-        assert_eq!(std::env::temp_dir(), tmp_root.path(), "TMPDIR must drive temp_dir()");
 
         // Plant $XDG/sandlock-cow (the primary) group/world-accessible -> insecure.
         let foreign_primary = xdg_root.path().join("sandlock-cow");
         fs::create_dir(&foreign_primary).unwrap();
         fs::set_permissions(&foreign_primary, fs::Permissions::from_mode(0o777)).unwrap();
 
-        // create(None) must fall back to the secure per-uid tmp base.
-        let workdir = tempfile::tempdir().unwrap();
-        let branch = SeccompCowBranch::create(workdir.path(), None, 0).unwrap();
-        let tmp_base = tmp_root.path().join(format!("sandlock-cow-{uid}"));
+        // The resolver must fall back to the secure per-uid tmp base, creating
+        // it 0700 on the way.
+        let tmp_base = tmp_storage_base(tmp_root.path(), uid);
+        let chosen =
+            resolve_default_storage_base(Some(xdg_root.path().as_os_str()), tmp_root.path(), uid, uid)
+                .expect("an insecure XDG base must fall back, not fail");
         assert_eq!(
-            branch.storage_dir.parent().unwrap(),
-            tmp_base,
+            chosen, tmp_base,
             "an insecure XDG base must fall back to the secure per-uid tmp base",
         );
-        drop(branch); // reclaim the branch dir; the tmp base dir itself remains 0700
+        assert_eq!(
+            fs::metadata(&tmp_base).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the fallback base must be created 0700",
+        );
 
-        // Now make the tmp fallback ALSO insecure: create(None) must HARD-ERROR,
-        // never silently land on an insecure base.
+        // Now make the tmp fallback ALSO insecure: the chain must HARD-ERROR,
+        // never silently land on an insecure base and never fall back twice.
         fs::set_permissions(&tmp_base, fs::Permissions::from_mode(0o777)).unwrap();
-        let err = match SeccompCowBranch::create(workdir.path(), None, 0) {
-            Ok(_) => panic!("both bases insecure must be a hard error, not a silent insecure base"),
+        let err = match resolve_default_storage_base(
+            Some(xdg_root.path().as_os_str()),
+            tmp_root.path(),
+            uid,
+            uid,
+        ) {
+            Ok(b) => panic!("both bases insecure must be a hard error, got base {}", b.display()),
             Err(e) => e,
         };
         assert!(
-            matches!(err, BranchError::Operation(_)),
+            matches!(err, BranchError::Operation(ref m) if m.starts_with("create storage base")),
             "expected a create-storage-base error, got: {err:?}",
         );
-
-        // Clean the widened dirs so they do not leak into the next test.
-        let _ = fs::remove_dir_all(&foreign_primary);
-        let _ = fs::remove_dir_all(&tmp_base);
     }
 
     /// One sweep of the per-uid default base spans MULTIPLE pids' preserved work —
