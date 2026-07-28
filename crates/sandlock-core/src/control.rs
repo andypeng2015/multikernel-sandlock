@@ -63,17 +63,12 @@ pub fn sock_path(dir: &Path) -> PathBuf {
 }
 
 /// Read the supervisor PID from a runtime dir's pid file.
-/// Returns `None` if the file is missing, unparseable, or in the old
-/// single-line format (backward compat: falls back to line 1).
+/// Returns `None` if the file is missing, unparseable, or does not
+/// contain two lines (child_pid\nsupervisor_pid\n).
 fn read_supervisor_pid(dir: &Path) -> Option<i32> {
     let content = std::fs::read_to_string(pid_path(dir)).ok()?;
-    let mut lines = content.lines();
-    // Line 2 is the supervisor PID in the current format.
-    if let Some(pid) = lines.nth(1).and_then(|l| l.trim().parse().ok()) {
-        return Some(pid);
-    }
-    // Fall back to line 1 (old single-line format or corrupt file).
-    content.lines().next()?.trim().parse().ok()
+    // Line 2 is the supervisor PID.
+    content.lines().nth(1)?.trim().parse().ok()
 }
 
 // ============================================================
@@ -520,10 +515,15 @@ pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
                 continue;
             }
         };
-        let supervisor_pid: i32 = lines
-            .next()
-            .and_then(|l| l.trim().parse().ok())
-            .unwrap_or(child_pid); // fall back to child_pid for old format
+        let supervisor_pid: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
+            Some(p) => p,
+            None => {
+                if !dir_is_recent(&dir, &now) {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                continue;
+            }
+        };
 
         // Liveness check: use supervisor PID since the supervisor owns
         // the control socket.  If the supervisor is dead, the sandbox is

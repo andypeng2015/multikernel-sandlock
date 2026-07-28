@@ -286,6 +286,10 @@ async fn main() -> Result<()> {
         }
 
         Command::Config { name, toml } => {
+            if let Err(e) = validate_cli_name(&name) {
+                eprintln!("sandlock: {e}");
+                std::process::exit(1);
+            }
             match sandlock_core::control::send_control_request(
                 &name, "config", serde_json::Value::Object(Default::default()),
             ) {
@@ -319,6 +323,10 @@ async fn main() -> Result<()> {
         }
 
         Command::Kill { name } => {
+            if let Err(e) = validate_cli_name(&name) {
+                eprintln!("sandlock: {e}");
+                std::process::exit(1);
+            }
             // Read both PIDs from the per-sandbox pid file (no socket
             // round-trip).  Format: child_pid\nsupervisor_pid\n
             let dir = sandlock_core::control::sandbox_dir(&name);
@@ -338,10 +346,13 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             };
-            let supervisor_pid: i32 = lines
-                .next()
-                .and_then(|l| l.trim().parse().ok())
-                .unwrap_or(child_pid); // fall back for old single-line format
+            let supervisor_pid: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
+                Some(p) => p,
+                None => {
+                    eprintln!("sandlock: invalid pid file for '{}'", name);
+                    std::process::exit(1);
+                }
+            };
 
             // Check supervisor liveness (the process that owns the socket).
             if unsafe { libc::kill(supervisor_pid, 0) } != 0 {
@@ -931,6 +942,28 @@ fn parse_branch_action(flag: &str, s: &str) -> Result<BranchAction> {
 // ============================================================
 // /proc helpers for sandlock ps
 // ============================================================
+
+/// Validate a sandbox name coming from CLI argv (kill/config paths).
+/// Mirrors `sandbox_validate_name` but returns a plain `Result` so the
+/// CLI can format its own error messages.
+fn validate_cli_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("sandbox name must not be empty".into());
+    }
+    if name.len() > 64 {
+        return Err("sandbox name must be at most 64 bytes".into());
+    }
+    if name.contains('\0') {
+        return Err("sandbox name must not contain NUL bytes".into());
+    }
+    if name.contains('/') {
+        return Err("sandbox name must not contain '/'".into());
+    }
+    if name == "." || name == ".." {
+        return Err("sandbox name must not be '.' or '..'".into());
+    }
+    Ok(())
+}
 
 /// Query the control socket for the virtual→real port map, returning a
 /// compact display string or `"-"` when the socket is missing (e.g.

@@ -9,11 +9,19 @@ time; runtime state (``_native``, ``_handle``) is initialized lazily.
 from __future__ import annotations
 
 import inspect
+import itertools
+import os
 import re
 import weakref
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
+
+# Module-level counter for auto-generated sandbox names.
+# Using itertools.count avoids both dataclass field pollution (a class-level
+# annotated assignment inside @dataclass becomes a real field) and a
+# check-then-act race on the lazy Lock init.
+_name_counter = itertools.count(1)
 
 if TYPE_CHECKING:
     from ._notif_policy import NotifPolicy
@@ -427,6 +435,10 @@ class Sandbox:
                 raise ValueError("sandbox name must not contain NUL bytes")
             if len(self.name.encode()) > 64:
                 raise ValueError("sandbox name must be at most 64 bytes")
+            if "/" in self.name:
+                raise ValueError("sandbox name must not contain '/'")
+            if self.name in (".", ".."):
+                raise ValueError("sandbox name must not be '.' or '..'")
         # Runtime state — not dataclass fields, not serialized
         self._native = None   # _NativePolicy created lazily on first use
         self._handle = None   # live sandbox handle during start()/run()
@@ -435,21 +447,10 @@ class Sandbox:
                               # non-owning busy marker
         self._restore_skipped = []  # SkippedFd entries from the last restore
 
-    _name_counter: int = 0
-    _name_lock = None  # threading.Lock, lazily created
-
-    @classmethod
-    def _next_name(cls) -> str:
+    @staticmethod
+    def _next_name() -> str:
         """Generate a unique sandbox name: sandbox-{pid}-{counter}."""
-        import os
-
-        if cls._name_lock is None:
-            import threading
-
-            cls._name_lock = threading.Lock()
-        with cls._name_lock:
-            cls._name_counter += 1
-            return f"sandbox-{os.getpid()}-{cls._name_counter}"
+        return f"sandbox-{os.getpid()}-{next(_name_counter)}"
 
     def _resolve_name(self) -> str:
         """Resolve sandbox name: explicit > auto-generated."""

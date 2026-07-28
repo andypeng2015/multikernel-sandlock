@@ -4,6 +4,7 @@
 //! sandbox via the CLI binary and querying its `config` verb, verifying that
 //! the effective policy returned matches the sandbox's configured policy.
 
+use std::ffi::CString;
 use std::process::Command;
 use std::time::Duration;
 
@@ -324,5 +325,345 @@ fn test_control_sandbox_to_json() {
     assert!(
         read.iter().any(|v| v.as_str() == Some("/usr")),
         "filesystem.read should contain /usr"
+    );
+}
+
+// ============================================================
+// Name collision, --no-supervisor, control_socket=false, ports
+// ============================================================
+
+#[test]
+fn test_control_name_collision() {
+    let name = format!("test-ctrl-collision-{}", std::process::id());
+    let mut first = start_sleep_sandbox(&name);
+
+    match wait_for_sandbox(&name) {
+        Ok(()) => {
+            let out = sandlock_bin()
+                .args([
+                    "run", "--name", &name,
+                    "-r", "/usr", "-r", "/bin", "-r", "/etc",
+                    "-r", "/proc", "-r", "/dev",
+                    "--", "/bin/sleep", "5",
+                ])
+                .output()
+                .expect("sandlock run (collision)");
+            assert!(
+                !out.status.success(),
+                "second sandbox with same name must fail"
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("already running"),
+                "error should indicate name collision: {}",
+                stderr
+            );
+        }
+        Err(e) => {
+            let stderr_output = child_stderr(&mut first);
+            let _ = first.kill();
+            panic!("{}; child stderr: {}", e, stderr_output);
+        }
+    }
+
+    let _ = first.kill();
+    let _ = first.wait();
+}
+
+#[test]
+fn test_control_no_supervisor() {
+    let name = format!("test-ctrl-nosup-{}", std::process::id());
+    let has_lib64 = std::path::Path::new("/lib64").exists();
+    let mut args: Vec<&str> = vec![
+        "run", "--name", &name, "--no-supervisor",
+        "-r", "/usr", "-r", "/bin", "-r", "/lib",
+        "-r", "/etc", "-r", "/proc", "-r", "/dev",
+    ];
+    if has_lib64 {
+        args.push("-r");
+        args.push("/lib64");
+    }
+    args.push("--");
+    args.push("/bin/sleep");
+    args.push("30");
+
+    let mut child = sandlock_bin()
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sandlock --no-supervisor");
+
+    match wait_for_sandbox(&name) {
+        Ok(()) => {
+            let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains(&name),
+                "ps should list --no-supervisor sandbox: {}",
+                stdout
+            );
+            assert!(
+                stdout.contains("PORTS"),
+                "ps should have PORTS column: {}",
+                stdout
+            );
+        }
+        Err(e) => {
+            let stderr_output = child_stderr(&mut child);
+            let _ = child.kill();
+            panic!("{}; child stderr: {}", e, stderr_output);
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn test_control_socket_disabled() {
+    // control_socket = false is a builder field, not a CLI flag.
+    // The sandbox runs without binding the control socket — the pid file
+    // is still written (via setup_runtime_dir_no_socket) so ps still sees
+    // it, but config/ports/kill via the socket fail gracefully.
+    let sb = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .control_socket(false)
+        .build()
+        .unwrap();
+    assert!(
+        !sb.control_socket,
+        "control_socket should be false"
+    );
+
+    // Also test the default (true).
+    let sb2 = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .build()
+        .unwrap();
+    assert!(
+        sb2.control_socket,
+        "control_socket should default to true"
+    );
+}
+
+#[test]
+fn test_control_ports_verb() {
+    let name = format!("test-ctrl-ports-{}", std::process::id());
+    let mut child = start_sleep_sandbox(&name);
+
+    match wait_for_sandbox(&name) {
+        Ok(()) => {
+            let resp = sandlock_core::control::send_control_request(
+                &name,
+                "ports",
+                serde_json::Value::Object(Default::default()),
+            );
+            match resp {
+                Ok(r) => {
+                    assert!(r.ok, "ports verb should succeed: {:?}", r.err);
+                    // With no port forwarding configured, the map should be empty.
+                    if let Some(data) = r.data {
+                        let map: std::collections::HashMap<u16, u16> =
+                            serde_json::from_value(data).unwrap_or_default();
+                        assert!(
+                            map.is_empty(),
+                            "ports map should be empty when no port forwarding configured"
+                        );
+                    }
+                }
+                Err(e) => {
+                    panic!("ports verb failed: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            let stderr_output = child_stderr(&mut child);
+            let _ = child.kill();
+            panic!("{}; child stderr: {}", e, stderr_output);
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn test_control_ps_ports_column() {
+    let name = format!("test-ctrl-psports-{}", std::process::id());
+    let mut child = start_sleep_sandbox(&name);
+
+    match wait_for_sandbox(&name) {
+        Ok(()) => {
+            let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains("PORTS"),
+                "ps header should contain PORTS column: {}",
+                stdout
+            );
+            assert!(
+                stdout.contains(&name),
+                "ps should list sandbox: {}",
+                stdout
+            );
+        }
+        Err(e) => {
+            let stderr_output = child_stderr(&mut child);
+            let _ = child.kill();
+            panic!("{}; child stderr: {}", e, stderr_output);
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[tokio::test]
+async fn test_control_invalid_names() {
+    // Names that would escape /dev/shm/sandlock-$UID must be rejected
+    // at spawn time (sandbox_resolve_name → sandbox_validate_name).
+    for bad in &["/", "..", ".", "a/b", "../etc"] {
+        let result = sandlock_core::Sandbox::builder()
+            .fs_read("/usr")
+            .fs_read("/bin")
+            .fs_read("/lib")
+            .fs_read_if_exists("/lib64")
+            .fs_read("/proc")
+            .build()
+            .unwrap()
+            .with_name(*bad)
+            .run(&["true"])
+            .await;
+        assert!(
+            result.is_err(),
+            "sandbox name {:?} should be rejected", bad
+        );
+    }
+
+    // Test that sandbox_dir alone does join freely — the validation layer
+    // is what prevents bad names from reaching filesystem ops.
+    let dir = sandlock_core::control::sandbox_dir("..");
+    let dir_str = dir.to_string_lossy();
+    assert!(
+        dir_str.ends_with(".."),
+        "sandbox_dir('..') must append the name as-is (caller must validate): {}",
+        dir_str
+    );
+}
+
+// ============================================================
+// CLI kill / config input validation
+// ============================================================
+
+#[test]
+fn test_control_cli_kill_rejects_bad_names() {
+    for bad in &["..", ".", "a/b", "/dev/shm"] {
+        let out = sandlock_bin()
+            .args(["kill", bad])
+            .output()
+            .expect("sandlock kill");
+        assert!(
+            !out.status.success(),
+            "sandlock kill {:?} should fail", bad
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("must not"),
+            "kill {:?} should produce a validation error, got: {}",
+            bad, stderr
+        );
+    }
+}
+
+#[test]
+fn test_control_cli_config_rejects_bad_names() {
+    for bad in &["..", ".", "a/b"] {
+        let out = sandlock_bin()
+            .args(["config", bad])
+            .output()
+            .expect("sandlock config");
+        assert!(
+            !out.status.success(),
+            "sandlock config {:?} should fail", bad
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("must not"),
+            "config {:?} should produce a validation error, got: {}",
+            bad, stderr
+        );
+    }
+}
+
+#[test]
+fn test_control_cli_kill_nonexistent() {
+    let out = sandlock_bin()
+        .args(["kill", "nonexistent-sandbox-xyz-99999"])
+        .output()
+        .expect("sandlock kill");
+    assert!(
+        !out.status.success(),
+        "kill nonexistent sandbox should fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no sandbox named") || stderr.contains("not running"),
+        "kill nonexistent should say 'no sandbox named', got: {}",
+        stderr
+    );
+}
+
+// ============================================================
+// pid file format — two lines required (old single-line shim removed)
+// ============================================================
+
+#[test]
+fn test_control_single_line_pid_file_is_pruned() {
+    let uid = unsafe { libc::getuid() };
+    let root = sandlock_core::control::runtime_dir_uid(uid);
+    if !root.exists() {
+        std::fs::create_dir_all(&root).expect("create sandlock root");
+    }
+
+    let dir = root.join("test-single-line-pid");
+    std::fs::create_dir_all(&dir).expect("create test dir");
+
+    // Write a pid file with only one line — the format that never shipped.
+    let pid_path = sandlock_core::control::pid_path(&dir);
+    std::fs::write(&pid_path, "12345\n").expect("write single-line pid file");
+
+    // Set the dir mtime to >2s ago so the recency check allows pruning.
+    // list_live_sandboxes won't prune dirs modified less than 2s ago
+    // (concurrent setup protection).
+    let old_time = libc::timespec {
+        tv_sec: 1000, // Unix epoch + 1000s — ancient
+        tv_nsec: 0,
+    };
+    let times = [old_time, old_time];
+    let dir_cstr = CString::new(dir.to_str().unwrap()).expect("valid C string");
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            dir_cstr.as_ptr(),
+            times.as_ptr(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0, "utimensat failed on {:?}", dir);
+
+    // list_live_sandboxes must prune this dir (supervisor_pid parse fails
+    // and the mtime is old).
+    let sandboxes = sandlock_core::control::list_live_sandboxes()
+        .expect("list_live_sandboxes");
+    assert!(
+        !sandboxes.iter().any(|(n, _)| n == "test-single-line-pid"),
+        "single-line pid dir should not be listed, got: {:?}",
+        sandboxes
+    );
+    assert!(
+        !dir.exists(),
+        "single-line pid dir should be pruned"
     );
 }

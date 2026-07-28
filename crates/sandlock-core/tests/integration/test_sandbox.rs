@@ -96,6 +96,22 @@ async fn test_invalid_sandbox_name() {
     let long_name = "x".repeat(65);
     let result = Sandbox::builder().build().unwrap().with_name(long_name).run(&["true"]).await;
     assert!(result.is_err(), "sandbox name > 64 bytes should fail");
+
+    // Name is a path component — reject /, ., ..
+    for bad in &["/", "..", ".", "a/b", "../etc"] {
+        let result = Sandbox::builder()
+            .fs_read("/usr")
+            .fs_read("/bin")
+            .fs_read("/lib")
+            .fs_read_if_exists("/lib64")
+            .fs_read("/proc")
+            .build()
+            .unwrap()
+            .with_name(*bad)
+            .run(&["true"])
+            .await;
+        assert!(result.is_err(), "sandbox name {:?} should fail", bad);
+    }
 }
 
 #[tokio::test]
