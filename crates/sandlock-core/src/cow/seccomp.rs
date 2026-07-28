@@ -1814,7 +1814,11 @@ impl SeccompCowBranch {
     ///    a commit that already failed part way keeps its stronger
     ///    `MergeInterrupted` marker rather than downgrading it (see
     ///    `preserve_deferred_unless_interrupted`), so the
-    ///    `CommitDeferred <=> workdir untouched` invariant holds across retries;
+    ///    `CommitDeferred => workdir untouched` implication holds across
+    ///    retries. Only that direction holds: a head-marker write failure
+    ///    leaves an UNTOUCHED workdir preserved as `MergeInterrupted`, the
+    ///    over-strong direction, which that reason's contract ("may have
+    ///    touched") permits;
     /// 3. only with the lock held does the destructive merge run.
     pub(crate) fn commit_with_lock_polling(
         &mut self,
@@ -1834,8 +1838,8 @@ impl SeccompCowBranch {
                 // `Preserved(MergeInterrupted)` over a HALF-MERGED workdir —
                 // downgrading it to `CommitDeferred` ("workdir untouched") would
                 // let a recovery sweep re-apply a half-merged change set. Never
-                // weaken a stronger reason; the invariant is
-                // CommitDeferred <=> workdir untouched.
+                // weaken a stronger reason; what must hold is
+                // CommitDeferred => workdir untouched.
                 self.preserve_deferred_unless_interrupted();
                 return Err(CommitError::Contended(d));
             }
