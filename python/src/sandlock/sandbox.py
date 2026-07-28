@@ -9,11 +9,19 @@ time; runtime state (``_native``, ``_handle``) is initialized lazily.
 from __future__ import annotations
 
 import inspect
+import itertools
+import os
 import re
 import weakref
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
+
+# Module-level counter for auto-generated sandbox names.
+# Using itertools.count avoids both dataclass field pollution (a class-level
+# annotated assignment inside @dataclass becomes a real field) and a
+# check-then-act race on the lazy Lock init.
+_name_counter = itertools.count(1)
 
 if TYPE_CHECKING:
     from ._notif_policy import NotifPolicy
@@ -407,7 +415,7 @@ class Sandbox:
     # Runtime kwargs — not part of policy serialization.
     name: str | None = field(default=None, repr=False, metadata={"runtime": True})
     """Sandbox name (also exposed as the virtual hostname inside the sandbox).
-    Auto-generated as ``sandbox-{pid}`` when omitted."""
+    Auto-generated as ``sandbox-{pid}-{counter}`` when omitted."""
 
     policy_fn: Callable | None = field(default=None, repr=False, metadata={"runtime": True})
     """Optional callback for dynamic per-event policy decisions."""
@@ -427,6 +435,10 @@ class Sandbox:
                 raise ValueError("sandbox name must not contain NUL bytes")
             if len(self.name.encode()) > 64:
                 raise ValueError("sandbox name must be at most 64 bytes")
+            if "/" in self.name:
+                raise ValueError("sandbox name must not contain '/'")
+            if self.name in (".", ".."):
+                raise ValueError("sandbox name must not be '.' or '..'")
         # Runtime state — not dataclass fields, not serialized
         self._native = None   # _NativePolicy created lazily on first use
         self._handle = None   # live sandbox handle during start()/run()
@@ -435,12 +447,16 @@ class Sandbox:
                               # non-owning busy marker
         self._restore_skipped = []  # SkippedFd entries from the last restore
 
+    @staticmethod
+    def _next_name() -> str:
+        """Generate a unique sandbox name: sandbox-{pid}-{counter}."""
+        return f"sandbox-{os.getpid()}-{next(_name_counter)}"
+
     def _resolve_name(self) -> str:
         """Resolve sandbox name: explicit > auto-generated."""
-        import os
         if self.name is not None:
             return self.name
-        return f"sandbox-{os.getpid()}"
+        return self._next_name()
 
     def _ensure_native(self):
         """Build a fresh native policy from this dataclass.

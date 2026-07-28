@@ -5,7 +5,6 @@ use super::*;
 /// When the `cli` feature is enabled this struct also derives `clap::Args` so
 /// that the CLI can expose all per-field flags via `#[clap(flatten)]` without
 /// duplicating the flag declarations.
-#[derive(Default)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(short = 'r', long = "fs-read", value_name = "PATH"))]
@@ -194,6 +193,13 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub no_supervisor: bool,
 
+    /// Enable the per-sandbox control socket for introspection. Defaults to
+    /// `true`. When `false`, no runtime dir, pid file, or control-socket task
+    /// is created — `sandlock ps` and `sandlock config` will not see this
+    /// sandbox.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub control_socket: bool,
+
     #[cfg_attr(feature = "cli", arg(long = "user", value_name = "UID:GID"))]
     pub user: Option<RunAs>,
 
@@ -229,6 +235,64 @@ impl std::fmt::Debug for SandboxBuilder {
             .field("max_processes", &self.max_processes)
             .field("policy_fn", &self.policy_fn.as_ref().map(|_| "<callback>"))
             .finish_non_exhaustive()
+    }
+}
+
+impl Default for SandboxBuilder {
+    fn default() -> Self {
+        Self {
+            fs_readable: Vec::new(),
+            fs_writable: Vec::new(),
+            fs_denied: Vec::new(),
+            extra_deny_syscalls: Vec::new(),
+            extra_allow_syscalls: Vec::new(),
+            net_allow: Vec::new(),
+            net_deny: Vec::new(),
+            net_allow_bind: Vec::new(),
+            net_deny_bind: Vec::new(),
+            http_allow: Vec::new(),
+            http_deny: Vec::new(),
+            credentials: Vec::new(),
+            http_auth: Vec::new(),
+            http_ports: Vec::new(),
+            http_ca: None,
+            http_key: None,
+            http_inject_ca: Vec::new(),
+            http_ca_out: None,
+            max_memory: None,
+            max_processes: None,
+            max_open_files: None,
+            max_cpu: None,
+            random_seed: None,
+            time_start: None,
+            no_randomize_memory: false,
+            no_huge_pages: false,
+            no_coredump: false,
+            deterministic_dirs: false,
+            workdir: None,
+            cwd: None,
+            fs_storage: None,
+            max_disk: None,
+            on_exit: None,
+            on_error: None,
+            fs_mount: Vec::new(),
+            fs_mount_ro: Vec::new(),
+            chroot: None,
+            clean_env: false,
+            env: std::collections::HashMap::new(),
+            gpu_devices: None,
+            cpu_cores: None,
+            num_cpus: None,
+            port_remap: false,
+            no_supervisor: false,
+            control_socket: true,
+            user: None,
+            protection_policy: ProtectionPolicy::default(),
+            policy_fn: None,
+            name: None,
+            init_fn: None,
+            work_fn: None,
+        }
     }
 }
 
@@ -283,6 +347,7 @@ impl Clone for SandboxBuilder {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
+            control_socket: self.control_socket,
             user: self.user,
             protection_policy: self.protection_policy.clone(),
             policy_fn: self.policy_fn.clone(),
@@ -612,6 +677,15 @@ impl SandboxBuilder {
         self
     }
 
+    /// Enable or disable the per-sandbox control socket. Defaults to `true`.
+    /// When `false`, no runtime dir, pid file, or control-socket task is
+    /// created — `sandlock ps` and `sandlock config` will not see this
+    /// sandbox.
+    pub fn control_socket(mut self, v: bool) -> Self {
+        self.control_socket = v;
+        self
+    }
+
     pub fn policy_fn(
         mut self,
         f: impl Fn(crate::policy_fn::SyscallEvent, &mut crate::policy_fn::PolicyContext) -> crate::policy_fn::Verdict + Send + Sync + 'static,
@@ -891,6 +965,7 @@ impl SandboxBuilder {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
+            control_socket: self.control_socket,
             user: self.user,
             policy_fn: self.policy_fn,
             name: self.name,

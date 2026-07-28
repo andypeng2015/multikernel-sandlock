@@ -16,13 +16,13 @@ async fn test_num_cpus_virtualization() {
         .unwrap();
 
     // Verify /proc/cpuinfo shows 2 processors.
-    let result = policy.clone().with_name("test").run(&["sh", "-c", "grep -c ^processor /proc/cpuinfo"]).await.unwrap();
+    let result = policy.clone().run(&["sh", "-c", "grep -c ^processor /proc/cpuinfo"]).await.unwrap();
     assert!(result.success(), "grep /proc/cpuinfo should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "2", "/proc/cpuinfo should show 2 processors, got: {:?}", stdout.trim());
 
     // Verify nproc (sched_getaffinity) also reports 2.
-    let result = policy.clone().with_name("test").run(&["nproc"]).await.unwrap();
+    let result = policy.clone().run(&["nproc"]).await.unwrap();
     assert!(result.success(), "nproc should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "2", "nproc should report 2 CPUs, got: {:?}", stdout.trim());
@@ -43,7 +43,7 @@ async fn test_meminfo_virtualization() {
         .unwrap();
 
     // Read meminfo — should show virtualized values
-    let result = policy.clone().with_name("test").run(&["cat", "/proc/meminfo"]).await.unwrap();
+    let result = policy.clone().run(&["cat", "/proc/meminfo"]).await.unwrap();
     assert!(result.success(), "cat /proc/meminfo should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // 256 MiB = 262144 kB
@@ -68,7 +68,7 @@ async fn test_sensitive_proc_blocked() {
         .unwrap();
 
     // /proc/kcore should be denied
-    let result = policy.clone().with_name("test").run(&["cat", "/proc/kcore"]).await.unwrap();
+    let result = policy.clone().run(&["cat", "/proc/kcore"]).await.unwrap();
     assert!(!result.success(), "/proc/kcore should be denied");
 }
 
@@ -112,7 +112,7 @@ async fn test_sensitive_proc_resists_bypasses() {
         "print('|'.join(results))\n",
     );
 
-    let result = policy.clone().with_name("test").run(&["python3", "-c", script]).await.unwrap();
+    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     for label in ["dirfd", "dotdot", "curdir", "slash2"] {
         let needle = format!("{label}:DENIED");
@@ -156,7 +156,7 @@ async fn test_proc_virt_resists_bypasses() {
         "print(results)\n",
     );
 
-    let result = policy.clone().with_name("test").run(&["python3", "-c", script]).await.unwrap();
+    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     for label in ["dirfd", "dotdot", "curdir", "slash2"] {
         let needle = format!("'{label}': 2");
@@ -180,7 +180,7 @@ async fn test_no_proc_virt_still_works() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["cat", "/proc/version"]).await.unwrap();
+    let result = policy.clone().run(&["cat", "/proc/version"]).await.unwrap();
     assert!(result.success(), "Should work without proc virtualization");
 }
 
@@ -224,7 +224,7 @@ async fn test_proc_net_tcp_filtered() {
         "open('{out}', 'w').write(str(len(ports)))\n",
     ), port = port, out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let count: usize = content.parse().unwrap_or(999);
@@ -242,7 +242,7 @@ async fn test_proc_mounts_virtualized() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["cat", "/proc/mounts"]).await.unwrap();
+    let result = policy.clone().run(&["cat", "/proc/mounts"]).await.unwrap();
     assert!(result.success(), "cat /proc/mounts should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // Should contain the root entry (no chroot → rootfs)
@@ -261,7 +261,7 @@ async fn test_proc_self_mountinfo_virtualized() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["cat", "/proc/self/mountinfo"]).await.unwrap();
+    let result = policy.clone().run(&["cat", "/proc/self/mountinfo"]).await.unwrap();
     assert!(result.success(), "cat /proc/self/mountinfo should succeed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     // Should contain root entry in mountinfo format
@@ -305,7 +305,7 @@ async fn test_proc_parent_pid_blocked() {
         "open('{out}', 'w').write(','.join(results))\n",
     ), out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "script should exit 0");
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
@@ -343,7 +343,7 @@ async fn test_proc_net_tcp_hides_host_ports() {
         "open('{out}', 'w').write(str(len(ports)))\n",
     ), out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let count: usize = content.parse().unwrap_or(999);

@@ -11,7 +11,7 @@ async fn test_echo() {
         .fs_read("/proc")
         .build()
         .unwrap();
-    let result = policy.clone().with_name("test").run(&["echo", "hello"]).await.unwrap();
+    let result = policy.clone().run(&["echo", "hello"]).await.unwrap();
     assert!(result.success());
     assert_eq!(result.code(), Some(0));
 }
@@ -26,7 +26,7 @@ async fn test_exit_code() {
         .fs_read("/proc")
         .build()
         .unwrap();
-    let result = policy.clone().with_name("test").run(&["sh", "-c", "exit 42"]).await.unwrap();
+    let result = policy.clone().run(&["sh", "-c", "exit 42"]).await.unwrap();
     assert_eq!(result.code(), Some(42));
 }
 
@@ -41,7 +41,7 @@ async fn test_denied_path() {
         .fs_read("/proc")
         .build()
         .unwrap();
-    let result = policy.clone().with_name("test").run(&["cat", "/etc/group"]).await.unwrap();
+    let result = policy.clone().run(&["cat", "/etc/group"]).await.unwrap();
     assert!(!result.success());
 }
 
@@ -59,7 +59,7 @@ async fn test_denied_syscall() {
         .unwrap();
     // mount is in DEFAULT_BLOCKLIST_SYSCALLS; redirect stderr to /dev/null
     // (need /dev readable for this)
-    let result = policy.clone().with_name("test")
+    let result = policy.clone()
         .run(&["sh", "-c", "mount -t tmpfs none /tmp 2>/dev/null; echo $?"])
         .await
         .unwrap();
@@ -96,6 +96,22 @@ async fn test_invalid_sandbox_name() {
     let long_name = "x".repeat(65);
     let result = Sandbox::builder().build().unwrap().with_name(long_name).run(&["true"]).await;
     assert!(result.is_err(), "sandbox name > 64 bytes should fail");
+
+    // Name is a path component — reject /, ., ..
+    for bad in &["/", "..", ".", "a/b", "../etc"] {
+        let result = Sandbox::builder()
+            .fs_read("/usr")
+            .fs_read("/bin")
+            .fs_read("/lib")
+            .fs_read_if_exists("/lib64")
+            .fs_read("/proc")
+            .build()
+            .unwrap()
+            .with_name(*bad)
+            .run(&["true"])
+            .await;
+        assert!(result.is_err(), "sandbox name {:?} should fail", bad);
+    }
 }
 
 #[tokio::test]
@@ -123,7 +139,7 @@ async fn test_default_policy_runs_ls() {
         .unwrap();
     // Use "ls /bin" instead of "ls /" because Landlock restricts access
     // to specific subtrees, not the root directory itself.
-    let result = policy.clone().with_name("test").run(&["ls", "/bin"]).await.unwrap();
+    let result = policy.clone().run(&["ls", "/bin"]).await.unwrap();
     assert!(result.success());
 }
 
@@ -151,7 +167,7 @@ async fn test_nested_sandbox() {
         .unwrap();
 
     // Spawn outer, then nest inner inside it
-    let mut outer_sb = outer.clone().with_name("test");
+    let mut outer_sb = outer.clone();
     outer_sb.create_interactive(&["sleep", "10"]).await.unwrap();
     outer_sb.start().unwrap();
 
@@ -169,10 +185,10 @@ async fn test_nested_sandbox() {
     // Sequential sandboxes: first sandbox applies Landlock + seccomp,
     // second sandbox from the same parent gets EBUSY on seccomp
     // but Landlock stacks. Verify both work independently.
-    let r1 = outer.clone().with_name("test").run(&["cat", "/etc/group"]).await.unwrap();
+    let r1 = outer.clone().run(&["cat", "/etc/group"]).await.unwrap();
     assert!(r1.success(), "outer should allow /etc");
 
-    let r2 = inner.clone().with_name("test").run(&["cat", "/etc/group"]).await.unwrap();
+    let r2 = inner.clone().run(&["cat", "/etc/group"]).await.unwrap();
     assert!(!r2.success(), "inner should deny /etc");
 }
 
@@ -288,7 +304,7 @@ async fn test_denied_path_hardlink_blocked() {
         tmp.path().display(),
         tmp.path().display(),
     );
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(
         result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
         "hardlink bypass: sandbox allowed reading denied file via hardlink"
@@ -319,7 +335,7 @@ async fn test_denied_path_preexisting_hardlink_blocked() {
     // Read via the alias name — not denied by path, but the same inode.
     let result = policy
         .clone()
-        .with_name("test")
+        
         .run(&["cat", alias.to_str().unwrap()])
         .await
         .unwrap();
@@ -351,7 +367,7 @@ async fn test_denied_path_rename_blocked() {
         tmp.path().display(),
         tmp.path().display(),
     );
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(
         result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
         "rename bypass: sandbox allowed reading denied file via rename"
@@ -390,7 +406,7 @@ async fn test_denied_path_renameat_blocked() {
         secret.display(),
         renamed.display(),
     );
-    let _ = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    let _ = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(&secret).unwrap_or_default(),
         "TOP_SECRET",
@@ -424,7 +440,7 @@ async fn test_denied_path_rename_onto_blocked() {
         secret.display(),
         dir = tmp.path().display(),
     );
-    let _ = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    let _ = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(&secret).unwrap_or_default(),
         "TOP_SECRET",
@@ -466,7 +482,7 @@ async fn test_denied_path_renameat_onto_blocked() {
         secret.display(),
         planted = planted.display(),
     );
-    let _ = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    let _ = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(&secret).unwrap_or_default(),
         "TOP_SECRET",
@@ -494,7 +510,7 @@ async fn test_denied_path_truncate_blocked() {
 
     // os.truncate on a path issues truncate(2), not open+ftruncate.
     let script = format!("import os; os.truncate('{}', 0)", secret.display());
-    let _ = policy.clone().with_name("test").run(&["python3", "-c", &script]).await.unwrap();
+    let _ = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(&secret).unwrap(),
         "TOP_SECRET",
@@ -521,7 +537,7 @@ async fn test_denied_path_unlink_blocked() {
         .unwrap();
 
     let cmd = format!("rm -f {}", secret.display());
-    let _ = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    let _ = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(&secret).unwrap_or_default(),
         "TOP_SECRET",
@@ -551,7 +567,7 @@ async fn test_denied_path_symlink_blocked() {
         tmp.path().display(),
         tmp.path().display(),
     );
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(
         result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
         "symlink bypass: sandbox allowed reading denied file via symlink"
@@ -578,7 +594,7 @@ async fn test_denied_path_preexisting_symlink_blocked() {
         .unwrap();
 
     let cmd = format!("cat {}", link.display());
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(
         result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
         "pre-existing symlink bypass: read denied file through symlink created before sandbox"
@@ -607,7 +623,7 @@ async fn test_denied_path_chained_symlinks_blocked() {
         .unwrap();
 
     let cmd = format!("cat {}", link2.display());
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(
         result.stdout_str().map_or(true, |s| !s.contains("TOP_SECRET")),
         "chained symlink bypass: read denied file through symlink chain"
@@ -635,7 +651,7 @@ async fn test_denied_path_allows_normal_writes() {
         "echo ok > {0}/a.txt && ln {0}/a.txt {0}/b.txt && cat {0}/b.txt",
         tmp.path().display(),
     );
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(result.success(), "normal write should succeed");
     assert_eq!(result.stdout_str(), Some("ok"));
 }
@@ -677,7 +693,7 @@ async fn test_chroot() {
         .unwrap();
 
     // cat the marker file — it should be at /marker.txt inside the chroot
-    let result = policy.clone().with_name("test").run_interactive(&["cat", "/marker.txt"]).await;
+    let result = policy.clone().run_interactive(&["cat", "/marker.txt"]).await;
 
     match result {
         Ok(r) => {

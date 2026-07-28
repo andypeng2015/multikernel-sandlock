@@ -40,7 +40,7 @@ async fn test_policy_fn_receives_events_with_metadata() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", "print('hello')"],
+    let result = policy.clone().run_interactive(&["python3", "-c", "print('hello')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -86,7 +86,7 @@ async fn test_policy_fn_deny_connect() {
         "  open('{out}', 'w').write('BLOCKED:%d' % e.errno)\n",
     ), port = port, out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -131,7 +131,7 @@ async fn test_policy_fn_restrict_network_takes_effect() {
         "open('{out}', 'w').write('allowed=' + probe('127.0.0.1', {p1}) + ' denied=' + probe('127.0.0.2', {p2}))\n",
     ), out = out.display(), p1 = p1, p2 = p2);
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -163,7 +163,7 @@ async fn test_policy_fn_deny_path() {
         "  open('{out}', 'w').write(f'BLOCKED:{{e.errno}}')\n",
     ), out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -186,7 +186,7 @@ async fn test_policy_fn_passthrough() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", "print('hello')"],
+    let result = policy.clone().run_interactive(&["python3", "-c", "print('hello')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -212,7 +212,7 @@ async fn test_policy_fn_execve_argv() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", "print('argv test')"],
+    let result = policy.clone().run_interactive(&["python3", "-c", "print('argv test')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -237,7 +237,7 @@ async fn test_policy_fn_deny_by_argv() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run_interactive(&["echo", "malicious"],
+    let result = policy.clone().run_interactive(&["echo", "malicious"],
     ).await.unwrap();
     assert!(!result.success(), "execve with 'malicious' in argv should be denied");
 }
@@ -260,7 +260,7 @@ async fn test_policy_fn_connect_metadata() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run_interactive(&[
+    let result = policy.clone().run_interactive(&[
         "python3", "-c",
         "import socket; s=socket.socket(); s.settimeout(0.1); \
          s.connect_ex(('127.0.0.1', 9999)); s.close()",
@@ -294,7 +294,7 @@ async fn test_policy_fn_event_categories() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", "print('categories')"],
+    let result = policy.clone().run_interactive(&["python3", "-c", "print('categories')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -327,7 +327,7 @@ async fn test_policy_fn_parent_pid() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", "print('ppid')"],
+    let result = policy.clone().run_interactive(&["python3", "-c", "print('ppid')"],
     ).await.unwrap();
     assert!(result.success());
 
@@ -371,7 +371,7 @@ async fn test_policy_fn_deny_with_eacces() {
         "  s.close()\n",
     ), out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -402,7 +402,7 @@ async fn test_policy_fn_audit() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run_interactive(&["cat", "/etc/hostname"],
+    let result = policy.clone().run_interactive(&["cat", "/etc/hostname"],
     ).await.unwrap();
     // Audit should allow the syscall — cat should succeed
     assert!(result.success(), "Audit should allow, not deny");
@@ -444,7 +444,7 @@ async fn test_policy_fn_restrict_pid_network_without_allowlist() {
         "  open('{out}', 'w').write('ERR%d' % e.errno)\n",
     ), port = port, out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -483,7 +483,7 @@ async fn test_policy_fn_restrict_max_memory_enforced() {
         })
         .build()
         .unwrap()
-        .with_name("test")
+        
         .run(&["python3", "-c", alloc_128])
         .await
         .unwrap();
@@ -497,7 +497,7 @@ async fn test_policy_fn_restrict_max_memory_enforced() {
         .policy_fn(|_e, _c| Verdict::Allow)
         .build()
         .unwrap()
-        .with_name("test")
+        
         .run(&["python3", "-c", alloc_128])
         .await
         .unwrap();
@@ -530,7 +530,7 @@ async fn test_policy_fn_restrict_max_processes_enforced() {
         })
         .build()
         .unwrap()
-        .with_name("test")
+        
         .run(&["python3", "-c", fork_once])
         .await
         .unwrap();
@@ -543,7 +543,7 @@ async fn test_policy_fn_restrict_max_processes_enforced() {
         .policy_fn(|_e, _c| Verdict::Allow)
         .build()
         .unwrap()
-        .with_name("test")
+        
         .run(&["python3", "-c", fork_once])
         .await
         .unwrap();
@@ -572,7 +572,7 @@ async fn test_policy_fn_fork_does_not_deadlock() {
         .policy_fn(|_e, _c| Verdict::Allow)
         .build()
         .unwrap()
-        .with_name("test");
+        ;
 
     let result = tokio::time::timeout(
         Duration::from_secs(30),
@@ -612,7 +612,7 @@ async fn test_policy_fn_fs_mutation_events() {
         renamed = renamed.display(),
         fifo = fifo.display(),
     );
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await.unwrap();
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await.unwrap();
     assert!(result.success());
     let _ = std::fs::remove_file(&fifo);
 
@@ -661,7 +661,7 @@ async fn test_policy_fn_deny_openat2() {
         "  open('{out}', 'w').write(os.read(fd, 32).decode())\n",
     ), secret = secret.display(), out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -699,7 +699,7 @@ async fn test_policy_fn_deny_sendmsg() {
         "  open('{out}', 'w').write('BLOCKED:%d' % e.errno)\n",
     ), port = port, out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success());
 
     let content = std::fs::read_to_string(&out).unwrap_or_default();

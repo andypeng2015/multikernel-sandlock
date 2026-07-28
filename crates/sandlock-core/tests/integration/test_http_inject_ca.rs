@@ -34,7 +34,7 @@ async fn inject_ca_appends_to_declared_bundle() {
 
     let result = policy
         .clone()
-        .with_name("test")
+        
         .run(&["cat", &bundle_str])
         .await
         .unwrap();

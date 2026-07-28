@@ -9,7 +9,7 @@ async fn test_checkpoint_save_load() {
         .build().unwrap();
 
     // Start a long-running process
-    let mut sb = policy.clone().with_name("test");
+    let mut sb = policy.clone();
     // We need to spawn something that stays alive long enough to checkpoint
     // Use "sleep 60" — we'll kill it after checkpoint
     sb.spawn_interactive(&["sleep", "60"]).await.unwrap();
@@ -54,7 +54,7 @@ async fn test_checkpoint_memory_maps() {
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = policy.clone().with_name("test");
+    let mut sb = policy.clone();
     sb.spawn_interactive(&["sleep", "60"]).await.unwrap();
 
     let cp = sb.checkpoint().await.unwrap();
@@ -80,7 +80,7 @@ async fn test_checkpoint_app_state_roundtrip() {
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = policy.clone().with_name("test");
+    let mut sb = policy.clone();
     sb.spawn_interactive(&["sleep", "60"]).await.unwrap();
 
     let mut cp = sb.checkpoint().await.unwrap();
@@ -112,7 +112,7 @@ async fn test_checkpoint_no_app_state_file() {
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = policy.clone().with_name("test");
+    let mut sb = policy.clone();
     sb.spawn_interactive(&["sleep", "60"]).await.unwrap();
 
     let cp = sb.checkpoint().await.unwrap();
@@ -138,7 +138,7 @@ async fn test_checkpoint_process_info() {
         .fs_read("/proc")
         .build().unwrap();
 
-    let mut sb = policy.clone().with_name("test");
+    let mut sb = policy.clone();
     sb.spawn_interactive(&["sleep", "60"]).await.unwrap();
 
     let expected_pid = sb.pid().unwrap();
@@ -163,7 +163,7 @@ async fn test_checkpoint_load_nonexistent() {
 #[tokio::test]
 async fn test_checkpoint_not_running() {
     let policy = Sandbox::builder().build().unwrap();
-    let sb = policy.clone().with_name("test");
+    let sb = policy.clone();
     let result = sb.checkpoint().await;
     assert!(result.is_err(), "Checkpoint on non-running sandbox should error");
 }

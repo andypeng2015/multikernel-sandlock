@@ -110,7 +110,7 @@ async fn test_chroot_ls_root() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "ls", "/"]).await;
+    let result = policy.clone().run(&["rootfs-helper", "ls", "/"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -151,7 +151,7 @@ async fn test_chroot_no_escape() {
 
     // Path traversal: /../../etc/sentinel should resolve to /etc/sentinel inside
     // the chroot (the sentinel file we created), not escape to the host.
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/../../etc/sentinel"]).await;
+    let result = policy.clone().run(&["rootfs-helper", "cat", "/../../etc/sentinel"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -188,7 +188,7 @@ async fn test_chroot_getcwd() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "pwd"]).await;
+    let result = policy.clone().run(&["rootfs-helper", "pwd"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -222,7 +222,7 @@ async fn test_chroot_chdir_proc_readonly_buffer() {
 
     let result = policy
         .clone()
-        .with_name("test")
+        
         .run(&["rootfs-helper", "chdir", "/proc"])
         .await;
     match result {
@@ -261,7 +261,7 @@ async fn test_chroot_chdir_proc_self_resolves_to_child() {
 
     let result = policy
         .clone()
-        .with_name("test")
+        
         .run(&["rootfs-helper", "chdir-self", "/proc/self"])
         .await;
     match result {
@@ -308,7 +308,7 @@ async fn test_chroot_proc_dirfd_relative_is_virtualized() {
 
     let result = policy
         .clone()
-        .with_name("test")
+        
         .run(&["rootfs-helper", "proc-dirfd", "meminfo"])
         .await;
     match result {
@@ -354,7 +354,7 @@ async fn test_chroot_magic_fd_symlink_resolves_to_child_fd() {
 
     let result = policy
         .clone()
-        .with_name("test")
+        
         .run(&["rootfs-helper", "write-fd-link", "/tmp/errlog", "MAGIC_MARKER"])
         .await;
     match result {
@@ -393,7 +393,7 @@ async fn test_chroot_write_file() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "sh", "-c", "echo hello > /tmp/test.txt && cat /tmp/test.txt"],
+    let result = policy.clone().run(&["rootfs-helper", "sh", "-c", "echo hello > /tmp/test.txt && cat /tmp/test.txt"],
     )
     .await;
     match result {
@@ -446,7 +446,7 @@ async fn test_chroot_cow_directory_open_stays_in_rootfs() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "ls", "/tmp"]).await;
+    let result = policy.clone().run(&["rootfs-helper", "ls", "/tmp"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -492,7 +492,7 @@ async fn test_chroot_with_cow() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "sh", "-c", "echo cow-test > /tmp/cow.txt"],
+    let result = policy.clone().run(&["rootfs-helper", "sh", "-c", "echo cow-test > /tmp/cow.txt"],
     )
     .await;
     match result {
@@ -552,7 +552,7 @@ async fn test_chroot_cow_read_deleted_file_is_enoent() {
     // in-process, so `rm` and `cat` share one COW branch.)
     let result = policy
         .clone()
-        .with_name("test")
+        
         .run(&["rootfs-helper", "sh", "-c", "rm /tmp/secret.txt; cat /tmp/secret.txt"])
         .await;
     match result {
@@ -585,7 +585,7 @@ async fn test_chroot_proc_self_root() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "readlink", "/proc/self/root"]).await;
+    let result = policy.clone().run(&["rootfs-helper", "readlink", "/proc/self/root"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -618,7 +618,7 @@ async fn test_chroot_write_denied_without_fs_write() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "sh", "-c", "echo denied > /tmp/should-fail.txt"],
+    let result = policy.clone().run(&["rootfs-helper", "sh", "-c", "echo denied > /tmp/should-fail.txt"],
     )
     .await;
     match result {
@@ -648,7 +648,7 @@ async fn test_chroot_exec_with_root_readable() {
         .unwrap();
 
     // Use /bin/rootfs-helper which goes through the bin -> usr/bin symlink
-    let result = policy.clone().with_name("test").run(&["/bin/rootfs-helper", "echo", "chroot-exec-ok"]).await;
+    let result = policy.clone().run(&["/bin/rootfs-helper", "echo", "chroot-exec-ok"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -682,7 +682,7 @@ async fn test_chroot_fs_deny_blocks_virtual_path() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/etc/hostname"]).await;
+    let result = policy.clone().run(&["rootfs-helper", "cat", "/etc/hostname"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -711,7 +711,7 @@ async fn test_chroot_read_denied_without_fs_read() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/etc/hostname"]).await;
+    let result = policy.clone().run(&["rootfs-helper", "cat", "/etc/hostname"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -750,7 +750,7 @@ async fn test_fs_mount_read_write() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/work/input.txt"]).await;
+    let result = policy.clone().run(&["rootfs-helper", "cat", "/work/input.txt"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -794,7 +794,7 @@ async fn test_chroot_etc_hosts_seeded_from_image() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/etc/hosts"]).await;
+    let result = policy.clone().run(&["rootfs-helper", "cat", "/etc/hosts"]).await;
     match result {
         Ok(r) => {
             assert!(
@@ -839,7 +839,7 @@ async fn test_chroot_etc_hosts_no_duplicate_loopback() {
         .build()
         .unwrap();
 
-    let result = policy.clone().with_name("test").run(&["rootfs-helper", "cat", "/etc/hosts"]).await;
+    let result = policy.clone().run(&["rootfs-helper", "cat", "/etc/hosts"]).await;
     match result {
         Ok(r) => {
             assert!(r.success(), "cat /etc/hosts should succeed");

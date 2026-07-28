@@ -49,7 +49,7 @@ async fn test_udp_rule_scopes_destination_by_host() {
         "s.close()\n",
     ), ok = out_allowed.display(), deny = out_blocked.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
@@ -101,7 +101,7 @@ async fn test_sendto_huge_addrlen_rejected_with_einval() {
         "s.close()\n",
     ), out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await.unwrap();
     // The run completing at all is the core assertion: an OOM-aborted supervisor
     // would kill the child instead of letting it finish.
@@ -140,7 +140,7 @@ async fn test_udp_wildcard_allows_any_destination() {
         "s.close()\n",
     ), a = out_a.display(), b = out_b.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
@@ -178,7 +178,7 @@ async fn test_udp_rule_does_not_authorize_tcp() {
         "s.close()\n",
     ), out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -262,7 +262,7 @@ async fn test_sendmmsg_partial_failure_on_blocked_destination() {
         "s.close()\n",
     ), out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
@@ -337,7 +337,7 @@ async fn test_connected_sendmmsg_delivers_on_behalf() {
 
     let result = policy
         .clone()
-        .with_name("test")
+        
         .run_interactive(&["python3", "-c", &script])
         .await
         .unwrap();
@@ -416,7 +416,7 @@ async fn test_sendmmsg_single_blocked_returns_econnrefused() {
         "s.close()\n",
     ), out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
         .await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
@@ -452,7 +452,7 @@ async fn test_net_allow_blocks_disallowed_host() {
         "  open('{out}', 'w').write('BLOCKED')\n",
     ), out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "BLOCKED", "connection to 1.1.1.1 should be blocked");
@@ -494,7 +494,7 @@ async fn test_net_allow_permits_listed_endpoint() {
         "open('{out}', 'w').write('CONNECTED')\n",
     ), out = out.display(), port = test_port);
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "CONNECTED");
@@ -527,7 +527,7 @@ async fn test_net_allow_any_ip_port() {
         "  s.close()\n",
     ), out = out.display());
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "REFUSED", "connect to permitted port should reach kernel; got: {}", content);
@@ -582,7 +582,7 @@ async fn test_net_allow_endpoint_rejects_other_ports() {
         "  s.close()\n",
     ), out = out.display(), port = blocked_port);
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = acceptor.join();
 
@@ -634,7 +634,7 @@ async fn test_grandchild_network_connect() {
         "sys.exit(child.returncode)\n",
     ), out = out.display(), port = port);
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "hello", "grandchild should connect and read data");
@@ -671,7 +671,7 @@ async fn test_net_allow_wildcard_any_host_any_port() {
         "open('{out}', 'w').write(data.decode())\n",
     ), out = out.display(), port = port);
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert_eq!(content, "ok", "wildcard :* should permit arbitrary egress");
@@ -721,7 +721,7 @@ async fn test_net_allow_wildcard_host_only() {
         "open('{out}', 'w').write(','.join(results))\n",
     ), out = out.display(), port = port);
 
-    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     assert!(content.contains("local:ok"), "localhost should connect; got: {}", content);
@@ -785,7 +785,7 @@ async fn test_net_deny_bind_blocks_tcp_only() {
         "open('{out}', 'w').write(json.dumps(res))\n",
     ), denied = denied, allowed = allowed, out = out.display());
 
-    let result = policy.clone().with_name("test")
+    let result = policy.clone()
         .run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -820,7 +820,7 @@ async fn test_net_allow_bind_wildcard_permits_any_bind() {
 
     // Control: no allow-bind list means default-deny for TCP bind.
     let policy = base_policy().build().unwrap();
-    let result = policy.clone().with_name("test")
+    let result = policy.clone()
         .run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -831,7 +831,7 @@ async fn test_net_allow_bind_wildcard_permits_any_bind() {
 
     // Wildcard: every bind succeeds.
     let policy = base_policy().net_allow_bind("*").build().unwrap();
-    let result = policy.clone().with_name("test")
+    let result = policy.clone()
         .run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -888,8 +888,8 @@ async fn test_net_allow_bind_wildcard_keeps_connect_enforcement() {
     ), port = port, out = out.display());
 
     // 1. Wildcard bind, empty net_allow: Landlock CONNECT_TCP deny-all.
-    let policy = base_policy().net_allow_bind("*").build().unwrap();
-    let result = policy.with_name("test")
+    let mut policy = base_policy().net_allow_bind("*").build().unwrap();
+    let result = policy
         .run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -904,12 +904,12 @@ async fn test_net_allow_bind_wildcard_keeps_connect_enforcement() {
 
     // 2. Wildcard bind + bounded net_allow that does not cover `port`: the
     //    on-behalf destination policy refuses the endpoint.
-    let policy = base_policy()
+    let mut policy = base_policy()
         .net_allow_bind("*")
         .net_allow("127.0.0.1:80")
         .build()
         .unwrap();
-    let result = policy.with_name("test")
+    let result = policy
         .run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
     let content = std::fs::read_to_string(&out).unwrap_or_default();
@@ -949,7 +949,7 @@ async fn test_empty_net_allow_denies_tcp_despite_fs_grants() {
 
     // base_policy() grants fs reads -> has_unix_fs_gate is on. No `.net_allow`
     // call: an empty allowlist means "deny all outbound".
-    let policy = base_policy().build().unwrap();
+    let mut policy = base_policy().build().unwrap();
 
     let script = format!(concat!(
         "import socket\n",
@@ -963,7 +963,7 @@ async fn test_empty_net_allow_denies_tcp_despite_fs_grants() {
         "s.close()\n",
     ), port = port, out = out.display());
 
-    let result = policy.with_name("test")
+    let result = policy
         .run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
@@ -1012,7 +1012,7 @@ async fn test_connected_unix_sendmsg_passes_through_under_net_policy() {
     // `net_allow` activates `has_net_destination_policy`; `fs_write("/tmp")`
     // covers the socket path so `has_unix_fs_gate` is on too — the realistic
     // shape of the report (a `--net-allow` rule plus fs grants).
-    let policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
+    let mut policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
 
     let script = format!(concat!(
         "import socket\n",
@@ -1026,7 +1026,7 @@ async fn test_connected_unix_sendmsg_passes_through_under_net_policy() {
         "s.close()\n",
     ), sock = sock_path.display(), out = out.display());
 
-    let result = policy.with_name("test")
+    let result = policy
         .run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
@@ -1098,7 +1098,7 @@ async fn test_connected_unix_sendmsg_translates_scm_rights_under_net_policy() {
     let out = temp_file("scm-out");
     // fs_read("/tmp") lets the child open the payload O_RDONLY; net_allow forces
     // the on-behalf path where the SCM_RIGHTS translation matters.
-    let policy = base_policy().fs_read("/tmp").net_allow("127.0.0.1:80").build().unwrap();
+    let mut policy = base_policy().fs_read("/tmp").net_allow("127.0.0.1:80").build().unwrap();
 
     let script = format!(concat!(
         "import socket, array, os\n",
@@ -1113,7 +1113,7 @@ async fn test_connected_unix_sendmsg_translates_scm_rights_under_net_policy() {
         "s.close()\n",
     ), sock = sock_path.display(), payload = payload.display(), out = out.display());
 
-    let result = policy.with_name("test")
+    let result = policy
         .run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
@@ -1169,7 +1169,7 @@ async fn test_large_blocking_send_defers_and_delivers_under_net_policy() {
     });
 
     let out = temp_file("defer-send-out");
-    let policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
+    let mut policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
     // A SINGLE blocking send() of N bytes must return N — the kernel's contract
     // for a blocking stream socket. A regression that returned on the first
     // partial (one SO_SNDBUF worth) would write a short count here.
@@ -1182,7 +1182,7 @@ async fn test_large_blocking_send_defers_and_delivers_under_net_policy() {
         "open('{out}', 'w').write('SENT:%d' % n)\n",
     ), sock = sock_path.display(), n = N, out = out.display());
 
-    let result = policy.with_name("test")
+    let result = policy
         .run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
@@ -1234,7 +1234,7 @@ async fn test_sendmmsg_blocking_entry_defers_and_delivers_under_net_policy() {
     });
 
     let out = temp_file("mmsg-defer-out");
-    let policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
+    let mut policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
     let script = format!(concat!(
         "import ctypes, socket\n",
         "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
@@ -1260,7 +1260,7 @@ async fn test_sendmmsg_blocking_entry_defers_and_delivers_under_net_policy() {
         "s.close()\n",
     ), sock = sock_path.display(), n = N, out = out.display());
 
-    let result = policy.with_name("test")
+    let result = policy
         .run_interactive(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}", result.code());
 
