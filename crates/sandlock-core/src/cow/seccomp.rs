@@ -208,12 +208,29 @@ fn marker_unescape(raw: &[u8]) -> Vec<u8> {
 
 /// Read the preservation marker of one branch storage dir, if it has one.
 ///
-/// `None` means the dir is not a preserved branch: either it is live storage of
-/// a running process, or it was orphaned by something that never marked it.
+/// `None` means the dir is not a usable preserved branch, in one of three ways:
+/// it is live storage of a running process; it was orphaned by something that
+/// never marked it; or its marker exists but was cut mid-line by a crash. The
+/// third is precisely the case a sweep exists for, so it is rejected loudly
+/// rather than half-parsed.
+///
+/// Part of the on-disk format: **every record ends with a newline**, and a body
+/// that does not is a crash-truncated record and is rejected whole.
 pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
     use std::os::unix::ffi::OsStringExt;
 
     let body = fs::read(branch_dir.join(PRESERVED_MARKER)).ok()?;
+    // The writer always ends with "\npid=<n>\n" and `marker_escape` escapes
+    // b'\n' in every value, so a raw newline is only ever a line terminator: a
+    // body that does not end in one was cut mid-line by a crash. Reject the
+    // whole record — a truncated "pid=412" reads back as a COMPLETE record with
+    // pid 41, and pid liveness is what separates a live merge from a dead one.
+    // A cut that lands exactly on a line boundary drops the pid line instead,
+    // which `pid?` below already rejects. This also rejects a zero-length
+    // marker, the shape delayed allocation leaves.
+    if body.last() != Some(&b'\n') {
+        return None;
+    }
     let mut reason = None;
     let mut workdir = None;
     let mut upper = None;
@@ -5107,14 +5124,25 @@ mod tests {
     }
 
     /// A marker truncated at any byte offset must read back as "not a preserved
-    /// branch", never as a half-populated record.
+    /// branch" — `None`, not a half-populated record.
     ///
-    /// `write_preserved_marker` is a plain `fs::write` — create, truncate,
-    /// write, no temp file and no rename — and it runs immediately before the
-    /// merge's first destructive step, so a crash there leaves exactly these
-    /// bytes. The dangerous shape is a prefix cut inside the `deleted=` lines:
-    /// it parses as a complete record whose change set is missing deletions,
-    /// and recovering from that resurrects the files the run deleted.
+    /// The marker is written immediately before the merge's first destructive
+    /// step, so a crash there leaves exactly these bytes on disk. Two dangerous
+    /// shapes, and the second is why the assertion is `is_none()` rather than a
+    /// comparison of the deletion lists:
+    ///
+    /// - a cut inside the `deleted=` lines parses as a complete record whose
+    ///   change set is missing deletions, and recovering from that resurrects
+    ///   the files the run deleted;
+    /// - a cut inside the LAST line, `pid=412` -> `pid=41`, parses as a
+    ///   complete record with a plausible but WRONG pid — and pid liveness is
+    ///   exactly what `list_preserved` uses to tell a live merge from a dead
+    ///   one, so the sweep either skips a crashed half-merge forever or acts on
+    ///   a merge that is still running.
+    ///
+    /// The trailing-newline rule in `read_preserved` is what closes both: the
+    /// pid line is written last, so every cut either lands mid-line (rejected
+    /// there) or on a line boundary (no pid line, rejected by `pid?`).
     #[test]
     fn a_marker_truncated_at_any_offset_never_reads_back_as_a_partial_record() {
         let workdir = tempfile::tempdir().unwrap();
@@ -5135,15 +5163,17 @@ mod tests {
 
         for cut in 0..full.len() {
             fs::write(&marker, &full[..cut]).unwrap();
-            if let Some(partial) = read_preserved(&storage_dir) {
-                assert_eq!(
-                    partial.deleted, complete.deleted,
-                    "a marker truncated at byte {cut} parsed with a SHORTER deletion list; \
-                     recovering from it would resurrect the files the run deleted",
-                );
-            }
+            assert!(
+                read_preserved(&storage_dir).is_none(),
+                "a marker truncated at byte {cut} of {} parsed as a complete record",
+                full.len(),
+            );
         }
         fs::write(&marker, &full).unwrap();
+        assert!(
+            read_preserved(&storage_dir).is_some(),
+            "and the untruncated marker must still parse, so the loop is not vacuous",
+        );
     }
 
     /// A non-UTF-8 workdir path round-trips through the marker byte-exactly.
