@@ -336,9 +336,9 @@ impl LearnObserver {
                 if let Some(path) = event.path {
                     self.reads.lock().unwrap().insert(path);
                 }
-            
-                /// When a non-leader thread calls execve, the new process runs under the TGID,
-                /// so we must insert the TGID into pending_maps.
+
+                // When a non-leader thread calls execve, the new process runs under the TGID,
+                // so we must insert the TGID into pending_maps.
                 self.pending_maps.lock().unwrap().insert(tgid_of(event.pid));
             }
             "openat" | "open" => {
