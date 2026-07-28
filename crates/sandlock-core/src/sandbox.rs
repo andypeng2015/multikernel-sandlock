@@ -1923,6 +1923,14 @@ impl Sandbox {
         // State remains `Created` until `do_start` writes ready_w to release
         // the child to execve.
 
+        let pidfd = match syscall::pidfd_open(pid as u32, 0) {
+            Ok(fd) => Some(fd),
+            Err(_) => None,
+        };
+
+        let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
+            .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
+
         // Even for --no-supervisor sandboxes, write a pid file so sandlock ps
         // can discover and list them.  The control socket is only created when
         // a supervisor exists (inside the if-let below).  Honour the
@@ -1932,6 +1940,13 @@ impl Sandbox {
         // no-supervisor sandbox with the same name as a live sandbox must
         // refuse to start rather than unconditionally remove_dir_all the
         // live one's pid file.
+        //
+        // This must stay after the notif-fd read above.  Any error return
+        // from do_spawn relies on Drop's killpg to reap the child, which
+        // only works once the child has setpgid'd into its own group; the
+        // notif-fd write is the child's setup-complete signal, so returning
+        // before it races killpg against setpgid and can deadlock Drop's
+        // waitpid against a child parked on the ready pipe.
         if no_supervisor && self.control_socket {
             let sandbox_name = self.rt().name.clone();
             let supervisor_pid = std::process::id() as i32;
@@ -1943,6 +1958,16 @@ impl Sandbox {
                 Ok(dir) => {
                     self.rt_mut().control_dir = Some(dir);
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Name collision with a live sandbox — hard-fail, same as
+                    // the supervisor path.  Continuing would leave a second
+                    // sandbox running invisible to ps.
+                    return Err(SandboxRuntimeError::Child(format!(
+                        "sandbox '{}' is already running: {}",
+                        sandbox_name, e
+                    ))
+                    .into());
+                }
                 Err(e) => {
                     eprintln!(
                         "sandlock: runtime dir setup failed for '{}': {}",
@@ -1951,14 +1976,6 @@ impl Sandbox {
                 }
             }
         }
-
-        let pidfd = match syscall::pidfd_open(pid as u32, 0) {
-            Ok(fd) => Some(fd),
-            Err(_) => None,
-        };
-
-        let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
-            .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
 
         let is_nested_mode = notif_fd_num == 0;
 

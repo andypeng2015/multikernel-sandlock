@@ -371,6 +371,47 @@ fn test_control_name_collision() {
 }
 
 #[test]
+fn test_control_name_collision_no_supervisor() {
+    // The no_supervisor path shares setup_runtime_dir_no_socket and must
+    // hard-fail on a live-name collision just like the supervisor path;
+    // continuing would leave a second sandbox running invisible to ps.
+    let name = format!("test-ctrl-collision-nosup-{}", std::process::id());
+    let mut first = start_sleep_sandbox(&name);
+
+    match wait_for_sandbox(&name) {
+        Ok(()) => {
+            let out = sandlock_bin()
+                .args([
+                    "run", "--name", &name, "--no-supervisor",
+                    "-r", "/usr", "-r", "/bin", "-r", "/etc",
+                    "-r", "/proc", "-r", "/dev",
+                    "--", "/bin/sleep", "5",
+                ])
+                .output()
+                .expect("sandlock run --no-supervisor (collision)");
+            assert!(
+                !out.status.success(),
+                "no_supervisor sandbox with a live name must fail"
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("already running"),
+                "error should indicate name collision: {}",
+                stderr
+            );
+        }
+        Err(e) => {
+            let stderr_output = child_stderr(&mut first);
+            let _ = first.kill();
+            panic!("{}; child stderr: {}", e, stderr_output);
+        }
+    }
+
+    let _ = first.kill();
+    let _ = first.wait();
+}
+
+#[test]
 fn test_control_no_supervisor() {
     let name = format!("test-ctrl-nosup-{}", std::process::id());
     let has_lib64 = std::path::Path::new("/lib64").exists();
