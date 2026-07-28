@@ -85,8 +85,12 @@ impl DeletionSet {
     /// Rebuild a set from an existing log and reopen the log for append.
     /// Unreadable log lines are skipped, not fatal: a torn final line from a
     /// crash must not hide the deletions before it.
-    // No production caller yet: this is the recovery half of the durability
-    // story, consumed by the preserved-branch sweep (PR #148 / RFC #65).
+    // No production caller: the preserved-branch sweep reads the OUTSTANDING
+    // deletions from the branch's PRESERVED marker, not this log. This log is
+    // the full whiteout history and must not be replayed against a partly
+    // merged branch — entries that already landed have had their upper copies
+    // drained, so re-applying them destroys work that landed. Kept for a
+    // future sweep that has to recover a branch whose marker is missing.
     #[allow(dead_code)]
     pub fn load(log_path: &Path) -> Self {
         let mut entries = BTreeSet::new();
