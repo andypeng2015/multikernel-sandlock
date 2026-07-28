@@ -538,31 +538,31 @@ fn test_ps_no_sandboxes() {
 }
 
 #[test]
-fn test_config_returns_json_policy() {
+fn test_inspect_returns_json_policy() {
     let name = format!("test-config-cli-{}", std::process::id());
     let mut child = spawn_sandbox(&name);
 
     match wait_for_sandbox(&mut child, &name) {
         Ok(()) => {
             let out = sandlock_bin()
-                .args(["config", &name])
+                .args(["inspect", &name])
                 .output()
-                .expect("sandlock config");
+                .expect("sandlock inspect");
             assert!(
                 out.status.success(),
-                "config should succeed: stderr={}",
+                "inspect should succeed: stderr={}",
                 String::from_utf8_lossy(&out.stderr)
             );
             let stdout = String::from_utf8_lossy(&out.stdout);
             // JSON output should contain the filesystem section.
             assert!(
                 stdout.contains("filesystem"),
-                "config JSON should contain 'filesystem': {}",
+                "inspect JSON should contain 'filesystem': {}",
                 stdout
             );
             assert!(
                 stdout.contains("/usr"),
-                "config JSON should contain /usr in read list: {}",
+                "inspect JSON should contain /usr in read list: {}",
                 stdout
             );
         }
@@ -577,31 +577,31 @@ fn test_config_returns_json_policy() {
 }
 
 #[test]
-fn test_config_toml_flag_produces_toml() {
+fn test_inspect_toml_flag_produces_toml() {
     let name = format!("test-config-toml-cli-{}", std::process::id());
     let mut child = spawn_sandbox(&name);
 
     match wait_for_sandbox(&mut child, &name) {
         Ok(()) => {
             let out = sandlock_bin()
-                .args(["config", "--toml", &name])
+                .args(["inspect", "--toml", &name])
                 .output()
-                .expect("sandlock config --toml");
+                .expect("sandlock inspect --toml");
             assert!(
                 out.status.success(),
-                "config --toml should succeed: stderr={}",
+                "inspect --toml should succeed: stderr={}",
                 String::from_utf8_lossy(&out.stderr)
             );
             let stdout = String::from_utf8_lossy(&out.stdout);
             // TOML output should have section headers.
             assert!(
                 stdout.contains("[filesystem]"),
-                "config --toml should contain [filesystem]: {}",
+                "inspect --toml should contain [filesystem]: {}",
                 stdout
             );
             assert!(
                 stdout.contains("/usr"),
-                "config --toml should contain /usr: {}",
+                "inspect --toml should contain /usr: {}",
                 stdout
             );
         }
@@ -616,12 +616,12 @@ fn test_config_toml_flag_produces_toml() {
 }
 
 #[test]
-fn test_config_nonexistent_sandbox() {
+fn test_inspect_nonexistent_sandbox() {
     let out = sandlock_bin()
-        .args(["config", "nonexistent-sandbox-xyz-99999"])
+        .args(["inspect", "nonexistent-sandbox-xyz-99999"])
         .output()
-        .expect("sandlock config");
-    assert!(!out.status.success(), "config for nonexistent sandbox should fail");
+        .expect("sandlock inspect");
+    assert!(!out.status.success(), "inspect for nonexistent sandbox should fail");
 }
 
 #[test]
@@ -669,14 +669,14 @@ fn test_kill_nonexistent_sandbox() {
 }
 
 #[test]
-fn test_help_shows_ps_and_config() {
+fn test_help_shows_ps_and_inspect() {
     let out = sandlock_bin()
         .args(["--help"])
         .output()
         .expect("sandlock --help");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("ps"), "--help should show 'ps' command");
-    assert!(stdout.contains("config"), "--help should show 'config' command");
+    assert!(stdout.contains("inspect"), "--help should show 'inspect' command");
     assert!(stdout.contains("kill"), "--help should show 'kill' command");
     // The old 'list' command should be gone.
     assert!(

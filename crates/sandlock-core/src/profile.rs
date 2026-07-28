@@ -433,7 +433,7 @@ fn time_start_str(t: SystemTime) -> Option<String> {
 ///
 /// This is the reverse of `parse_input`: it flattens the `Sandbox` dataclass
 /// back into the sectioned profile shape so it can be serialized to JSON (the
-/// control-socket `config` verb) or TOML (`sandlock config <name> --toml`).
+/// control-socket `config` verb) or TOML (`sandlock inspect <name> --toml`).
 ///
 /// Runtime-only kwargs (`policy_fn`, `init_fn`, `work_fn`) are not `Sandbox`
 /// fields and so do not appear; the `config` handler emits a `"<callback>"`

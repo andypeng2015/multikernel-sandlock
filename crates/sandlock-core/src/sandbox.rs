@@ -505,7 +505,7 @@ pub struct Sandbox {
     pub no_supervisor: bool,
 
     /// Enable the per-sandbox control socket for introspection (`sandlock ps`,
-    /// `sandlock config`, etc.). Defaults to `true`. Set to `false` to skip
+    /// `sandlock inspect`, etc.). Defaults to `true`. Set to `false` to skip
     /// the runtime dir, pid file, and control-socket tokio task entirely.
     #[serde(skip, default = "default_control_socket")]
     pub control_socket: bool,

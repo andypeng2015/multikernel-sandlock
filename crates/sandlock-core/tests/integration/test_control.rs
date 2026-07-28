@@ -117,30 +117,30 @@ fn test_control_list_sandboxes_via_cli() {
 }
 
 #[test]
-fn test_control_config_returns_policy_via_cli() {
+fn test_control_inspect_returns_policy_via_cli() {
     let name = format!("test-ctrl-config-{}", std::process::id());
     let mut child = start_sleep_sandbox(&name);
 
     match wait_for_sandbox(&name) {
         Ok(()) => {
             let out = sandlock_bin()
-                .args(["config", &name])
+                .args(["inspect", &name])
                 .output()
-                .expect("sandlock config");
+                .expect("sandlock inspect");
             assert!(
                 out.status.success(),
-                "config should succeed: stderr={}",
+                "inspect should succeed: stderr={}",
                 String::from_utf8_lossy(&out.stderr)
             );
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(
                 stdout.contains("filesystem"),
-                "config JSON should contain 'filesystem': {}",
+                "inspect JSON should contain 'filesystem': {}",
                 stdout
             );
             assert!(
                 stdout.contains("/usr"),
-                "config JSON should contain /usr: {}",
+                "inspect JSON should contain /usr: {}",
                 stdout
             );
         }
@@ -156,12 +156,12 @@ fn test_control_config_returns_policy_via_cli() {
 }
 
 #[test]
-fn test_control_config_nonexistent_sandbox() {
+fn test_control_inspect_nonexistent_sandbox() {
     let out = sandlock_bin()
-        .args(["config", "nonexistent-sandbox-xyz-99999"])
+        .args(["inspect", "nonexistent-sandbox-xyz-99999"])
         .output()
-        .expect("sandlock config");
-    assert!(!out.status.success(), "config for nonexistent sandbox should fail");
+        .expect("sandlock inspect");
+    assert!(!out.status.success(), "inspect for nonexistent sandbox should fail");
 }
 
 #[test]
@@ -578,20 +578,20 @@ fn test_control_cli_kill_rejects_bad_names() {
 }
 
 #[test]
-fn test_control_cli_config_rejects_bad_names() {
+fn test_control_cli_inspect_rejects_bad_names() {
     for bad in &["..", ".", "a/b"] {
         let out = sandlock_bin()
-            .args(["config", bad])
+            .args(["inspect", bad])
             .output()
-            .expect("sandlock config");
+            .expect("sandlock inspect");
         assert!(
             !out.status.success(),
-            "sandlock config {:?} should fail", bad
+            "sandlock inspect {:?} should fail", bad
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("must not"),
-            "config {:?} should produce a validation error, got: {}",
+            "inspect {:?} should produce a validation error, got: {}",
             bad, stderr
         );
     }
