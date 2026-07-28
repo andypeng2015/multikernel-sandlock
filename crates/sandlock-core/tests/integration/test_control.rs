@@ -662,13 +662,7 @@ fn test_control_cli_kill_nonexistent() {
 
 #[test]
 fn test_control_single_line_pid_file_is_pruned() {
-    let uid = unsafe { libc::getuid() };
-    let root = sandlock_core::control::runtime_dir_uid(uid);
-    if !root.exists() {
-        std::fs::create_dir_all(&root).expect("create sandlock root");
-    }
-
-    let dir = root.join("test-single-line-pid");
+    let dir = sandlock_core::control::sandbox_dir("test-single-line-pid");
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // Write a pid file with only one line — the format that never shipped.

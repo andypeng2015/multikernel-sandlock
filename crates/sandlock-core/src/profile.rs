@@ -392,7 +392,7 @@ pub fn format_net_rule(rule: &crate::sandbox::NetRule) -> String {
 }
 
 /// Render an `HttpRule` back into `"METHOD host/path"` form.
-pub fn format_http_rule(rule: &crate::http::HttpRule) -> String {
+pub(crate) fn format_http_rule(rule: &crate::http::HttpRule) -> String {
     format!("{} {}{}", rule.method, rule.host, rule.path)
 }
 

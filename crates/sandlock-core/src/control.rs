@@ -42,7 +42,7 @@ use crate::seccomp::ctx::SupervisorCtx;
 // ============================================================
 
 /// Return the per-user runtime directory root.
-pub fn runtime_dir_uid(uid: u32) -> PathBuf {
+pub(crate) fn runtime_dir_uid(uid: u32) -> PathBuf {
     PathBuf::from(format!("/dev/shm/sandlock-{}", uid))
 }
 
@@ -90,7 +90,7 @@ fn read_supervisor_pid(dir: &Path) -> Option<i32> {
 /// socket) instead of duplicating a bare `remove_dir_all` + `create_dir_all`
 /// that had no liveness check and would wipe a live sandbox's pid file on a
 /// name collision.
-pub fn setup_runtime_dir(
+pub(crate) fn setup_runtime_dir(
     name: &str,
     child_pid: i32,
     supervisor_pid: i32,
@@ -114,7 +114,7 @@ pub fn setup_runtime_dir(
 /// binding a control socket.  Used by the `no_supervisor` path (no socket
 /// exists) and as the common prefix of `setup_runtime_dir` for the supervisor
 /// path.
-pub fn setup_runtime_dir_no_socket(
+pub(crate) fn setup_runtime_dir_no_socket(
     name: &str,
     child_pid: i32,
     supervisor_pid: i32,
@@ -180,7 +180,7 @@ pub fn cleanup_runtime_dir(dir: &Path) {
 /// Takes ownership of `sandbox` (moved into the task) so the config snapshot
 /// lives for the lifetime of the control loop.  The sandbox clone has
 /// `init_fn = None` (FnOnce can't be cloned), so the value is `Send`.
-pub fn spawn_control_loop(
+pub(crate) fn spawn_control_loop(
     listener: UnixListener,
     ctx: Arc<SupervisorCtx>,
     sandbox: Sandbox,
