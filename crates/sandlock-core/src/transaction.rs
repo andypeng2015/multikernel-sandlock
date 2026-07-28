@@ -219,9 +219,13 @@ pub enum TxnError {
     },
 
     /// The commit merge failed. The change set that did not land is preserved —
-    /// additions and modifications under `preserved_upper`, deletions in the
-    /// `PRESERVED` marker beside it (see
-    /// [`read_preserved`](crate::recovery::read_preserved)).
+    /// additions and modifications under `preserved_upper`, outstanding
+    /// deletions in the `PRESERVED` marker beside it (see
+    /// [`read_preserved`](crate::recovery::read_preserved)) WHEN one could be
+    /// written. The marker itself failing to write is one of the ways this
+    /// error is reached, and in that case the workdir was not touched at all;
+    /// `source` says so, which is why the text is conditional rather than a
+    /// promise the file exists.
     ///
     /// The merge is not rolled back, so the workdir may be partially merged and
     /// re-running the stages is not the same thing as finishing this
@@ -231,7 +235,8 @@ pub enum TxnError {
     #[error(
         "transaction: the commit merge into {workdir} failed: {source}. The workdir may be \
          partially merged; what did not land was preserved at {preserved_upper}, with any \
-         outstanding deletions listed in the PRESERVED marker beside it"
+         outstanding deletions listed in the PRESERVED marker beside it when one could be \
+         written; the error text above says so when it could not"
     )]
     Merge {
         workdir: std::path::PathBuf,

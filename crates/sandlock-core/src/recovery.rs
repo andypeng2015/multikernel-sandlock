@@ -32,5 +32,29 @@
 //! size-limited tmpfs. A daemon or any cross-session recovery MUST therefore set
 //! an explicit, durable, disk-backed `fs_storage` rather than rely on the
 //! default.
+//!
+//! The same caveat scopes the marker's crash-durability. The marker is written
+//! atomically and fsynced (file, then its directory entry) at the one moment it
+//! is the crash record for a merge in flight. A `SIGKILL` or a panic never
+//! needed that — the page cache survives — so it changes behaviour only on
+//! power loss or a kernel panic, and on the tmpfs default there is nothing left
+//! to recover from after either. It buys something real only with a disk-backed
+//! `fs_storage`, and even there the upper it names is written by the COW copy
+//! path and by the child with no sync of its own.
+//!
+//! # Applying a preserved change set
+//!
+//! Order is not free: **deletions first, then the upper**. An addition under a
+//! path the run also deleted only lands correctly if the deletion has already
+//! emptied that path, which is the same order the merge itself uses.
+//!
+//! The marker's `deleted=` lines are the OUTSTANDING deletions as of the last
+//! durable write, not the branch's whole whiteout history. The history lives in
+//! the append-only `deleted.log` beside the upper and must NOT be used here: a
+//! `MergeInterrupted` branch may have had part of its upper published and
+//! drained already, and re-applying a whiteout over a path that landed destroys
+//! it. That is why this module is report-only today — the supported route to
+//! finish an interrupted merge is to re-run `commit()` on the branch, which
+//! knows which deletions it already applied.
 
 pub use crate::cow::seccomp::{list_preserved, read_preserved, PreserveReason, PreservedBranch};

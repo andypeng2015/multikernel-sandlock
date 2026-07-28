@@ -98,6 +98,18 @@ fn dir_size(dir: &Path) -> u64 {
 /// next to `upper/`, never inside it, so it is not part of the change set.
 const PRESERVED_MARKER: &str = "PRESERVED";
 
+/// Staging name for an atomic marker rewrite. Invisible to the sweep:
+/// [`read_preserved`] opens the exact name `PRESERVED`, and [`list_preserved`]
+/// only descends directories.
+const PRESERVED_TMP: &str = ".PRESERVED.tmp";
+
+/// `fsync` a directory, so a name created or removed in it survives a power
+/// loss. Mirrors `deletions::sync_parent_dir`, but returns the error: the
+/// caller here has a decision to make on it.
+fn sync_dir(p: &Path) -> std::io::Result<()> {
+    fs::File::open(p)?.sync_all()
+}
+
 /// Why a branch's private storage was preserved instead of reclaimed.
 ///
 /// Every preserved branch is storage that nothing in this process will free
@@ -1770,7 +1782,18 @@ impl SeccompCowBranch {
         // one that was interrupted, for as long as it runs. That is the right
         // way round — the alternative loses the crash — and the marker's pid is
         // what a sweep uses to tell them apart (see `list_preserved`).
-        self.preserve(PreserveReason::MergeInterrupted);
+        //
+        // Strict, unlike every other `preserve` call site: this is the one
+        // moment the marker exists for, so a workdir that cannot be described
+        // is a workdir that is not touched. Failing here loses nothing — the
+        // upper still holds the whole change set and the commit is retryable.
+        self.preserve_durable(PreserveReason::MergeInterrupted).map_err(|e| {
+            BranchError::Operation(format!(
+                "preserve marker: {e}; the workdir was not touched, but the change set at {} \
+                 has no marker and a sweep will not find it",
+                self.storage_dir.display()
+            ))
+        })?;
 
         // Apply deletions, recording each one that is no longer outstanding so
         // a retry sees only what is left to do. Whether the removal call
@@ -1782,6 +1805,8 @@ impl SeccompCowBranch {
         // merged view. `applied_deletions` is the second question.
         let pending_deletions: Vec<String> = self.outstanding_deletions().map(str::to_string).collect();
         let mut deletion_failure: Option<String> = None;
+        let mut applied_any = false;
+        let mut removed_parents: HashSet<PathBuf> = HashSet::new();
         for rel_path in pending_deletions {
             let dest = self.workdir.join(&rel_path);
             // Classify without dereferencing: `is_dir()` follows a symlink, so
@@ -1799,6 +1824,15 @@ impl SeccompCowBranch {
             };
             if !dest.exists() && !dest.is_symlink() {
                 self.applied_deletions.insert(rel_path.clone());
+                // Only count and fsync entries this attempt actually removed.
+                // An entry that was already absent is applied, but nothing was
+                // unlinked, so there is no directory entry to make durable.
+                if dest_kind.is_ok() {
+                    applied_any = true;
+                    if let Some(p) = dest.parent() {
+                        removed_parents.insert(p.to_path_buf());
+                    }
+                }
             } else if deletion_failure.is_none() {
                 deletion_failure = Some(match removal {
                     Err(e) => format!("{}: errno {}", rel_path, e),
@@ -1806,6 +1840,34 @@ impl SeccompCowBranch {
                 });
             }
         }
+        if applied_any {
+            // Order matters both ways round.
+            //
+            // The removals go durable BEFORE the marker stops naming them: the
+            // unlinks above are plain syscalls and the copy phase's fsyncs
+            // cover only directories the COPY touched. Shrinking a durable
+            // marker over page-cache-only removals means a power loss leaves a
+            // record saying "nothing outstanding" over a workdir that still
+            // holds the files, and `applied_deletions` is RAM-only, so the
+            // deletions are lost.
+            for d in &removed_parents {
+                sync_dir(d)
+                    .map_err(|e| BranchError::Operation(format!("sync workdir dir: {e}")))?;
+            }
+            // And the marker is refreshed BEFORE the copy phase, strictly. The
+            // head marker names deletions that have since landed; once the copy
+            // phase publishes an entry and `drop_merged_entry` DRAINS it from
+            // the upper, replaying that stale list destroys work that landed.
+            // So the copy phase must never run behind a marker that
+            // over-reports deletions relative to a drained upper. Failing here
+            // loses nothing: the upper is not yet drained and the commit is
+            // retryable, and the marker still on disk is the head one, which
+            // OVER-lists — the safe direction, because nothing has been
+            // drained.
+            self.preserve_durable(PreserveReason::MergeInterrupted)
+                .map_err(|e| BranchError::Operation(format!("preserve marker: {e}")))?;
+        }
+
         // A deletion left outstanding is a merge that did not happen. Stopping
         // here — before a single entry is copied — is what keeps the ADDITIONS
         // all-or-nothing: running on would publish them, and the successful
@@ -1999,12 +2061,30 @@ impl SeccompCowBranch {
     /// them — so without writing them down a preserved branch would be an upper
     /// that resurrects every file the run deleted when it is recovered.
     ///
-    /// Writing the marker is best-effort. If it fails the upper is still
+    /// Writing the marker is best-effort here. If it fails the upper is still
     /// preserved in this process — losing the data would be worse than losing
-    /// the record — but an out-of-band sweep will not find it.
+    /// the record — but an out-of-band sweep will not find it. The write is
+    /// still ATOMIC (temp + rename): that costs nothing and it is what stops a
+    /// rewrite from truncating a marker that was already valid. It is not made
+    /// DURABLE, because on these paths the workdir is untouched and there is
+    /// nothing half-done for a crash to leave behind. See
+    /// [`Self::preserve_durable`] for the path where there is.
     pub(crate) fn preserve(&mut self, reason: PreserveReason) {
         self.state = BranchState::Preserved(reason);
-        let _ = self.write_preserved_marker(reason);
+        let _ = self.write_preserved_marker(reason, false);
+    }
+
+    /// [`Self::preserve`], but the marker is fsynced and its error propagates.
+    ///
+    /// Used only by the merge, where the marker is the crash record for work in
+    /// flight: it is written immediately before the first destructive step, so
+    /// a marker that never reached disk over a half-merged workdir is precisely
+    /// the failure it exists to prevent. The state is set BEFORE the write, so
+    /// a caller that returns on the error still leaves `Drop` preserving the
+    /// storage.
+    pub(crate) fn preserve_durable(&mut self, reason: PreserveReason) -> std::io::Result<()> {
+        self.state = BranchState::Preserved(reason);
+        self.write_preserved_marker(reason, true)
     }
 
     /// Preserve as [`PreserveReason::CommitDeferred`] on a lock failure, but only
@@ -2022,7 +2102,36 @@ impl SeccompCowBranch {
         }
     }
 
-    fn write_preserved_marker(&self, reason: PreserveReason) -> std::io::Result<()> {
+    /// Write (or replace) this branch's PRESERVED marker.
+    ///
+    /// Atomicity and durability are separate properties with separate costs,
+    /// and only one caller needs both:
+    ///
+    /// - **Atomic** (temp + rename) for everyone, unconditionally. `preserve`
+    ///   REWRITES an existing marker — the merge calls it on every attempt and
+    ///   `commit()` is documented and tested as retryable — and a plain
+    ///   `fs::write` truncates in place, so a crash inside a rewrite loses a
+    ///   marker that was already valid, over a workdir that may be half merged.
+    /// - **Durable** (`fsync` of the file, then of the storage dir, then
+    ///   best-effort of the base) only when `durable`, i.e. only from the
+    ///   merge, where the marker is the crash record for work in flight.
+    ///
+    /// The file is fsynced BEFORE the rename: delayed allocation can otherwise
+    /// persist the new name over blocks that were never written. The storage
+    /// dir is fsynced after, to persist the `PRESERVED` name; the base above it
+    /// is fsynced best-effort, to persist the branch dir's own name, since
+    /// `list_preserved` enumerates that base.
+    ///
+    /// Scope of the guarantee, so it is not overclaimed: a SIGKILL or a panic
+    /// leaves the page cache intact and the old unsynced write was already
+    /// enough. These fsyncs change behaviour only on power loss or a kernel
+    /// panic — and there they make the RECORD durable while the upper it names
+    /// is written by `ensure_cow_copy` and by the child with no sync at all,
+    /// and the default storage base is `$XDG_RUNTIME_DIR` or `$TMPDIR`, i.e.
+    /// tmpfs, where the whole tree is gone anyway. They are meaningful with an
+    /// explicit disk-backed `fs_storage`, and inert without one.
+    fn write_preserved_marker(&self, reason: PreserveReason, durable: bool) -> std::io::Result<()> {
+        use std::io::Write;
         use std::os::unix::ffi::OsStrExt;
 
         let mut body = Vec::new();
@@ -2047,7 +2156,25 @@ impl SeccompCowBranch {
             body.extend_from_slice(&marker_escape(rel.as_bytes()));
         }
         body.extend_from_slice(format!("\npid={}\n", std::process::id()).as_bytes());
-        fs::write(self.storage_dir.join(PRESERVED_MARKER), body)
+
+        let tmp = self.storage_dir.join(PRESERVED_TMP);
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(&body)?;
+        if durable {
+            // Content AND the temp inode, before the rename publishes the name.
+            f.sync_all()?;
+        }
+        drop(f);
+        fs::rename(&tmp, self.storage_dir.join(PRESERVED_MARKER))?;
+        if durable {
+            sync_dir(&self.storage_dir)?;
+            // The branch dir's own name in the base `list_preserved` walks.
+            // Best-effort: an exotic `$TMPDIR` must not be able to fail a commit.
+            if let Some(base) = self.storage_dir.parent() {
+                let _ = sync_dir(base);
+            }
+        }
+        Ok(())
     }
 
     /// Whether a further `commit()`/`abort()` would be a no-op: the storage is
@@ -2060,6 +2187,21 @@ impl SeccompCowBranch {
     }
 
     fn cleanup(&self) {
+        // Retire the record before the storage it describes, durably.
+        //
+        // The marker is now guaranteed on disk while the `remove_dir_all` that
+        // takes it away is not, so a power loss just after a fully successful
+        // commit would otherwise resurrect `<base>/<uuid>/PRESERVED` with
+        // `reason=merge-interrupted` over an already-merged workdir — and after
+        // a reboot the pid gate cannot help, because the pid is dead either
+        // way. What survives a crash mid-teardown must be an unmarked orphan,
+        // which `read_preserved` ignores.
+        //
+        // Best-effort throughout: `cleanup` has no error channel and runs in
+        // `Drop`.
+        if fs::remove_file(self.storage_dir.join(PRESERVED_MARKER)).is_ok() {
+            let _ = sync_dir(&self.storage_dir);
+        }
         let _ = fs::remove_dir_all(&self.storage_dir);
     }
 }
@@ -2124,6 +2266,133 @@ mod tests {
         };
         assert!(kept.exists(), "a kept branch must survive drop");
         let _ = fs::remove_dir_all(&kept);
+    }
+
+    /// A commit that cannot record itself must not start destroying.
+    ///
+    /// The marker is written immediately before the merge's first destructive
+    /// step precisely so a crash mid-merge leaves a sweep something to find, so
+    /// a marker that could not be written is the one case where running on
+    /// would produce exactly what the marker exists to prevent: a modified
+    /// workdir with no record of the change set that modified it. The commit
+    /// fails instead, and the error names the storage dir — an operator told
+    /// only "preserve marker: ENOSPC" has nowhere to look.
+    ///
+    /// This is a NEW `commit()` failure mode and it can leave a provably
+    /// untouched workdir marked `MergeInterrupted`. Both are the over-strong
+    /// direction, which `PreserveReason::MergeInterrupted`'s own doc permits.
+    #[test]
+    fn a_commit_whose_marker_cannot_be_written_fails_before_touching_the_workdir() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("victim.txt"), "still here").unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let storage_dir = branch.storage_dir.clone();
+        branch.mark_deleted("victim.txt");
+        // Occupy the staging name with a DIRECTORY: `File::create` then fails
+        // EISDIR. Not overridable by CAP_DAC_OVERRIDE, unlike a chmod-based
+        // obstruction, so this holds under root with no conditional assertion.
+        fs::create_dir(storage_dir.join(PRESERVED_TMP)).unwrap();
+
+        let err = branch.commit().expect_err("an unwritable marker must fail the commit");
+        let msg = match err {
+            BranchError::Operation(m) => m,
+            other => panic!("expected an Operation error, got: {other:?}"),
+        };
+        assert!(
+            workdir.path().join("victim.txt").exists(),
+            "a commit that could not record itself must not have started deleting; got {msg:?}",
+        );
+        assert!(msg.starts_with("preserve marker"), "expected a marker error, got: {msg:?}");
+        assert!(
+            msg.contains(&storage_dir.display().to_string()),
+            "the operator has to be told WHERE the unfindable change set is, got: {msg:?}",
+        );
+    }
+
+    /// The marker of a partly merged branch lists only the deletions that are
+    /// still outstanding, not the whole whiteout set.
+    ///
+    /// Two independent things have to hold for this to pass, and either
+    /// regression gives the same seven-element vector: the applied deletions
+    /// must leave the outstanding set, and the marker must be REFRESHED after
+    /// the deletion loop rather than left as the one written at the head of the
+    /// merge, before any of them ran.
+    ///
+    /// Coverage note: this does NOT test the refresh's STRICTNESS. It would
+    /// still pass with the refresh error swallowed. That is carried by
+    /// `a_commit_whose_marker_cannot_be_written_fails_before_touching_the_workdir`
+    /// and by the argument in the commit message, not by this test.
+    #[test]
+    fn the_marker_of_a_partly_merged_branch_lists_only_the_outstanding_deletions() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("x.txt"), "outside the root").unwrap();
+        std::os::unix::fs::symlink(outside.path(), workdir.path().join("link")).unwrap();
+        for i in 0..6 {
+            fs::write(workdir.path().join(format!("f{i}.txt")), "doomed").unwrap();
+        }
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let storage_dir = branch.storage_dir.clone();
+        fs::write(branch.upper.join("added.txt"), "payload").unwrap();
+        for i in 0..6 {
+            branch.mark_deleted(&format!("f{i}.txt"));
+        }
+        branch.mark_deleted("link/x.txt");
+
+        let err = branch.commit().expect_err("the unappliable deletion must fail the merge");
+        assert!(
+            matches!(err, BranchError::Operation(ref m) if m.starts_with("delete:")),
+            "expected the deletion step to fail, got: {err:?}"
+        );
+
+        let p = read_preserved(&storage_dir).expect("a half-merged branch must have a marker");
+        assert_eq!(
+            p.deleted,
+            vec![PathBuf::from("link/x.txt")],
+            "the marker must name what is LEFT TO DO, not the six that already landed",
+        );
+        assert_eq!(p.reason, PreserveReason::MergeInterrupted);
+    }
+
+    /// Rewriting the marker must not strand the staging file.
+    ///
+    /// HONEST FRAMING: this test does NOT fail before the change that
+    /// introduced the rename — there was no temp file to leak. It is the guard
+    /// for the mechanism the fix adds, so that a future sweep (or a
+    /// `deleted.log` consumer) walking a branch dir cannot trip over a
+    /// half-written `.PRESERVED.tmp`. It is not evidence for the durability
+    /// work; nothing in-process can be.
+    #[test]
+    fn rewriting_the_marker_leaves_no_temp_file_in_the_branch_dir() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let storage_dir = branch.storage_dir.clone();
+
+        branch.preserve(PreserveReason::CommitDeferred);
+        branch.preserve(PreserveReason::MergeInterrupted); // the REWRITE path
+
+        let p = read_preserved(&storage_dir).expect("the rewritten marker must parse");
+        assert_eq!(p.reason, PreserveReason::MergeInterrupted, "the rewrite must have taken");
+
+        let mut names: Vec<String> = fs::read_dir(&storage_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                PRESERVED_MARKER.to_string(),
+                "deleted.log".to_string(),
+                "upper".to_string()
+            ],
+            "the branch dir must hold exactly the marker, the whiteout log and the upper",
+        );
     }
 
     /// A deletion that could not be applied must FAIL the commit. Reporting
