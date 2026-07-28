@@ -106,8 +106,49 @@ const PRESERVED_TMP: &str = ".PRESERVED.tmp";
 /// `fsync` a directory, so a name created or removed in it survives a power
 /// loss. Mirrors `deletions::sync_parent_dir`, but returns the error: the
 /// caller here has a decision to make on it.
+///
+/// `O_DIRECTORY` is not decoration. A plain open of a path that turns out to be
+/// a FIFO BLOCKS until the other end is opened, and this runs with the workdir
+/// commit lock held, so a non-directory at the path would wedge the commit
+/// indefinitely rather than fail it. `O_DIRECTORY` is checked before the file
+/// operation's `open` can block, so such a path is refused with `ENOTDIR`.
+/// `O_NOFOLLOW` refuses a symlink at the final component.
+///
+/// For a path derived from a workdir name use [`sync_dir_in_root`] instead:
+/// this one still resolves intermediate components unconfined.
 fn sync_dir(p: &Path) -> std::io::Result<()> {
-    fs::File::open(p)?.sync_all()
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(p)?
+        .sync_all()
+}
+
+/// [`sync_dir`] for a directory named relative to a root, resolved through
+/// `openat2(RESOLVE_IN_ROOT)` like every other workdir touch in the merge.
+///
+/// The merge fsyncs the parents of entries it removed, and those names come
+/// from the child, so an unconfined open would follow a symlink or a `..` out
+/// of the workdir. Confining the walk closes that; `O_DIRECTORY`/`O_NOFOLLOW`
+/// close the FIFO-wedge and final-symlink cases described on [`sync_dir`].
+///
+/// An empty `rel` means the root itself.
+///
+/// Returns the raw errno rather than an `io::Error`: the caller has to decide
+/// per-errno which failures are tolerable, and matching on errno is what makes
+/// that decision readable.
+fn sync_dir_in_root(root: &Path, rel: &str) -> Result<(), i32> {
+    let fd = crate::sys::fs::openat2_in_root(
+        root,
+        rel,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    // SAFETY: `openat2_in_root` returns an owned fd we have not shared.
+    let dir = unsafe { fs::File::from_raw_fd(fd) };
+    dir.sync_all()
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
 }
 
 /// Why a branch's private storage was preserved instead of reclaimed.
@@ -222,9 +263,11 @@ fn marker_unescape(raw: &[u8]) -> Vec<u8> {
 ///
 /// `None` means the dir is not a usable preserved branch, in one of three ways:
 /// it is live storage of a running process; it was orphaned by something that
-/// never marked it; or its marker exists but was cut mid-line by a crash. The
-/// third is precisely the case a sweep exists for, so it is rejected loudly
-/// rather than half-parsed.
+/// never marked it; or its marker exists but was cut mid-line by a crash. All
+/// three return the same bare `None` — the caller cannot tell them apart, and
+/// [`list_preserved`] contracts the skip — so the third, which is precisely the
+/// case a sweep exists for, is rejected WHOLE rather than half-parsed, but not
+/// reported.
 ///
 /// Part of the on-disk format: **every record ends with a newline**, and a body
 /// that does not is a crash-truncated record and is rejected whole.
@@ -555,10 +598,15 @@ pub struct SeccompCowBranch {
     /// durable form of the remainder is the preserved marker's `deleted=`
     /// lines, not this.
     ///
-    /// It assumes the branch owns the workdir between attempts. The commit
-    /// lock is held across the merge, so nothing else re-creates a path this
-    /// branch already deleted; if something outside did, the retry would not
-    /// delete it again.
+    /// Accepted limitation: the commit lock is held only for the duration of
+    /// ONE attempt — `commit_with_lock_polling` drops it on return — so between
+    /// a failed commit and its retry the workdir is unlocked and another writer
+    /// may re-create a path this branch already deleted. The retry would then
+    /// not delete it again, because the entry is recorded applied. Nothing here
+    /// can close that: the whiteout set cannot carry the distinction, and
+    /// re-deleting unconditionally would instead let a retry destroy a file
+    /// created after the branch's own deletion landed. Callers that need the
+    /// workdir quiescent across retries have to hold it quiescent themselves.
     applied_deletions: HashSet<String>,
     has_changes: bool,
     state: BranchState,
@@ -1617,11 +1665,17 @@ impl SeccompCowBranch {
     /// the two lock-failure kinds map to distinct messages (contention vs a broken
     /// workdir, the latter interpolating the io error).
     ///
-    /// Two failure shapes, not to be conflated:
+    /// Three failure shapes, not to be conflated:
     /// - **Contended / lock failure** (the deferral): the lock could not be taken,
     ///   the workdir is UNTOUCHED, and the WHOLE change set is preserved as
     ///   `CommitDeferred` (recoverable via [`crate::recovery::list_preserved`]).
     ///   Retry by re-running the commit once the contention clears.
+    /// - **`preserve marker: ...`**: the lock WAS taken, but the crash record
+    ///   could not be written, so the merge never started. The workdir is
+    ///   provably untouched — this is the first thing the merge does — the
+    ///   whole change set is still in the storage, and there is no marker on
+    ///   disk, so an out-of-band sweep will NOT find it; only a retry in this
+    ///   process will. Retryable once the storage dir is writable again.
     /// - **Merge failure** (`ENOSPC`, `EACCES`, an obstructing symlink, ...): the
     ///   lock WAS held and the merge ran; the workdir may be left partially merged
     ///   and this returns `Err`, but the upper is **preserved** holding exactly
@@ -1633,10 +1687,18 @@ impl SeccompCowBranch {
     ///
     /// Deletions are applied first, one at a time, and each is recorded applied
     /// as it lands; if any is still outstanding when they have all been tried
-    /// the commit fails there, before a single addition is copied. So a failure
-    /// on this side is not "the workdir is untouched" — every deletion that
-    /// could be applied already has been — it is "no addition was published,
-    /// and some deletions are still to do".
+    /// the commit fails there (`delete: ...`), before a single addition is
+    /// copied. So a failure on this side is not "the workdir is untouched" —
+    /// every deletion that could be applied already has been — it is "no
+    /// addition was published, and some deletions are still to do".
+    ///
+    /// `sync workdir dir: ...` belongs to that same window: the deletions have
+    /// landed, no addition has been published, and the merge stopped because
+    /// making a removal durable failed with a real I/O error. Errnos for which
+    /// the fsync is simply unavailable (a `0o300` directory, a parent replaced
+    /// by a non-directory) do NOT fail the merge — they cannot be satisfied by
+    /// any retry, and the exposure they leave is a removal that a power loss
+    /// could undo, which is not destructive.
     ///
     /// The deletions remainder is NOT derivable from `changes()`. The whiteout
     /// set is append-only (a landed deletion has to stay in it, or the path
@@ -1652,7 +1714,13 @@ impl SeccompCowBranch {
     /// and so fail rather than claim: an entry whose name is not UTF-8, and a
     /// workdir entry of the wrong type where the upper holds a directory.
     ///
-    /// The short-circuit below is the exception, and it is not a merge. On a
+    /// Two short-circuits are the exception, and neither is a merge. A branch
+    /// with no recorded changes returns `Ok(())` after reclaiming its storage,
+    /// without writing a marker: there is no change set for a crash record to
+    /// describe, so a storage dir that cannot hold one must not fail a commit
+    /// that has nothing to publish.
+    ///
+    /// The other is disposition. On a
     /// [`BranchState::Finished`] branch there is nothing left to merge — the
     /// storage is already gone — so `Ok(())` is an idempotent no-op. On a
     /// [`PreserveReason::Kept`] branch it is a **caller error reported as
@@ -1770,6 +1838,30 @@ impl SeccompCowBranch {
     /// destructive step so a crash mid-merge still leaves a sweep something to
     /// find.
     fn commit_merge(&mut self) -> Result<(), BranchError> {
+        // Nothing to merge — and therefore nothing for a crash record to
+        // describe. Short-circuiting here is not an optimisation of the merge
+        // below, it removes a failure the merge cannot justify:
+        // `preserve_durable` is STRICT, so a storage dir whose marker cannot be
+        // written (an obstructed `.PRESERVED.tmp`, a full filesystem) would
+        // turn a commit with NO CHANGES into `Err("preserve marker: ...")`
+        // naming a change set that does not exist. It also drops the marker's
+        // fsyncs off every no-op commit, and `Sandbox` runs one from `Drop`.
+        //
+        // The test is deliberately "provably nothing to publish", not just the
+        // `has_changes` flag. This arm RECLAIMS THE STORAGE, so a false
+        // positive destroys data; a flag that every writer has to remember to
+        // set is the wrong thing to stake that on, and the upper is on disk and
+        // can be asked directly. `has_changes` is kept as the cheap first cut,
+        // so a branch that did record changes pays nothing for the check.
+        if !self.has_changes()
+            && self.outstanding_deletions().next().is_none()
+            && fs::read_dir(&self.upper).map(|mut d| d.next().is_none()).unwrap_or(false)
+        {
+            self.cleanup();
+            self.state = BranchState::Finished;
+            return Ok(());
+        }
+
         // Enter the interrupted state BEFORE the first destructive operation,
         // which also puts the marker on disk before the workdir is touched, so a
         // crash mid-merge still leaves a sweep something to find. Every `?`
@@ -1806,7 +1898,14 @@ impl SeccompCowBranch {
         let pending_deletions: Vec<String> = self.outstanding_deletions().map(str::to_string).collect();
         let mut deletion_failure: Option<String> = None;
         let mut applied_any = false;
-        let mut removed_parents: HashSet<PathBuf> = HashSet::new();
+        // Whether the OUTSTANDING SET shrank, which is the question the marker
+        // refresh below turns on. Not the same as `applied_any`, which is only
+        // "an unlink happened": a deletion of a path the workdir no longer has
+        // shrinks the set without unlinking anything.
+        let mut shrank = false;
+        // Parents of entries this attempt unlinked, RELATIVE to the workdir, so
+        // the fsync can be resolved confined. Empty string = the workdir root.
+        let mut removed_parents: HashSet<String> = HashSet::new();
         for rel_path in pending_deletions {
             let dest = self.workdir.join(&rel_path);
             // Classify without dereferencing: `is_dir()` follows a symlink, so
@@ -1822,37 +1921,94 @@ impl SeccompCowBranch {
             } else {
                 Ok(())
             };
-            if !dest.exists() && !dest.is_symlink() {
-                self.applied_deletions.insert(rel_path.clone());
-                // Only count and fsync entries this attempt actually removed.
-                // An entry that was already absent is applied, but nothing was
+            // "Applied" has to mean a DEFINITIVE "not there". `Path::exists()`
+            // is false for any stat error, not just `ENOENT`: a whiteout that
+            // cannot be statted (`EACCES` on a parent, `ENOTDIR` through a
+            // parent replaced by a file, `ELOOP`) would read as applied, drop
+            // out of `outstanding_deletions`, and leave the `remaining > 0`
+            // guard below unfired — so the merge would run on, the successful
+            // tail would remove the storage AND the marker, and `commit()`
+            // would return `Ok(())` over a file that is still in the workdir
+            // with its record destroyed.
+            let stat_after = dest.symlink_metadata();
+            let gone = matches!(stat_after, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound);
+            if gone {
+                shrank |= self.applied_deletions.insert(rel_path.clone());
+                // Only fsync entries this attempt actually removed. An entry
+                // that was already absent is applied, but nothing was
                 // unlinked, so there is no directory entry to make durable.
                 if dest_kind.is_ok() {
                     applied_any = true;
-                    if let Some(p) = dest.parent() {
-                        removed_parents.insert(p.to_path_buf());
-                    }
+                    removed_parents.insert(parent_rel(&rel_path).unwrap_or("").to_string());
                 }
             } else if deletion_failure.is_none() {
-                deletion_failure = Some(match removal {
-                    Err(e) => format!("{}: errno {}", rel_path, e),
-                    Ok(()) => format!("{}: still present after removal", rel_path),
+                deletion_failure = Some(match (removal, &stat_after) {
+                    (Err(e), _) => format!("{}: errno {}", rel_path, e),
+                    // The removal reported success but the path cannot be
+                    // confirmed gone. Carry the stat errno: "still present
+                    // after removal" would be a guess, and the wrong one.
+                    (Ok(()), Err(e)) => format!("{}: cannot confirm removal: {}", rel_path, e),
+                    (Ok(()), Ok(_)) => format!("{}: still present after removal", rel_path),
                 });
             }
         }
-        if applied_any {
-            // Order matters both ways round.
-            //
-            // The removals go durable BEFORE the marker stops naming them: the
-            // unlinks above are plain syscalls and the copy phase's fsyncs
-            // cover only directories the COPY touched. Shrinking a durable
-            // marker over page-cache-only removals means a power loss leaves a
-            // record saying "nothing outstanding" over a workdir that still
-            // holds the files, and `applied_deletions` is RAM-only, so the
-            // deletions are lost.
-            for d in &removed_parents {
-                sync_dir(d)
-                    .map_err(|e| BranchError::Operation(format!("sync workdir dir: {e}")))?;
+        // Gated on the OUTSTANDING SET having shrunk, not on an unlink having
+        // happened. Deleting a path the workdir no longer has shrinks the set
+        // with `applied_any == false`; skipping the refresh there would let the
+        // copy phase run behind a marker naming a path it publishes and
+        // `drop_merged_entry` drains — and a recovery replaying that marker
+        // would then destroy the only copy.
+        if shrank {
+            if applied_any {
+                // Order matters both ways round.
+                //
+                // The removals go durable BEFORE the marker stops naming them:
+                // the unlinks above are plain syscalls and the copy phase's
+                // fsyncs cover only directories the COPY touched. Shrinking a
+                // durable marker over page-cache-only removals means a power
+                // loss leaves a record saying "nothing outstanding" over a
+                // workdir that still holds the files, and `applied_deletions`
+                // is RAM-only, so the deletions are lost.
+                for d in &removed_parents {
+                    if let Err(errno) = sync_dir_in_root(&self.workdir, d) {
+                        // Tolerated errnos: the fsync is either unavailable or
+                        // moot here, and it must not fail the merge. A workdir
+                        // directory that is writable and searchable but not
+                        // readable (0o300) is the structural case — the child
+                        // can unlink in it, but it cannot be opened for fsync
+                        // by ANY means, so a strict call would turn an
+                        // otherwise complete merge into a hard failure AFTER
+                        // its deletions had landed and BEFORE any addition was
+                        // published, with no way past it on a retry.
+                        //
+                        // Tolerating is the safe direction, and skipping the
+                        // refresh below is not. The worst case here is an
+                        // unsynced removal: a power loss resurrects a file,
+                        // which is non-destructive and still named by the head
+                        // marker. Returning instead would leave the refresh
+                        // undone, and the copy phase must never run behind a
+                        // marker that over-reports deletions against an upper
+                        // it is draining — that direction destroys data that
+                        // has already been published.
+                        //
+                        // Real I/O errors (`EIO`, `ENOSPC`) are NOT tolerated:
+                        // there the filesystem itself is failing, and running
+                        // the destructive copy phase on is not defensible.
+                        const TOLERATED: [i32; 5] = [
+                            libc::EACCES,
+                            libc::EPERM,
+                            libc::ELOOP,
+                            libc::ENOTDIR,
+                            libc::ENOENT,
+                        ];
+                        if !TOLERATED.contains(&errno) {
+                            return Err(BranchError::Operation(format!(
+                                "sync workdir dir: {}",
+                                std::io::Error::from_raw_os_error(errno)
+                            )));
+                        }
+                    }
+                }
             }
             // And the marker is refreshed BEFORE the copy phase, strictly. The
             // head marker names deletions that have since landed; once the copy
@@ -2166,21 +2322,34 @@ impl SeccompCowBranch {
         body.extend_from_slice(format!("\npid={}\n", std::process::id()).as_bytes());
 
         let tmp = self.storage_dir.join(PRESERVED_TMP);
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(&body)?;
-        if durable {
-            // Content AND the temp inode, before the rename publishes the name.
-            f.sync_all()?;
-        }
-        drop(f);
-        fs::rename(&tmp, self.storage_dir.join(PRESERVED_MARKER))?;
-        if durable {
-            sync_dir(&self.storage_dir)?;
-            // The branch dir's own name in the base `list_preserved` walks.
-            // Best-effort: an exotic `$TMPDIR` must not be able to fail a commit.
-            if let Some(base) = self.storage_dir.parent() {
-                let _ = sync_dir(base);
+        let publish = || -> std::io::Result<()> {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&body)?;
+            if durable {
+                // Content AND the temp inode, before the rename publishes the name.
+                f.sync_all()?;
             }
+            drop(f);
+            fs::rename(&tmp, self.storage_dir.join(PRESERVED_MARKER))?;
+            if durable {
+                sync_dir(&self.storage_dir)?;
+                // The branch dir's own name in the base `list_preserved` walks.
+                // Best-effort: an exotic `$TMPDIR` must not be able to fail a commit.
+                if let Some(base) = self.storage_dir.parent() {
+                    let _ = sync_dir(base);
+                }
+            }
+            Ok(())
+        };
+        // A rewrite that fails between the create and the rename must not
+        // strand the staging file in the branch dir. Nothing else ever clears
+        // it: `preserve` swallows the error, so the leak would be permanent,
+        // and the branch dir is what a recovery sweep walks. Best-effort
+        // removal — the error worth reporting is the write's, not the
+        // cleanup's.
+        if let Err(e) = publish() {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
         Ok(())
     }
@@ -2401,6 +2570,26 @@ mod tests {
             ],
             "the branch dir must hold exactly the marker, the whiteout log and the upper",
         );
+
+        // ...and, load-bearing, when the rewrite FAILS. The success path above
+        // cannot leak — the rename consumes the staging file — so it is the
+        // failure path that needs the cleanup, and nothing else ever clears it:
+        // `preserve` swallows the error, so a stranded `.PRESERVED.tmp` would
+        // sit in the dir a recovery sweep walks for good.
+        //
+        // The failure is injected after the staging file is written, by making
+        // the rename fail: a non-empty directory at `PRESERVED` cannot be
+        // replaced by a file. No permission games, so it works as root.
+        fs::remove_file(storage_dir.join(PRESERVED_MARKER)).unwrap();
+        fs::create_dir(storage_dir.join(PRESERVED_MARKER)).unwrap();
+        fs::write(storage_dir.join(PRESERVED_MARKER).join("occupied"), "x").unwrap();
+
+        branch.preserve(PreserveReason::CommitDeferred);
+
+        assert!(
+            !storage_dir.join(PRESERVED_TMP).exists(),
+            "a rewrite that could not be published must not strand its staging file",
+        );
     }
 
     /// A deletion that could not be applied must FAIL the commit. Reporting
@@ -2457,6 +2646,320 @@ mod tests {
         assert!(
             read_preserved(&storage_dir).is_some(),
             "the preserved branch must be findable by an out-of-band sweep"
+        );
+    }
+
+    /// A deletion whose path cannot be STATTED must not be read as applied.
+    ///
+    /// `Path::exists()` is false for ANY stat error, so an unstatable whiteout
+    /// would be recorded applied, drop out of `outstanding_deletions()`, leave
+    /// the `remaining > 0` guard unfired, and let the successful tail remove
+    /// the storage AND the marker — `Ok(())` over a file that is still there,
+    /// with the record of it destroyed.
+    ///
+    /// `ENOTDIR` is the shape used here because it needs no permission games
+    /// and so fails as intended when the suite runs as root: `d` is replaced by
+    /// a regular file after the deletion of `d/x.txt` was recorded, so statting
+    /// the whiteout's path fails on the ancestor. The file `d` must still be
+    /// there afterwards, and the commit must report the deletion.
+    #[test]
+    fn a_deletion_whose_path_cannot_be_statted_is_not_counted_applied() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/x.txt"), "lower").unwrap();
+
+        let storage_dir;
+        {
+            let mut branch =
+                SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+            storage_dir = branch.storage_dir.clone();
+            fs::write(branch.upper.join("added.txt"), "payload").unwrap();
+            branch.mark_deleted("d/x.txt");
+
+            // Now make `d` a regular file, so every stat through it is ENOTDIR.
+            fs::remove_dir_all(workdir.path().join("d")).unwrap();
+            fs::write(workdir.path().join("d"), "not a directory").unwrap();
+
+            let err = branch
+                .commit()
+                .expect_err("an unstattable deletion must NOT be reported as a successful merge");
+            assert!(
+                matches!(err, BranchError::Operation(ref m) if m.starts_with("delete:")),
+                "expected the deletion step to fail, got: {err:?}"
+            );
+            assert!(
+                branch.is_deleted("d/x.txt"),
+                "the deletion must stay outstanding so a retry still sees it"
+            );
+        }
+
+        assert!(
+            !workdir.path().join("added.txt").exists(),
+            "a commit that failed on a deletion must not have merged the additions"
+        );
+        // The storage and the marker must both have survived: the successful
+        // tail is what removes them, and it must not have been reached.
+        assert!(
+            storage_dir.join("upper").join("added.txt").exists(),
+            "the unmerged change set must not have been destroyed by a bogus success"
+        );
+        let p = read_preserved(&storage_dir)
+            .expect("the record of the outstanding deletion must survive");
+        assert_eq!(
+            p.deleted,
+            vec![PathBuf::from("d/x.txt")],
+            "the marker must still name the deletion that never landed",
+        );
+    }
+
+    /// The same invariant through `EACCES` rather than `ENOTDIR`: a whiteout
+    /// under a parent with mode 0o000 cannot be statted at all, and must not be
+    /// counted applied. Skipped as root, where `CAP_DAC_OVERRIDE` defeats the
+    /// mode and the stat succeeds.
+    #[test]
+    fn a_deletion_under_an_unreadable_parent_is_not_counted_applied() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipped: root ignores mode bits");
+            return;
+        }
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let parent = workdir.path().join("d");
+        fs::create_dir(&parent).unwrap();
+        fs::write(parent.join("x.txt"), "lower").unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::write(branch.upper.join("added.txt"), "payload").unwrap();
+        branch.mark_deleted("d/x.txt");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = branch.commit();
+
+        // Restore before asserting, so a failure cannot leave an unremovable tree.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("an unstattable deletion must not be reported as merged");
+        assert!(
+            matches!(err, BranchError::Operation(ref m) if m.starts_with("delete:")),
+            "expected the deletion step to fail, got: {err:?}"
+        );
+        assert!(
+            parent.join("x.txt").exists(),
+            "the file was never removed, so the commit claiming success would be a lie"
+        );
+        assert!(
+            branch.is_deleted("d/x.txt"),
+            "the deletion must stay outstanding so a retry still sees it"
+        );
+    }
+
+    /// A workdir directory the merge cannot fsync must not fail the merge when
+    /// the fsync is STRUCTURALLY unavailable, and the marker must still be
+    /// refreshed.
+    ///
+    /// `0o300` (writable and searchable, not readable) is the case: the child
+    /// could unlink in it, but no open-for-fsync can succeed, on any retry. A
+    /// strict fsync turns a merge that would otherwise complete into a hard
+    /// failure AFTER its deletions have landed and BEFORE any addition is
+    /// published — unsatisfiable, so the commit could never make progress.
+    /// Skipped as root, where `CAP_DAC_OVERRIDE` makes the directory readable.
+    #[test]
+    fn an_unfsyncable_workdir_dir_does_not_fail_the_merge() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipped: root ignores mode bits");
+            return;
+        }
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let dir = workdir.path().join("d");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("gone.txt"), "to be deleted").unwrap();
+
+        let storage_dir;
+        let result;
+        {
+            let mut branch =
+                SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+            storage_dir = branch.storage_dir.clone();
+            fs::write(branch.upper.join("added.txt"), "payload").unwrap();
+            branch.mark_deleted("d/gone.txt");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+            result = branch.commit();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        result.expect("an fsync that cannot be satisfied must not fail an otherwise good merge");
+        assert!(
+            !dir.join("gone.txt").exists(),
+            "the deletion must have landed"
+        );
+        assert!(
+            workdir.path().join("added.txt").exists(),
+            "the addition must have been published"
+        );
+        assert!(
+            !storage_dir.exists(),
+            "a successful commit reclaims the storage"
+        );
+    }
+
+    /// Syncing a directory must never BLOCK on what is at the path.
+    ///
+    /// The merge fsyncs the parents of the entries it removed, and those names
+    /// come from the child. A plain `File::open` of a path that turns out to be
+    /// a FIFO blocks until the other end is opened — and this runs with the
+    /// workdir commit lock held, so instead of failing the commit it wedges it,
+    /// and every other commit on that workdir behind it, forever. `O_DIRECTORY`
+    /// is refused before the open can block, so the call returns `ENOTDIR`.
+    ///
+    /// Bounded by a watchdog rather than asserted directly: a regression here
+    /// HANGS, and a test that hangs instead of failing is worth nothing. Both
+    /// entry points are covered — the confined one the merge uses for workdir
+    /// names, and the plain one used for the branch's own storage dir.
+    ///
+    /// The confinement of the relative form is checked in the same place: a
+    /// symlink at the final component is refused (`ELOOP`) rather than
+    /// followed, and a `..` escape is clamped to the root instead of syncing
+    /// something outside it.
+    #[test]
+    fn syncing_a_dir_refuses_a_fifo_instead_of_blocking_on_it() {
+        use std::ffi::CString;
+        use std::sync::mpsc;
+
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("d");
+        let c = CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo failed");
+        // A symlink pointing at a real directory, to prove O_NOFOLLOW.
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.path().join("link")).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let rp = root.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let confined = sync_dir_in_root(&rp, "d");
+            let plain = sync_dir(&rp.join("d")).map_err(|e| e.raw_os_error().unwrap_or(0));
+            let symlinked = sync_dir_in_root(&rp, "link");
+            let escaped = sync_dir_in_root(&rp, "../..");
+            let ok = sync_dir_in_root(&rp, "real");
+            let _ = tx.send((confined, plain, symlinked, escaped, ok));
+        });
+
+        let (confined, plain, symlinked, escaped, ok) = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("syncing a dir BLOCKED on a FIFO; with the commit lock held this wedges");
+        worker.join().unwrap();
+
+        assert_eq!(confined, Err(libc::ENOTDIR), "a FIFO must be refused, not opened");
+        assert_eq!(plain, Err(libc::ENOTDIR), "the plain form must refuse it too");
+        // Refused, not followed. Which errno depends on the order the kernel
+        // applies the two flags — `ENOTDIR` for `O_DIRECTORY` against the
+        // symlink itself, `ELOOP` for `O_NOFOLLOW` — and both are in the
+        // tolerated set, so accept either rather than pin kernel internals.
+        // That this is a refusal and not a blanket failure is what `ok` below
+        // establishes: the very directory it points at IS syncable by name.
+        assert!(
+            matches!(symlinked, Err(libc::ELOOP) | Err(libc::ENOTDIR)),
+            "a symlinked dir must be refused, not followed; got {symlinked:?}",
+        );
+        // `..` is clamped to the root by RESOLVE_IN_ROOT, so this syncs the
+        // root itself rather than escaping to its parent.
+        assert_eq!(escaped, Ok(()), "a `..` escape must be clamped, not refused or followed out");
+        assert_eq!(ok, Ok(()), "a real directory must still be syncable");
+    }
+
+    /// A deletion of a path the workdir does not have must be dropped from the
+    /// marker BEFORE the copy phase, exactly like one that was unlinked.
+    ///
+    /// Such a deletion is applied on sight — the workdir entry is already gone
+    /// — so it shrinks the outstanding set without unlinking anything. Gating
+    /// the marker refresh on "an unlink happened" instead of "the outstanding
+    /// set shrank" skips it, and the copy phase then runs behind a marker that
+    /// names a path it is publishing while `drop_merged_entry` DRAINS that path
+    /// from the upper. A recovery working from that marker would re-apply the
+    /// deletion over the merged workdir and destroy the only copy.
+    ///
+    /// The commit is failed at the LAST upper entry so the marker survives to
+    /// be read back, with an earlier entry published and drained first — the
+    /// state the stale marker would be lethal over.
+    #[test]
+    fn a_deletion_of_an_absent_path_leaves_the_marker_before_the_copy_phase() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        // Sorts after "a-published.txt", so the merge publishes that one and
+        // then fails here (ELOOP: a symlink where the upper holds a file).
+        std::os::unix::fs::symlink("/dev/null", workdir.path().join("z-blocked.txt")).unwrap();
+
+        let storage_dir;
+        {
+            let mut branch =
+                SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+            storage_dir = branch.storage_dir.clone();
+            fs::write(branch.upper.join("a-published.txt"), "lands").unwrap();
+            fs::write(branch.upper.join("z-blocked.txt"), "does not").unwrap();
+            // Never existed in the workdir: applied on sight, nothing unlinked.
+            branch.mark_deleted("a-published.txt");
+
+            branch.commit().expect_err("the obstructed merge must fail");
+        }
+
+        // The precondition that makes a stale marker lethal: the entry is in
+        // the workdir and no longer in the upper.
+        assert!(
+            workdir.path().join("a-published.txt").exists(),
+            "the addition must have been published to the workdir"
+        );
+        assert!(
+            !storage_dir.join("upper").join("a-published.txt").exists(),
+            "and drained from the upper, so the workdir holds the only copy"
+        );
+
+        let p = read_preserved(&storage_dir).expect("the failed merge must leave a marker");
+        assert!(
+            p.deleted.is_empty(),
+            "an applied deletion must not still be named by the marker over a drained \
+             upper — replaying it would destroy the published copy; got {:?}",
+            p.deleted,
+        );
+    }
+
+    /// A commit with nothing recorded must be `Ok(())` and must write no
+    /// marker, even when the marker COULD NOT be written.
+    ///
+    /// The head marker is the crash record for a merge in flight; with no
+    /// change set there is nothing for it to describe, and writing it strictly
+    /// means an obstructed storage dir turns a no-op commit into
+    /// `Err("preserve marker: ...")` naming a change set that does not exist.
+    /// `Sandbox` runs a commit from `Drop`, so this is the common path.
+    ///
+    /// The obstruction is a directory at `.PRESERVED.tmp`, which makes the
+    /// staging `File::create` fail with `EISDIR` — no permission games, so it
+    /// works as root too.
+    #[test]
+    fn a_commit_with_no_changes_succeeds_even_when_no_marker_can_be_written() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let storage_dir = branch.storage_dir.clone();
+        fs::create_dir(storage_dir.join(PRESERVED_TMP)).unwrap();
+
+        assert!(!branch.has_changes(), "the branch must start with nothing recorded");
+        branch
+            .commit()
+            .expect("a commit with nothing to publish must not fail on its crash record");
+
+        assert!(
+            !storage_dir.join(PRESERVED_MARKER).exists(),
+            "no marker may be written for a change set that does not exist",
+        );
+        assert!(
+            list_preserved(storage.path()).is_empty(),
+            "a no-change commit must leave nothing for a recovery sweep to find",
         );
     }
 
@@ -2733,22 +3236,40 @@ mod tests {
     /// newline (and need not be UTF-8). Round-trip one so the format cannot be
     /// silently broken by a legal workdir name — including a DELETED path, which
     /// is a name the child chose and so is even less constrained.
+    ///
+    /// The deletion has to be a GENUINELY OUTSTANDING one, or the test proves
+    /// nothing: a deletion of a path the workdir does not have is applied on
+    /// sight and drops straight out of the marker, so it would round-trip only
+    /// through a marker the merge failed to refresh. The unapplicable shape is
+    /// the same one `commit_fails_when_a_deletion_could_not_be_applied` uses —
+    /// a symlinked parent component, which the confined `unlinkat` resolves
+    /// inside the workdir root and so cannot reach — with the newline moved
+    /// into the leaf name.
     #[test]
     fn the_preserved_marker_round_trips_a_deleted_path_with_a_newline() {
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink("/dev/null", workdir.path().join("blocked.txt")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("we\nird\\name.txt"), "survives").unwrap();
+        std::os::unix::fs::symlink(outside.path(), workdir.path().join("link")).unwrap();
 
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        fs::write(branch.upper.join("blocked.txt"), "payload").unwrap();
-        branch.mark_deleted("we\nird\\name.txt");
-        branch.commit().expect_err("the obstructed merge must fail");
+        fs::write(branch.upper.join("added.txt"), "payload").unwrap();
+        branch.mark_deleted("link/we\nird\\name.txt");
+        let err = branch.commit().expect_err("the unapplicable deletion must fail the merge");
+        // `delete:` is what the outstanding-deletion guard reports, so this is
+        // the proof that the path below reaches the marker as a REMAINDER
+        // rather than through a refresh the merge happened to skip.
+        assert!(
+            matches!(err, BranchError::Operation(ref m) if m.starts_with("delete:")),
+            "the deletion must still be outstanding, or this proves nothing: {err:?}",
+        );
 
         let found = list_preserved(storage.path());
         assert_eq!(found.len(), 1);
         assert_eq!(
             found[0].deleted,
-            vec![PathBuf::from("we\nird\\name.txt")],
+            vec![PathBuf::from("link/we\nird\\name.txt")],
             "a deleted path with a newline and a backslash must survive the round-trip",
         );
     }
