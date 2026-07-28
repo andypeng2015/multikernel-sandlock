@@ -65,6 +65,7 @@ legacy_syscall!(sys_getdents, "getdents");
 legacy_syscall!(sys_unlink, "unlink");
 legacy_syscall!(sys_rmdir, "rmdir");
 legacy_syscall!(sys_mkdir, "mkdir");
+legacy_syscall!(sys_mknod, "mknod");
 legacy_syscall!(sys_rename, "rename");
 legacy_syscall!(sys_symlink, "symlink");
 legacy_syscall!(sys_link, "link");
@@ -73,6 +74,13 @@ legacy_syscall!(sys_chown, "chown");
 legacy_syscall!(sys_lchown, "lchown");
 legacy_syscall!(sys_vfork, "vfork");
 legacy_syscall!(sys_fork, "fork");
+
+/// `renameat` syscall number on this architecture, or `None` where the ABI
+/// omits it. Unlike the legacy syscalls above it survived into the generic
+/// ABI on aarch64; only riscv64 dropped it in favor of `renameat2` alone.
+pub fn sys_renameat() -> Option<i64> {
+    sysno("renameat")
+}
 
 /// Fork-class syscalls present on this architecture: `clone`/`clone3` always,
 /// plus `fork`/`vfork` only where the legacy ABI provides them. Single source

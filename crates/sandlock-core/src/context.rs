@@ -176,10 +176,22 @@ fn close_fds_above(min_fd: RawFd, keep: &[RawFd]) {
 /// `real_uid`/`real_gid` must be captured *before* unshare(CLONE_NEWUSER),
 /// since getuid()/getgid() return the overflow id (65534) after unshare.
 /// `target_uid`/`target_gid` are the UIDs visible inside the namespace.
-fn write_id_maps(real_uid: u32, real_gid: u32, target_uid: u32, target_gid: u32) {
-    let _ = std::fs::write("/proc/self/uid_map", format!("{} {} 1\n", target_uid, real_uid));
-    let _ = std::fs::write("/proc/self/setgroups", "deny\n");
-    let _ = std::fs::write("/proc/self/gid_map", format!("{} {} 1\n", target_gid, real_gid));
+///
+/// Errors must reach the caller: mapping only happens when the caller asked
+/// for a specific identity, and a failed write would otherwise leave the
+/// child running as the overflow uid (65534) with no indication. Ubuntu
+/// 24.04's default AppArmor restriction on unprivileged user namespaces
+/// produces exactly that: unshare succeeds, the map write fails.
+fn write_id_maps(
+    real_uid: u32,
+    real_gid: u32,
+    target_uid: u32,
+    target_gid: u32,
+) -> std::io::Result<()> {
+    std::fs::write("/proc/self/uid_map", format!("{} {} 1\n", target_uid, real_uid))?;
+    std::fs::write("/proc/self/setgroups", "deny\n")?;
+    std::fs::write("/proc/self/gid_map", format!("{} {} 1\n", target_gid, real_gid))?;
+    Ok(())
 }
 
 // ============================================================
@@ -227,6 +239,11 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// parent death in the child without assuming PID 1 is always init
     /// (incorrect in containers where the entrypoint runs as PID 1).
     pub parent_pid: libc::pid_t,
+    /// Make the child the terminal's foreground process group before exec.
+    /// Only interactive (fully inherited) stdio wants this; a captured or
+    /// piped run taking the foreground demotes the embedding process to a
+    /// background job, and its next tty read stops it with SIGTTIN.
+    pub foreground: bool,
 }
 
 /// Set the calling thread/process name (`/proc/<pid>/comm`, shown by `ps`). The
@@ -251,6 +268,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         sandbox_name,
         extra_syscalls,
         parent_pid,
+        foreground,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
@@ -268,11 +286,13 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         fail!("setpgid");
     }
 
-    // 1b. If stdin is a terminal, become the foreground process group
-    //     so interactive shells can read from the TTY.
+    // 1b. Interactive runs only: if stdin is a terminal, become the
+    //     foreground process group so interactive shells can read from the
+    //     TTY. Captured/piped runs must not: the embedding process keeps
+    //     the terminal (issue #164).
     //     Must ignore SIGTTOU first — a background pgrp calling tcsetpgrp
     //     gets stopped by SIGTTOU otherwise.
-    if unsafe { libc::isatty(0) } == 1 {
+    if foreground && unsafe { libc::isatty(0) } == 1 {
         unsafe {
             libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             libc::tcsetpgrp(0, libc::getpgrp());
@@ -362,7 +382,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
                 fail!("unshare(CLONE_NEWUSER)");
             }
-            write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid);
+            if write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid).is_err() {
+                fail!(
+                    "uid_map/gid_map write (is unprivileged userns restricted? \
+                     e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
+                );
+            }
         }
     }
 

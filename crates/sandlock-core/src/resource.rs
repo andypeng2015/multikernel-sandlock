@@ -128,6 +128,7 @@ pub(crate) async fn handle_fork(
     }
 
     rs.proc_count += 1;
+    rs.peak_proc_count = rs.peak_proc_count.max(rs.proc_count);
     NotifAction::Continue
 }
 
@@ -605,6 +606,7 @@ pub(crate) async fn handle_memory(
                 return kill;
             }
             st.mem_used += len;
+            st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
         }
     } else if nr == libc::SYS_munmap {
         // args[1] = len
@@ -638,6 +640,7 @@ pub(crate) async fn handle_memory(
                 return kill;
             }
             st.mem_used += delta;
+            st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
             perproc.brk_base = Some(new_brk);
         } else if new_brk < base {
             let delta = base - new_brk;
@@ -655,6 +658,7 @@ pub(crate) async fn handle_memory(
                 return kill;
             }
             st.mem_used += growth;
+            st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
         } else if new_len < old_len {
             let shrink = old_len - new_len;
             st.mem_used = st.mem_used.saturating_sub(shrink);
@@ -666,6 +670,7 @@ pub(crate) async fn handle_memory(
             return kill;
         }
         st.mem_used += size;
+        st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
     }
 
     NotifAction::Continue

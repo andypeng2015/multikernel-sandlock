@@ -28,6 +28,18 @@ fn parent_rel(rel: &str) -> Option<&str> {
     rel.trim_end_matches('/').rfind('/').map(|i| &rel[..i])
 }
 
+/// Errno for a branch failure, for handlers that answer the child directly
+/// (the `handle_unlink` convention) rather than returning a `BranchError`.
+fn branch_errno(e: BranchError) -> i32 {
+    match e {
+        BranchError::QuotaExceeded => libc::ENOSPC,
+        BranchError::Denied => libc::EPERM,
+        BranchError::Deleted => libc::ENOENT,
+        BranchError::Exists => libc::EEXIST,
+        BranchError::Operation(_) | BranchError::Conflict(_) => libc::EIO,
+    }
+}
+
 /// Plan for a COW copy — returned by `prepare_copy()` to separate metadata
 /// updates (under lock) from potentially expensive file I/O (outside lock).
 #[derive(Debug)]
@@ -466,13 +478,29 @@ pub(crate) enum CommitError {
 }
 
 /// Seccomp-based COW branch. Redirects writes to an upper directory
-/// and tracks deletions in memory.
+/// and tracks deletions in a subtree-aware whiteout set, mirrored to an
+/// append-only log beside the upper.
 pub struct SeccompCowBranch {
     workdir: PathBuf,
     workdir_str: String,
     upper: PathBuf,
     storage_dir: PathBuf,
-    deleted: HashSet<String>,
+    deleted: crate::cow::deletions::DeletionSet,
+    /// Deletions this branch has already applied to the workdir.
+    ///
+    /// `deleted` is the durable, append-only whiteout set: it answers "is this
+    /// path hidden in the merged view". It cannot answer "is this deletion
+    /// still to do", because an applied entry must stay in it (removing it
+    /// would resurrect the path) while the merge must not run it again. This
+    /// set is that second question. RAM-only and deliberately not logged: the
+    /// durable form of the remainder is the preserved marker's `deleted=`
+    /// lines, not this.
+    ///
+    /// It assumes the branch owns the workdir between attempts. The commit
+    /// lock is held across the merge, so nothing else re-creates a path this
+    /// branch already deleted; if something outside did, the retry would not
+    /// delete it again.
+    applied_deletions: HashSet<String>,
     has_changes: bool,
     state: BranchState,
     /// What `Drop` does with a branch that was never disposed of: reclaim it
@@ -541,12 +569,20 @@ impl SeccompCowBranch {
         fs::create_dir_all(&upper)
             .map_err(|e| BranchError::Operation(format!("create upper: {}", e)))?;
 
+        // Strictly after `create_dir_all`: the log lives IN `branch_dir`, and
+        // `DeletionSet::create` swallows the open error by design (it degrades to
+        // a RAM-only set). Opening it before the directory exists would silently
+        // cost every branch its durable whiteout record.
+        let deleted =
+            crate::cow::deletions::DeletionSet::create(Some(&branch_dir.join("deleted.log")));
+
         Ok(Self {
             workdir_str: workdir.to_string_lossy().into_owned(),
             workdir,
             upper,
             storage_dir: branch_dir,
-            deleted: HashSet::new(),
+            deleted,
+            applied_deletions: HashSet::new(),
             has_changes: false,
             state: BranchState::Open,
             keep_if_abandoned: false,
@@ -582,10 +618,12 @@ impl SeccompCowBranch {
     }
 
     /// Check if a path has been modified or deleted in the COW layer.
-    /// Used to skip read-only opens for unmodified files.
+    /// Used to skip read-only opens for unmodified files. A path covered by
+    /// a whiteout needs interception even when re-created in the upper: the
+    /// read must be redirected there, never fall through to the lower file.
     pub fn needs_read_intercept(&self, path: &str) -> bool {
         if let Some(rel) = self.safe_rel(path) {
-            self.is_deleted(&rel) || self.upper.join(&rel).exists()
+            self.deleted.covers(&rel) || self.upper.join(&rel).exists()
         } else {
             false
         }
@@ -601,15 +639,35 @@ impl SeccompCowBranch {
         Some(rel_str)
     }
 
-    /// Check if a relative path has been deleted.
-    pub fn is_deleted(&self, rel_path: &str) -> bool {
-        self.deleted.contains(rel_path)
+    /// Confined lstat: does the upper hold an entry (any type) at `rel`?
+    fn upper_has(&self, rel: &str) -> bool {
+        crate::sys::fs::statat_in_root(&self.upper, rel, false).is_ok()
     }
 
-    /// Mark a relative path as deleted.
+    /// Check if a relative path is hidden by a whiteout in the merged view.
+    /// A whiteout covers its whole subtree; an entry re-created in the upper
+    /// shadows the whiteout and is visible again.
+    pub fn is_deleted(&self, rel_path: &str) -> bool {
+        self.deleted.covers(rel_path) && !self.upper_has(rel_path)
+    }
+
+    /// Mark a relative path as deleted (whiteout over it and its subtree).
+    ///
+    /// Deliberately does not touch `applied_deletions`: re-marking a path this
+    /// branch already removed from the workdir leaves it non-outstanding, which
+    /// is correct — the workdir entry is already gone.
     pub fn mark_deleted(&mut self, rel_path: &str) {
-        self.deleted.insert(rel_path.to_string());
+        self.deleted.insert(rel_path);
         self.has_changes = true;
+    }
+
+    /// The deletions still to apply. NOT filtered by upper presence: a
+    /// whiteout whose path the upper re-creates must still be applied to the
+    /// workdir first — that ordering is what makes `rm -rf d` then writing
+    /// `d/new.txt` publish into a directory that no longer holds the stale
+    /// contents (`deletions_are_applied_before_additions_at_the_same_path`).
+    fn outstanding_deletions(&self) -> impl Iterator<Item = &str> {
+        self.deleted.iter().filter(|r| !self.applied_deletions.contains(*r))
     }
 
     /// Check whether `additional` bytes would exceed the disk quota.
@@ -641,7 +699,6 @@ impl SeccompCowBranch {
     /// file copies to the caller. This is the shared core used by both
     /// `ensure_cow_copy` (synchronous) and the async two-phase dispatch.
     pub fn prepare_copy(&mut self, rel_path: &str) -> Result<CowCopyPlan, BranchError> {
-        self.deleted.remove(rel_path);
         self.has_changes = true;
 
         let upper_file = self.upper.join(rel_path);
@@ -657,13 +714,27 @@ impl SeccompCowBranch {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
 
+        // A whiteout covers this path: the lower entry is logically gone, so
+        // there is nothing to copy up. Creating over the whiteout starts
+        // fresh, and the entry appearing in the upper is what re-exposes it
+        // in the merged view (and what makes a re-created directory opaque).
+        if self.deleted.covers(rel_path) {
+            self.check_quota(0)?;
+            return Ok(CowCopyPlan::Ready(upper_file));
+        }
+
         // Classify the lower entry confined to the workdir root, so a symlinked
         // parent component cannot make us follow out of the tree (issue #112).
         // The lstat also yields the size of the entry we will actually copy.
         let st = match crate::sys::fs::statat_in_root(&self.workdir, rel_path, false) {
             Ok(st) => st,
             // Absent or confined-out: treat as a new file created in upper.
-            Err(libc::ENOENT) => {
+            // EACCES gets the same disposition as execute_copy's source-open
+            // gives it: the supervisor cannot see inside the lower directory
+            // (e.g. /root under a workdir of "/"), so the write proceeds on
+            // an empty upper file rather than falling through to a real
+            // permission error the virtualized child was promised not to hit.
+            Err(libc::ENOENT) | Err(libc::EACCES) => {
                 self.check_quota(0)?;
                 return Ok(CowCopyPlan::Ready(upper_file));
             }
@@ -690,6 +761,33 @@ impl SeccompCowBranch {
                 .map_err(|e| BranchError::Operation(format!("create dir: {}", e)))?;
             let _ = crate::sys::fs::chmod_in_root(&self.upper, rel_path, st.st_mode & 0o7777);
             self.disk_used += 4096;
+            return Ok(CowCopyPlan::Ready(upper_file));
+        }
+
+        if kind != libc::S_IFREG {
+            // Non-regular lower (FIFO, socket, device node): its content is
+            // not filesystem data, and reading it can block forever (issue
+            // #158: a FIFO open waits for a writer). Virtualize the write
+            // like any other COW write, onto an empty regular stub in the
+            // upper, WITHOUT reading the source. Under a COW workdir a
+            // write must never need real permission on the lower entry
+            // (learn mode COWs whole trees, so `> /dev/null` lands here)
+            // and must never touch the real device.
+            self.check_quota(0)?;
+            let fd = crate::sys::fs::openat2_in_root(
+                &self.upper,
+                rel_path,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+            .map_err(|e| BranchError::Operation(format!("create cow stub: {}", e)))?;
+            unsafe { libc::close(fd) };
+            // Whiteout the lower entry the stub replaces. The stub already
+            // shadows it in the merged view; the whiteout makes commit
+            // unlink it before the publish walk, which would otherwise
+            // O_WRONLY-open the surviving FIFO and block on a reader that
+            // never comes (the publish half of issue #158).
+            self.mark_deleted(rel_path);
             return Ok(CowCopyPlan::Ready(upper_file));
         }
 
@@ -729,7 +827,7 @@ impl SeccompCowBranch {
         let src_fd = match crate::sys::fs::openat2_in_root(
             workdir_root,
             rel,
-            libc::O_RDONLY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
             0,
         ) {
             Ok(fd) => fd,
@@ -747,6 +845,15 @@ impl SeccompCowBranch {
         };
 
         let mut src = unsafe { fs::File::from_raw_fd(src_fd) };
+        // prepare_copy classified this entry as a regular file, but it can
+        // change type between that lstat and this open. Never stream a
+        // non-regular source: a FIFO read blocks or steals pipe data (issue
+        // #158). O_NONBLOCK above makes the FIFO open itself return instead
+        // of waiting for a writer; on a regular file it is a no-op for reads.
+        if !src.metadata()?.file_type().is_file() {
+            create_dest()?;
+            return Ok(());
+        }
         let mut dst = create_dest()?;
         std::io::copy(&mut src, &mut dst)?;
         if let Ok(meta) = src.metadata() {
@@ -772,6 +879,72 @@ impl SeccompCowBranch {
         }
     }
 
+    /// Copy a lower tree into the upper, entry by entry, so a directory
+    /// rename can be staged in the branch without losing the contents
+    /// (issue #160). Each entry goes through the same confined,
+    /// quota-accounted single-entry copy-up, so symlinks are copied verbatim
+    /// and never followed (issue #112).
+    ///
+    /// Staging is all-or-nothing: a mid-tree failure (EACCES, EIO, quota)
+    /// must propagate rather than truncate the copy, because the caller
+    /// whiteouts the source afterwards and untraversed children would be
+    /// silently lost at commit. On failure every upper entry this staging
+    /// created is removed again and the quota re-derived.
+    fn copy_up_tree(&mut self, rel: &str) -> Result<(), i32> {
+        let mut created: Vec<String> = Vec::new();
+        let result = self.stage_tree(rel, &mut created);
+        if result.is_err() {
+            for c in created.iter().rev() {
+                let is_dir = crate::sys::fs::statat_in_root(&self.upper, c, false)
+                    .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+                    .unwrap_or(false);
+                if is_dir {
+                    let _ = crate::sys::fs::remove_dir_all_in_root(&self.upper, c);
+                } else {
+                    let _ = crate::sys::fs::unlinkat_in_root(&self.upper, c, false);
+                }
+            }
+            self.recalc_disk_used();
+        }
+        result
+    }
+
+    /// The traversal half of `copy_up_tree`: an explicit worklist (child
+    /// directory depth must not become supervisor stack depth) that records
+    /// every upper entry it creates into `created` for rollback.
+    fn stage_tree(&mut self, root: &str, created: &mut Vec<String>) -> Result<(), i32> {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(root.to_string());
+        while let Some(rel) = queue.pop_front() {
+            let was_in_upper = self.upper_has(&rel);
+            self.ensure_cow_copy(&rel).map_err(branch_errno)?;
+            if !was_in_upper && self.upper_has(&rel) {
+                created.push(rel.clone());
+            }
+            let st = match crate::sys::fs::statat_in_root(&self.workdir, &rel, false) {
+                Ok(st) => st,
+                // Upper-only entry: nothing below it in the lower to stage.
+                Err(libc::ENOENT) => continue,
+                Err(e) => return Err(e),
+            };
+            if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                continue;
+            }
+            let rd = fs::read_dir(self.workdir.join(&rel))
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            for entry in rd {
+                let entry = entry.map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let child = format!("{}/{}", rel, name);
+                if self.deleted.covers(&child) && !self.upper_has(&child) {
+                    continue;
+                }
+                queue.push_back(child);
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve a read path: upper if modified, else lower.
     pub fn resolve_read(&self, rel_path: &str) -> PathBuf {
         let upper_file = self.upper.join(rel_path);
@@ -794,13 +967,20 @@ impl SeccompCowBranch {
     /// seccomp supervisor) and prevents new opens once the quota is
     /// exhausted.
     pub fn handle_open(&mut self, path: &str, flags: u64) -> Result<Option<PathBuf>, BranchError> {
-        if flags & O_DIRECTORY != 0 {
-            return Ok(None);
-        }
         let rel = match self.safe_rel(path) {
             Some(r) => r,
             None => return Ok(None),
         };
+        if flags & O_DIRECTORY != 0 {
+            // A whiteouted directory must not fall through to the kernel:
+            // the lower directory still exists, so opendir would hand the
+            // child a live fd (and fstat its inode) where the merged answer
+            // is ENOENT.
+            if self.is_deleted(&rel) {
+                return Err(BranchError::Deleted);
+            }
+            return Ok(None);
+        }
 
         let is_write = flags & WRITE_FLAGS != 0;
 
@@ -861,6 +1041,12 @@ impl SeccompCowBranch {
                 Some(r) => r,
                 None => return Ok(CowOpenPlan::Skip),
             };
+            // Same whiteout gate as the non-directory path: Skip would let
+            // the kernel open the still-existing lower directory where the
+            // merged answer is ENOENT.
+            if self.is_deleted(&rel) {
+                return Ok(CowOpenPlan::Deleted);
+            }
             let upper_dir = self.upper.join(&rel);
             let lower_dir = self.workdir.join(&rel);
             if upper_dir.is_dir() && !lower_dir.is_dir() {
@@ -944,9 +1130,10 @@ impl SeccompCowBranch {
     /// a non-directory, `EISDIR` when unlink is called on a directory, `EBUSY`
     /// for the workdir root itself.
     ///
-    /// Diverges from `rmdir(2)` in one destructive direction: `rmdir` on a
-    /// NON-EMPTY directory is accepted here and becomes a recursive delete at
-    /// commit time, where `rmdir(2)` would return `ENOTEMPTY`.
+    /// Matches `rmdir(2)` on a non-empty directory: emptiness is judged against
+    /// the MERGED view (upper over workdir, minus whiteouts), and a non-empty
+    /// one gives `ENOTEMPTY` rather than becoming a recursive delete at commit
+    /// time.
     pub fn handle_unlink(&mut self, path: &str, is_dir: bool) -> Result<bool, i32> {
         let rel = match self.safe_rel(path) {
             Some(r) => r,
@@ -958,6 +1145,9 @@ impl SeccompCowBranch {
         // `EINVAL` on the root itself — permanently, on every retry.
         if rel.is_empty() || rel == "." {
             return Err(libc::EBUSY);
+        }
+        if self.is_deleted(&rel) {
+            return Err(libc::ENOENT);
         }
         let upper_file = self.upper.join(&rel);
         let lower_file = self.workdir.join(&rel);
@@ -982,6 +1172,14 @@ impl SeccompCowBranch {
                 // unlink() on a directory → EISDIR
                 return Err(libc::EISDIR);
             }
+        }
+
+        // rmdir semantics come from the merged view: entries in either layer
+        // that the child can still see make the directory non-empty (issue
+        // #161). The path-based whiteout would otherwise delete a subtree the
+        // child never emptied, and would do it while reporting success.
+        if is_dir && !self.list_merged_dir(&rel).is_empty() {
+            return Err(libc::ENOTEMPTY);
         }
 
         if upper_file.exists() || upper_file.is_symlink() {
@@ -1010,7 +1208,6 @@ impl SeccompCowBranch {
             None => return Ok(false),
         };
         self.check_quota(4096)?; // directory metadata
-        self.deleted.remove(&rel);
         self.has_changes = true;
         let ok = crate::sys::fs::mkdirp_in_root(&self.upper, &rel, 0o755).is_ok();
         if ok {
@@ -1019,10 +1216,65 @@ impl SeccompCowBranch {
         Ok(ok)
     }
 
+    /// Handle mknodat: create a file-system node in the upper layer.
+    ///
+    /// Returns `Err(QuotaExceeded)` when the node would exceed `max_disk`.
+    /// Returns `Err(Denied)` when the node type is S_IFBLK or S_IFCHR.
+    pub fn handle_mknod(&mut self, path: &str, mode: u32, dev: u64) -> Result<bool, BranchError> {
+        // Only S_IFIFO, S_IFSOCK, S_IFREG, and 0 are permitted.
+        // S_IFBLK/S_IFCHR are rejected: the supervisor creates nodes under its
+        // own credentials, making device nodes a sandbox escape on root runs.
+        let file_type = mode & libc::S_IFMT as u32; // strips the permission bits 
+        let allowed = file_type == 0
+            || file_type == libc::S_IFREG as u32
+            || file_type == libc::S_IFIFO as u32
+            || file_type == libc::S_IFSOCK as u32;
+        if !allowed {
+            return Err(BranchError::Denied);
+        }
+        let rel = match self.safe_rel(path) {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        self.check_quota(256)?;
+        self.has_changes = true;
+        // Ensure the parent directory exists in the upper layer before creating
+        // the node (mirrors handle_symlink; parent may only exist in lower).
+        if let Some(p) = parent_rel(&rel) {
+            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
+        }
+        let ok = crate::sys::fs::mknod_in_root(&self.upper, &rel, mode, dev).is_ok();
+        if ok {
+            self.disk_used += 256;
+        }
+        Ok(ok)
+    }
+
+    /// Merged-view classification of `rel`: `Some(is_dir)` when the child can
+    /// see an entry there, `None` when the merged answer is ENOENT. The upper
+    /// is consulted first because upper presence shadows both the lower entry
+    /// and any whiteout; a trailing symlink classifies as a non-directory
+    /// (rename never follows it).
+    fn merged_entry_is_dir(&self, rel: &str) -> Option<bool> {
+        if let Ok(st) = crate::sys::fs::statat_in_root(&self.upper, rel, false) {
+            return Some(st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+        }
+        if self.deleted.covers(rel) {
+            return None;
+        }
+        crate::sys::fs::statat_in_root(&self.workdir, rel, false)
+            .ok()
+            .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    }
+
     /// Handle rename.
     ///
-    /// Returns `Err(QuotaExceeded)` when the COW copy would exceed `max_disk`.
-    pub fn handle_rename(&mut self, old_path: &str, new_path: &str) -> Result<bool, BranchError> {
+    /// Returns `Ok(true)` on success, `Ok(false)` when the branch does not
+    /// handle the path, or `Err(errno)` when the merged view forbids the
+    /// rename (ENOENT for an absent or whiteouted source, ENOTEMPTY for a
+    /// non-empty directory destination, EISDIR/ENOTDIR for type mismatches,
+    /// ENOSPC for quota).
+    pub fn handle_rename(&mut self, old_path: &str, new_path: &str) -> Result<bool, i32> {
         let old_rel = match self.safe_rel(old_path) {
             Some(r) => r,
             None => return Ok(false),
@@ -1031,16 +1283,41 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        let _old_upper = self.ensure_cow_copy(&old_rel)?;
+        let src_is_dir = match self.merged_entry_is_dir(&old_rel) {
+            Some(d) => d,
+            None => return Err(libc::ENOENT),
+        };
+        // Destination semantics come from the merged view: renaming onto an
+        // existing directory must replace it or refuse, never publish the
+        // union of the renamed tree and the pre-existing one (issue #160
+        // review). The kernel cannot give these answers because it sees only
+        // one layer at a time.
+        if let Some(dest_is_dir) = self.merged_entry_is_dir(&new_rel) {
+            match (src_is_dir, dest_is_dir) {
+                (false, true) => return Err(libc::EISDIR),
+                (true, false) => return Err(libc::ENOTDIR),
+                (true, true) if !self.list_merged_dir(&new_rel).is_empty() => {
+                    return Err(libc::ENOTEMPTY)
+                }
+                _ => {}
+            }
+        }
+        self.copy_up_tree(&old_rel)?;
         if let Some(p) = parent_rel(&new_rel) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
         if crate::sys::fs::renameat_in_root(&self.upper, &old_rel, &new_rel).is_err() {
             return Ok(false);
         }
-        let lower_old = self.workdir.join(&old_rel);
-        if lower_old.exists() || lower_old.is_symlink() {
+        // A surviving lower entry under either name gets a whiteout: the
+        // source so it stops existing, the destination so commit removes it
+        // before publishing the renamed entry instead of merging into it.
+        // The staged upper entry shadows the destination whiteout until then.
+        if crate::sys::fs::statat_in_root(&self.workdir, &old_rel, false).is_ok() {
             self.mark_deleted(&old_rel);
+        }
+        if crate::sys::fs::statat_in_root(&self.workdir, &new_rel, false).is_ok() {
+            self.mark_deleted(&new_rel);
         }
         Ok(true)
     }
@@ -1071,7 +1348,6 @@ impl SeccompCowBranch {
             return Ok(false);
         }
         self.check_quota(256)?;
-        self.deleted.remove(&rel);
         self.has_changes = true;
         if let Some(p) = parent_rel(&rel) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
@@ -1095,6 +1371,18 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        if self.is_deleted(&old_rel) {
+            return Err(BranchError::Deleted);
+        }
+        // linkat on a directory is the kernel's EPERM to give; staging a
+        // copy for it would leave a meaningless empty dir in the upper.
+        let src_is_dir = crate::sys::fs::statat_in_root(&self.upper, &old_rel, false)
+            .or_else(|_| crate::sys::fs::statat_in_root(&self.workdir, &old_rel, false))
+            .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+            .unwrap_or(false);
+        if src_is_dir {
+            return Ok(false);
+        }
         let _ = self.ensure_cow_copy(&old_rel)?;
         if let Some(p) = parent_rel(&new_rel) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
@@ -1183,8 +1471,15 @@ impl SeccompCowBranch {
             return None;
         }
         // Read the link confined to each layer root so a symlinked parent
-        // component cannot escape the tree (issue #112).
-        for root in [&self.upper, &self.workdir] {
+        // component cannot escape the tree (issue #112). A covered path only
+        // consults the upper: falling through to the lower link would leak
+        // the pre-delete target of a whiteouted-then-recreated entry.
+        let roots: &[&PathBuf] = if self.deleted.covers(&rel) {
+            &[&self.upper]
+        } else {
+            &[&self.upper, &self.workdir]
+        };
+        for root in roots {
             if let Ok(target) = crate::sys::fs::readlink_in_root(root, &rel) {
                 return Some(String::from_utf8_lossy(&target).into_owned());
             }
@@ -1206,7 +1501,11 @@ impl SeccompCowBranch {
             }
             let rel = entry.path().strip_prefix(&self.upper).unwrap();
             let lower = self.workdir.join(rel);
-            let kind = if lower.exists() {
+            // A covered path's lower entry is logically gone, so a re-created
+            // upper entry is an addition even though lower bytes still exist.
+            let kind = if self.deleted.covers(&rel.to_string_lossy()) {
+                ChangeKind::Added
+            } else if lower.exists() {
                 ChangeKind::Modified
             } else {
                 ChangeKind::Added
@@ -1214,8 +1513,17 @@ impl SeccompCowBranch {
             result.push(Change { kind, path: rel.to_path_buf() });
         }
 
-        // Deletions from tracked set
-        for rel_path in &self.deleted {
+        // Deletions from the whiteout set; an entry re-created in the upper
+        // is reported by the upper walk instead.
+        for rel_path in self.deleted.iter() {
+            // Already landed this run: not something the next commit will do.
+            if self.applied_deletions.contains(rel_path) {
+                continue;
+            }
+            // Re-created in the upper: the upper walk reports it instead.
+            if self.upper_has(rel_path) {
+                continue;
+            }
             result.push(Change {
                 kind: ChangeKind::Deleted,
                 path: std::path::PathBuf::from(rel_path),
@@ -1244,7 +1552,9 @@ impl SeccompCowBranch {
                 } else {
                     format!("{}/{}", rel_path, name)
                 };
-                if !self.is_deleted(&child_rel) {
+                // covers, not is_deleted: a covered child re-created in the
+                // upper was already inserted by the upper loop above.
+                if !self.deleted.covers(&child_rel) {
                     entries.insert(name);
                 }
             }
@@ -1277,18 +1587,26 @@ impl SeccompCowBranch {
     /// - **Merge failure** (`ENOSPC`, `EACCES`, an obstructing symlink, ...): the
     ///   lock WAS held and the merge ran; the workdir may be left partially merged
     ///   and this returns `Err`, but the upper is **preserved** holding exactly
-    ///   what did not make it across — each change is dropped from the upper as it
-    ///   lands, so afterwards `changes()` reports the REMAINDER, not the whole run.
-    ///   Call `commit()` again to retry the remainder once the cause is cleared,
-    ///   or `abort()` to discard it. Dropping the branch after a failed commit does
-    ///   NOT reclaim it.
+    ///   the ADDITIONS that did not make it across — each is dropped from the
+    ///   upper as it lands, so the additions remainder is what the upper still
+    ///   holds and what `changes()` still reports. Call `commit()` again to
+    ///   retry the remainder once the cause is cleared, or `abort()` to discard
+    ///   it. Dropping the branch after a failed commit does NOT reclaim it.
     ///
-    /// Deletions are applied first, one at a time, and each is dropped from the
-    /// set as it lands; if any is still outstanding when they have all been
-    /// tried the commit fails there, before a single addition is copied. So a
-    /// failure on this side is not "the workdir is untouched" — every deletion
-    /// that could be applied already has been — it is "no addition was
-    /// published, and what is left in `deleted` is what still has to happen".
+    /// Deletions are applied first, one at a time, and each is recorded applied
+    /// as it lands; if any is still outstanding when they have all been tried
+    /// the commit fails there, before a single addition is copied. So a failure
+    /// on this side is not "the workdir is untouched" — every deletion that
+    /// could be applied already has been — it is "no addition was published,
+    /// and some deletions are still to do".
+    ///
+    /// The deletions remainder is NOT derivable from `changes()`. The whiteout
+    /// set is append-only (a landed deletion has to stay in it, or the path
+    /// would reappear in the merged view), and a deletion whose path the upper
+    /// re-created is folded into the upper walk rather than reported as
+    /// `Deleted`. It is recorded instead in the PRESERVED marker beside the
+    /// upper, refreshed after the deletion loop, which is where
+    /// [`crate::error::TxnError::Merge`] points an operator.
     ///
     /// `Ok(())` from a merge means every recorded change landed: the successful
     /// tail removes the storage, so a change reported as merged but left behind
@@ -1428,12 +1746,15 @@ impl SeccompCowBranch {
         // what a sweep uses to tell them apart (see `list_preserved`).
         self.preserve(PreserveReason::MergeInterrupted);
 
-        // Apply deletions, forgetting each one that is no longer outstanding so
-        // a retry (and `changes()`) sees only what is left to do. Whether the
-        // removal call succeeded is not the test — the entry being gone is —
-        // because a deletion of something the workdir no longer has is already
-        // applied.
-        let pending_deletions: Vec<String> = self.deleted.iter().cloned().collect();
+        // Apply deletions, recording each one that is no longer outstanding so
+        // a retry sees only what is left to do. Whether the removal call
+        // succeeded is not the test — the entry being gone is — because a
+        // deletion of something the workdir no longer has is already applied.
+        //
+        // The whiteout set itself is append-only and cannot carry this: a
+        // landed deletion has to stay in it or the path would reappear in the
+        // merged view. `applied_deletions` is the second question.
+        let pending_deletions: Vec<String> = self.outstanding_deletions().map(str::to_string).collect();
         let mut deletion_failure: Option<String> = None;
         for rel_path in pending_deletions {
             let dest = self.workdir.join(&rel_path);
@@ -1451,7 +1772,7 @@ impl SeccompCowBranch {
                 Ok(())
             };
             if !dest.exists() && !dest.is_symlink() {
-                self.deleted.remove(&rel_path);
+                self.applied_deletions.insert(rel_path.clone());
             } else if deletion_failure.is_none() {
                 deletion_failure = Some(match removal {
                     Err(e) => format!("{}: errno {}", rel_path, e),
@@ -1468,14 +1789,14 @@ impl SeccompCowBranch {
         // The deletions themselves are NOT all-or-nothing. The loop above
         // applies each one in turn, so by the time this fires every deletion
         // that could be applied already has been, and the workdir is not what
-        // it was before the commit. Only the ones still listed in `deleted`
-        // (and reported by `changes()`) are outstanding.
-        if !self.deleted.is_empty() {
+        // it was before the commit. The ones still outstanding are listed in
+        // the refreshed PRESERVED marker beside the upper.
+        let remaining = self.outstanding_deletions().count();
+        if remaining > 0 {
             let detail = deletion_failure.unwrap_or_else(|| "unknown".to_string());
             return Err(BranchError::Operation(format!(
                 "delete: {} deletion(s) could not be applied to the workdir, first: {}",
-                self.deleted.len(),
-                detail
+                remaining, detail
             )));
         }
 
@@ -1685,14 +2006,17 @@ impl SeccompCowBranch {
         body.extend_from_slice(&marker_escape(self.workdir.as_os_str().as_bytes()));
         body.extend_from_slice(b"\nupper=");
         body.extend_from_slice(&marker_escape(self.upper.as_os_str().as_bytes()));
-        // One line per deletion, sorted so the marker is byte-stable for the
-        // same change set. This is the set as it stood when `preserve` was
-        // called — `commit()` calls it before applying any of them — so a
-        // recovery may re-apply a deletion that has since landed. That is a
-        // no-op, and it is the safe direction: the other one loses a deletion.
-        let mut deletions: Vec<&String> = self.deleted.iter().collect();
-        deletions.sort();
-        for rel in deletions {
+        // One line per OUTSTANDING deletion, in the whiteout set's own (sorted)
+        // order so the marker is byte-stable for the same change set. These are
+        // the deletions still to do as of this write: `commit()` refreshes the
+        // marker after its deletion loop, so what is listed here is what a
+        // recovery would still have to apply.
+        //
+        // The durable whiteout set in `deleted.log` is a DIFFERENT question and
+        // must not be used here. It is the full history, including deletions
+        // that already landed; re-applying one of those over a path the upper
+        // re-created and the merge already drained destroys work that landed.
+        for rel in self.outstanding_deletions() {
             body.extend_from_slice(b"\ndeleted=");
             body.extend_from_slice(&marker_escape(rel.as_bytes()));
         }
@@ -2608,11 +2932,10 @@ mod tests {
     #[test]
     fn test_quota_handle_open_create_denied() {
         let (workdir, storage) = setup_workdir();
-        // O_CREAT on a deleted file triggers ensure_cow_copy.
+        // O_CREAT on an existing (not deleted) file triggers the copy-up,
+        // which must fail when the 5-byte file exceeds the 4-byte quota.
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
         let path = abs(&branch, "existing.txt");
-        branch.mark_deleted("existing.txt");
-        // O_CREAT on a deleted path — tries to COW-copy the 5-byte file, should fail.
         let err = branch.handle_open(&path, O_CREAT).unwrap_err();
         assert!(matches!(err, BranchError::QuotaExceeded));
     }
@@ -2661,7 +2984,7 @@ mod tests {
         let old = abs(&branch, "existing.txt");
         let new = abs(&branch, "renamed.txt");
         let err = branch.handle_rename(&old, &new).unwrap_err();
-        assert!(matches!(err, BranchError::QuotaExceeded));
+        assert_eq!(err, libc::ENOSPC);
     }
 
     #[test]
@@ -3184,6 +3507,762 @@ mod tests {
         );
     }
 
+    #[test]
+    fn write_open_in_unreadable_dir_virtualizes() {
+        // The supervisor may not be able to stat inside a 0o000 lower dir
+        // (as with /root under learn's workdir="/"). The write must still
+        // virtualize onto an empty upper file instead of erroring out and
+        // letting the child hit the real permission wall.
+        use std::os::unix::fs::PermissionsExt;
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("locked")).unwrap();
+        fs::write(workdir.path().join("locked/f"), "x").unwrap();
+        let locked = workdir.path().join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let result = branch.ensure_cow_copy("locked/f");
+        // Restore before asserting so the tempdir can be cleaned up either way.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let upper = result.unwrap();
+        assert_eq!(upper, branch.upper_dir().join("locked/f"));
+        // Nothing was readable to copy, so the plan is a fresh (absent or
+        // empty) upper entry, never the lower bytes and never an error.
+        assert!(!upper.exists() || fs::read(&upper).unwrap().is_empty());
+    }
+
+    // ---- Subtree whiteout semantics (issues #159/#160/#161 family) ----
+
+    #[test]
+    fn deleted_dir_hides_children() {
+        // Issue #159: a whiteout must cover the subtree, not just the path.
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/secret.txt"), "SECRET").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("d");
+
+        assert!(branch.is_deleted("d"));
+        assert!(branch.is_deleted("d/secret.txt"));
+        assert!(branch.list_merged_dir("d").is_empty());
+        assert!(matches!(
+            branch.handle_open(&format!("{}/d/secret.txt", branch.workdir_str()), 0),
+            Err(BranchError::Deleted)
+        ));
+        assert!(branch
+            .handle_stat(&format!("{}/d/secret.txt", branch.workdir_str()))
+            .is_none());
+        // Sibling boundary: d2 is not covered by the d whiteout.
+        fs::write(workdir.path().join("d2"), "kept").unwrap();
+        assert!(!branch.is_deleted("d2"));
+    }
+
+    #[test]
+    fn o_directory_open_of_whiteouted_dir_reports_deleted() {
+        // #159 review follow-up: opendir takes the O_DIRECTORY early-return,
+        // which used to skip the whiteout check entirely; the child got a
+        // live fd on the surviving lower directory (and could fstat its
+        // inode) where stat on the same path already said ENOENT.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/x"), "x").unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("d");
+        let path = format!("{}/d", wd.display());
+        let dirflag = libc::O_DIRECTORY as u64;
+        assert!(matches!(
+            branch.handle_open(&path, dirflag),
+            Err(BranchError::Deleted)
+        ));
+        assert!(matches!(
+            branch.prepare_open(&path, dirflag),
+            Ok(CowOpenPlan::Deleted)
+        ));
+        // Re-created in the upper: the shadow makes it visible again and the
+        // open goes back to the normal resolution.
+        assert!(branch.handle_mkdir(&path).unwrap());
+        assert!(matches!(branch.handle_open(&path, dirflag), Ok(None)));
+        assert!(!matches!(
+            branch.prepare_open(&path, dirflag),
+            Ok(CowOpenPlan::Deleted)
+        ));
+    }
+
+    #[test]
+    fn write_under_deleted_dir_does_not_republish_on_commit() {
+        // Issue #159 integrity half: a write-open under the deleted directory
+        // must not resurrect the deleted file's bytes into the commit.
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/secret.txt"), "SECRET").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("d");
+
+        let flags = (libc::O_WRONLY | libc::O_CREAT) as u64;
+        let upper = branch
+            .handle_open(&format!("{}/d/secret.txt", branch.workdir_str()), flags)
+            .unwrap()
+            .expect("create over whiteout resolves into upper");
+        // The plan points at the upper path; the child's O_CREAT would create
+        // it empty. Simulate that create with fresh bytes.
+        fs::write(&upper, "NEW").unwrap();
+
+        branch.commit().unwrap();
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("d/secret.txt")).unwrap(),
+            "NEW"
+        );
+    }
+
+    #[test]
+    fn create_over_deleted_file_starts_empty() {
+        // Same failure class as #159: O_CREAT on a whiteouted file used to
+        // copy the pre-delete lower bytes up. It must start fresh.
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("existing.txt");
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        assert!(!upper.exists() || fs::read(&upper).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mkdir_over_deleted_dir_is_opaque() {
+        // rmdir d; mkdir d must yield an EMPTY d: the old contents stay hidden.
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/old.txt"), "old").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("d");
+        let wd = branch.workdir_str().to_string();
+        assert!(branch.handle_mkdir(&format!("{}/d", wd)).unwrap());
+
+        assert!(!branch.is_deleted("d"));
+        assert!(branch.is_deleted("d/old.txt"));
+        assert!(branch.list_merged_dir("d").is_empty());
+
+        branch.commit().unwrap();
+        assert!(workdir.path().join("d").is_dir());
+        assert!(!workdir.path().join("d/old.txt").exists());
+    }
+
+    #[test]
+    fn changes_skips_shadowed_whiteouts() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("existing.txt");
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        fs::write(&upper, "recreated").unwrap();
+        let changes = branch.changes().unwrap();
+        // The recreated file is a single Added entry, not Deleted + Modified.
+        let for_path: Vec<_> = changes
+            .iter()
+            .filter(|c| c.path == std::path::Path::new("existing.txt"))
+            .collect();
+        assert_eq!(for_path.len(), 1);
+        assert_eq!(for_path[0].kind, crate::dry_run::ChangeKind::Added);
+    }
+
+    #[test]
+    fn rmdir_nonempty_gives_enotempty() {
+        // Issue #161: rmdir must consult the merged view, as the kernel would.
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/inner.txt"), "DATA").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/d", wd), true),
+            Err(libc::ENOTEMPTY)
+        );
+        assert!(workdir.path().join("d/inner.txt").exists());
+        branch.commit().unwrap();
+        assert!(workdir.path().join("d/inner.txt").exists());
+    }
+
+    #[test]
+    fn rmdir_succeeds_after_draining_merged_view() {
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/inner.txt"), "DATA").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/d/inner.txt", wd), false),
+            Ok(true)
+        );
+        assert_eq!(branch.handle_unlink(&format!("{}/d", wd), true), Ok(true));
+        branch.commit().unwrap();
+        assert!(!workdir.path().join("d").exists());
+    }
+
+    #[test]
+    fn rmdir_nonempty_in_upper_only_gives_enotempty() {
+        // Emptiness is about the merged view: content that exists only in
+        // the upper still blocks the rmdir.
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+        assert!(branch.handle_mkdir(&format!("{}/newdir", wd)).unwrap());
+        fs::write(branch.upper_dir().join("newdir/f.txt"), "x").unwrap();
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/newdir", wd), true),
+            Err(libc::ENOTEMPTY)
+        );
+    }
+
+    #[test]
+    fn unlink_hidden_path_gives_enoent() {
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/inner.txt"), "DATA").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("d");
+        let wd = branch.workdir_str().to_string();
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/d/inner.txt", wd), false),
+            Err(libc::ENOENT)
+        );
+    }
+
+    #[test]
+    fn rename_lower_dir_preserves_contents() {
+        // Issue #160: renaming a lower-only directory must not destroy it.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/inner.txt"), "PRECIOUS").unwrap();
+        fs::create_dir(wd.join("d/sub")).unwrap();
+        fs::write(wd.join("d/sub/deep.txt"), "DEEP").unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert!(branch
+            .handle_rename(&format!("{}/d", wd.display()), &format!("{}/d2", wd.display()))
+            .unwrap());
+
+        // Merged view before commit: d hidden, d2 holds the tree.
+        assert!(branch.is_deleted("d"));
+        assert_eq!(
+            branch.list_merged_dir("d2"),
+            vec!["inner.txt".to_string(), "sub".to_string()]
+        );
+
+        branch.commit().unwrap();
+        assert!(!wd.join("d").exists());
+        assert_eq!(fs::read_to_string(wd.join("d2/inner.txt")).unwrap(), "PRECIOUS");
+        assert_eq!(fs::read_to_string(wd.join("d2/sub/deep.txt")).unwrap(), "DEEP");
+    }
+
+    #[test]
+    fn rename_dir_skips_deleted_children() {
+        // A child already whiteouted must not reappear under the new name.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/keep.txt"), "keep").unwrap();
+        fs::write(wd.join("d/gone.txt"), "gone").unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/d/gone.txt", wd.display()), false),
+            Ok(true)
+        );
+        assert!(branch
+            .handle_rename(&format!("{}/d", wd.display()), &format!("{}/d2", wd.display()))
+            .unwrap());
+        branch.commit().unwrap();
+        assert!(wd.join("d2/keep.txt").exists());
+        assert!(!wd.join("d2/gone.txt").exists());
+    }
+
+    #[test]
+    fn rename_hidden_source_gives_deleted() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("existing.txt");
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/moved.txt", wd.display())
+            ),
+            Err(libc::ENOENT)
+        );
+    }
+
+    #[test]
+    fn rename_onto_nonempty_dir_is_enotempty() {
+        // #160 review follow-up: with lower-only a/{a1} and b/{b1}, a
+        // dir-onto-dir rename must refuse with ENOTEMPTY, never publish the
+        // union b = {a1, b1}.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("a")).unwrap();
+        fs::write(wd.join("a/a1"), "A").unwrap();
+        fs::create_dir(wd.join("b")).unwrap();
+        fs::write(wd.join("b/b1"), "B").unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(&format!("{}/a", wd.display()), &format!("{}/b", wd.display())),
+            Err(libc::ENOTEMPTY)
+        );
+        // The refusal must leave no trace: nothing staged, nothing whiteouted.
+        assert!(!branch.is_deleted("a"));
+        assert_eq!(branch.list_merged_dir("b"), vec!["b1".to_string()]);
+        branch.commit().unwrap();
+        assert_eq!(fs::read_to_string(wd.join("a/a1")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(wd.join("b/b1")).unwrap(), "B");
+        assert!(!wd.join("b/a1").exists());
+    }
+
+    #[test]
+    fn rename_onto_empty_dir_replaces() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("a")).unwrap();
+        fs::write(wd.join("a/a1"), "A").unwrap();
+        fs::create_dir(wd.join("b")).unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(&format!("{}/a", wd.display()), &format!("{}/b", wd.display())),
+            Ok(true)
+        );
+        assert!(branch.is_deleted("a"));
+        assert_eq!(branch.list_merged_dir("b"), vec!["a1".to_string()]);
+        branch.commit().unwrap();
+        assert!(!wd.join("a").exists());
+        assert_eq!(fs::read_to_string(wd.join("b/a1")).unwrap(), "A");
+    }
+
+    #[test]
+    fn rename_onto_lower_file_replaces_not_merges() {
+        // The destination's lower bytes must be gone after commit, replaced
+        // by the renamed entry, and the source name must stop existing.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::write(wd.join("target.txt"), "OLD").unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/target.txt", wd.display())
+            ),
+            Ok(true)
+        );
+        branch.commit().unwrap();
+        assert!(!wd.join("existing.txt").exists());
+        assert_eq!(fs::read_to_string(wd.join("target.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn rename_onto_lower_symlink_dest_commits_as_regular_file() {
+        // The discriminating case for the destination whiteout: an empty-dir
+        // or regular-file destination commits identical bytes whether the
+        // rename replaces or merges, so only a special-file destination can
+        // tell the two apart. Without the whiteout the lower symlink survives
+        // into commit, whose O_NOFOLLOW publish refuses to write through it
+        // (and a FIFO destination would hang it, the #158 class).
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::write(wd.join("real.txt"), "REAL").unwrap();
+        std::os::unix::fs::symlink("real.txt", wd.join("dest")).unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/dest", wd.display())
+            ),
+            Ok(true)
+        );
+        branch.commit().unwrap();
+
+        let meta = fs::symlink_metadata(wd.join("dest")).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "dest must be the renamed regular file, not the surviving symlink"
+        );
+        assert_eq!(fs::read_to_string(wd.join("dest")).unwrap(), "hello");
+        assert!(!wd.join("existing.txt").exists());
+        // The link's old target is untouched: the rename replaced the link
+        // itself and never wrote through it.
+        assert_eq!(fs::read_to_string(wd.join("real.txt")).unwrap(), "REAL");
+    }
+
+    #[test]
+    fn rename_type_mismatch_refused() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        // File onto directory: EISDIR. Directory onto file: ENOTDIR.
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/d", wd.display())
+            ),
+            Err(libc::EISDIR)
+        );
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/d", wd.display()),
+                &format!("{}/existing.txt", wd.display())
+            ),
+            Err(libc::ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn rename_onto_whiteouted_dest_is_plain_rename() {
+        // A whiteouted destination is absent in the merged view; the rename
+        // must succeed and expose only the renamed content.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("b")).unwrap();
+        fs::write(wd.join("b/b1"), "B").unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(branch.handle_unlink(&format!("{}/b/b1", wd.display()), false), Ok(true));
+        assert_eq!(branch.handle_unlink(&format!("{}/b", wd.display()), true), Ok(true));
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/b", wd.display())
+            ),
+            Ok(true)
+        );
+        branch.commit().unwrap();
+        let meta = fs::metadata(wd.join("b")).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(fs::read_to_string(wd.join("b")).unwrap(), "hello");
+        assert!(!wd.join("existing.txt").exists());
+    }
+
+    #[test]
+    fn rename_absent_source_is_enoent() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/nope", wd.display()),
+                &format!("{}/dest", wd.display())
+            ),
+            Err(libc::ENOENT)
+        );
+    }
+
+    #[test]
+    fn rename_staging_failure_fails_rename_and_rolls_back() {
+        // A mid-tree staging error used to be swallowed, after which the
+        // source was whiteouted anyway and the untraversed children were
+        // lost at commit. The rename must fail, leave the merged view
+        // untouched, and leave no partially staged destination behind.
+        use std::os::unix::fs::PermissionsExt;
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/top.txt"), "top").unwrap();
+        fs::create_dir(wd.join("d/inner")).unwrap();
+        fs::write(wd.join("d/inner/deep.txt"), "deep").unwrap();
+        fs::set_permissions(wd.join("d/inner"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        let result = branch.handle_rename(
+            &format!("{}/d", wd.display()),
+            &format!("{}/moved", wd.display()),
+        );
+        fs::set_permissions(wd.join("d/inner"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(result, Err(libc::EACCES));
+        assert!(!branch.is_deleted("d"), "failed rename must not whiteout the source");
+        assert!(!branch.upper_dir().join("d").exists(), "partial staging left behind");
+        let merged = branch.list_merged_dir("d");
+        assert!(merged.contains(&"inner".to_string()));
+        assert!(merged.contains(&"top.txt".to_string()));
+        branch.commit().unwrap();
+        assert_eq!(fs::read_to_string(wd.join("d/inner/deep.txt")).unwrap(), "deep");
+    }
+
+    #[test]
+    fn rename_quota_failure_leaves_no_partial_staging() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/f1"), vec![b'x'; 50]).unwrap();
+        // Quota fits the staged directory (4096) but not the file after it.
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 4100).unwrap();
+        assert_eq!(
+            branch.handle_rename(&format!("{}/d", wd.display()), &format!("{}/m", wd.display())),
+            Err(libc::ENOSPC)
+        );
+        assert!(!branch.is_deleted("d"));
+        assert!(!branch.upper_dir().join("d").exists(), "partial staging left behind");
+        // The rollback must also return the reserved quota: a small write
+        // elsewhere still fits.
+        assert!(branch.ensure_cow_copy("existing.txt").is_ok());
+    }
+
+    #[test]
+    fn rename_deep_tree_stages_iteratively() {
+        // The staging walk is a worklist, not recursion: child-controlled
+        // directory depth must not become supervisor stack depth.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        let mut rel = String::from("d");
+        fs::create_dir(wd.join(&rel)).unwrap();
+        for _ in 0..400 {
+            rel.push_str("/d");
+            fs::create_dir(wd.join(&rel)).unwrap();
+        }
+        fs::write(wd.join(format!("{}/leaf.txt", rel)), "LEAF").unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_rename(&format!("{}/d", wd.display()), &format!("{}/m", wd.display())),
+            Ok(true)
+        );
+        branch.commit().unwrap();
+        let deep = format!("m{}", &rel[1..]);
+        assert_eq!(fs::read_to_string(wd.join(format!("{}/leaf.txt", deep))).unwrap(), "LEAF");
+        assert!(!wd.join("d").exists());
+    }
+
+    #[test]
+    fn rename_file_still_works() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert!(branch
+            .handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/renamed.txt", wd.display())
+            )
+            .unwrap());
+        branch.commit().unwrap();
+        assert!(!wd.join("existing.txt").exists());
+        assert_eq!(fs::read_to_string(wd.join("renamed.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn link_on_directory_falls_through() {
+        // linkat on a directory is the kernel's EPERM to give; the branch
+        // must not stage an empty-dir copy for it.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch
+                .handle_link(&format!("{}/d", wd.display()), &format!("{}/d2", wd.display()))
+                .unwrap(),
+            false
+        );
+        assert!(!branch.upper_dir().join("d").exists());
+    }
+
+    #[test]
+    fn copy_up_of_fifo_does_not_block() {
+        // Issue #158: opening a FIFO O_RDONLY blocks until a writer appears,
+        // so the copy-up path must never stream a non-regular file. The probe
+        // runs on a thread with a timeout so a regression hangs the test, not
+        // the suite.
+        let (workdir, storage) = setup_workdir();
+        let fifo = workdir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        let wd = workdir.path().to_path_buf();
+        let sd = storage.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut b = SeccompCowBranch::create(&wd, Some(&sd), 0).unwrap();
+            let _ = tx.send(b.ensure_cow_copy("pipe").map(|p| fs::read(p).map(|b| b.len())));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            // The FIFO is virtualized as an empty regular stub in the upper,
+            // created without ever opening the FIFO itself.
+            Ok(Ok(Ok(0))) => {}
+            Ok(other) => panic!("expected an empty upper stub for a FIFO, got {:?}", other),
+            Err(_) => panic!("copy-up of a FIFO hung"),
+        }
+    }
+
+    #[test]
+    fn write_open_of_fifo_virtualizes_to_upper_stub() {
+        // A write-open of a FIFO under the COW tree keeps the virtualization
+        // contract (`> /dev/null` in a learn-mode tree must not need real
+        // write permission on /dev), and must not block the supervisor.
+        let (workdir, storage) = setup_workdir();
+        let fifo = workdir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+        let flags = libc::O_WRONLY as u64;
+        let resolved = branch.handle_open(&format!("{}/pipe", wd), flags).unwrap();
+        assert_eq!(resolved, Some(branch.upper_dir().join("pipe")));
+        let meta = fs::metadata(branch.upper_dir().join("pipe")).unwrap();
+        assert!(meta.file_type().is_file(), "upper stub must be a regular file");
+        assert_eq!(meta.len(), 0);
+    }
+
+    #[test]
+    fn commit_replaces_lower_fifo_with_stub_bytes() {
+        // The publish half of issue #158: the stub must whiteout the lower
+        // FIFO so commit's deletion pass unlinks it. Without the whiteout
+        // the publish walk O_WRONLY-opens the surviving FIFO as its
+        // destination and blocks on a reader that never comes. Commit runs
+        // on a thread with a timeout so a regression fails the test
+        // instead of hanging the suite.
+        let (workdir, storage) = setup_workdir();
+        let fifo = workdir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        let wd = workdir.path().to_path_buf();
+        let sd = storage.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut b = SeccompCowBranch::create(&wd, Some(&sd), 0).unwrap();
+            let wds = b.workdir_str().to_string();
+            let resolved = b
+                .handle_open(&format!("{}/pipe", wds), libc::O_WRONLY as u64)
+                .unwrap()
+                .unwrap();
+            fs::write(&resolved, "published").unwrap();
+            let _ = tx.send(b.commit());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("commit failed: {:?}", e),
+            Err(_) => panic!("commit hung on the lower FIFO (issue #158)"),
+        }
+        let meta = fs::symlink_metadata(workdir.path().join("pipe")).unwrap();
+        assert!(meta.file_type().is_file(), "lower FIFO must be replaced by the stub");
+        assert_eq!(fs::read_to_string(workdir.path().join("pipe")).unwrap(), "published");
+    }
+
+    #[test]
+    fn chmod_of_fifo_stays_in_upper() {
+        let (workdir, storage) = setup_workdir();
+        let fifo = workdir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+        assert_eq!(branch.handle_chmod(&format!("{}/pipe", wd), 0o600).unwrap(), true);
+        // The chmod landed on the upper stub, not the real FIFO.
+        let lower_mode = fs::metadata(&fifo).unwrap().permissions();
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&lower_mode) & 0o777, 0o644);
+    }
+
+    #[test]
+    fn execute_copy_guards_against_type_race() {
+        // Defense in depth: if the entry changes type between prepare_copy's
+        // lstat and execute_copy's open, the O_NONBLOCK+fstat guard must
+        // catch it and produce an empty destination instead of streaming.
+        let (workdir, storage) = setup_workdir();
+        let fifo = workdir.path().join("race");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let workdir_root = branch.workdir().to_path_buf();
+        let upper_root = branch.upper_dir().to_path_buf();
+        SeccompCowBranch::execute_copy(&workdir_root, &upper_root, "race").unwrap();
+        assert_eq!(fs::read(upper_root.join("race")).unwrap(), b"");
+    }
+
+    /// Recursively snapshot the merged view as (rel path -> Option<bytes>),
+    /// None for directories. This is what the child observes during the run.
+    fn merged_snapshot(
+        branch: &SeccompCowBranch,
+        rel: &str,
+        out: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    ) {
+        for name in branch.list_merged_dir(rel) {
+            let child = if rel == "." { name.clone() } else { format!("{}/{}", rel, name) };
+            let resolved = branch.resolve_read(&child);
+            if resolved.is_dir() {
+                out.insert(child.clone(), None);
+                merged_snapshot(branch, &child, out);
+            } else if resolved.is_file() {
+                out.insert(child.clone(), Some(fs::read(&resolved).unwrap()));
+            }
+        }
+    }
+
+    /// Snapshot a real directory tree in the same shape.
+    fn dir_snapshot(
+        root: &std::path::Path,
+        rel: &str,
+        out: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    ) {
+        let dir = if rel == "." { root.to_path_buf() } else { root.join(rel) };
+        for e in fs::read_dir(dir).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let child = if rel == "." { name } else { format!("{}/{}", rel, name) };
+            let p = e.path();
+            if p.is_dir() {
+                out.insert(child.clone(), None);
+                dir_snapshot(root, &child, out);
+            } else if p.is_file() {
+                out.insert(child.clone(), Some(fs::read(&p).unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn commit_reproduces_merged_view() {
+        // The invariant behind #159/#160/#161: what the child observed during
+        // the run is exactly what commit() publishes.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/a.txt"), "A").unwrap();
+        fs::write(wd.join("d/b.txt"), "B").unwrap();
+        fs::create_dir(wd.join("e")).unwrap();
+        fs::write(wd.join("e/keep.txt"), "K").unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        let w = |r: &str| format!("{}/{}", wd.display(), r);
+
+        // A mix of the operations the four issues cover.
+        let up = branch
+            .handle_open(&w("new.txt"), (libc::O_WRONLY | libc::O_CREAT) as u64)
+            .unwrap()
+            .unwrap();
+        fs::write(&up, "NEW").unwrap();
+        let up = branch
+            .handle_open(&w("existing.txt"), libc::O_WRONLY as u64)
+            .unwrap()
+            .unwrap();
+        fs::write(&up, "MODIFIED").unwrap();
+        assert_eq!(branch.handle_unlink(&w("d/a.txt"), false), Ok(true));
+        assert!(branch.handle_rename(&w("d"), &w("moved")).unwrap());
+        assert_eq!(branch.handle_unlink(&w("subdir/nested.txt"), false), Ok(true));
+        assert_eq!(branch.handle_unlink(&w("subdir"), true), Ok(true));
+
+        let mut merged = std::collections::BTreeMap::new();
+        merged_snapshot(&branch, ".", &mut merged);
+        branch.commit().unwrap();
+        let mut committed = std::collections::BTreeMap::new();
+        dir_snapshot(&wd, ".", &mut committed);
+        assert_eq!(merged, committed);
+    }
+
+    #[test]
+    fn deletion_log_written_beside_upper() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("existing.txt");
+        let log = branch.upper_dir().parent().unwrap().join("deleted.log");
+        let replayed = crate::cow::deletions::DeletionSet::load(&log);
+        assert!(replayed.covers("existing.txt"));
+    }
+
     // ---- Deletions: what the merge does with each shape of workdir entry ----
 
     /// A deletion of a symlink that points at a directory must unlink the LINK
@@ -3272,11 +4351,16 @@ mod tests {
     }
 
     /// A deletion of something the workdir no longer has is ALREADY APPLIED: it
-    /// is dropped from the set and the commit succeeds.
+    /// leaves the outstanding set and the commit succeeds.
     ///
     /// The test is "is the entry gone", not "did the removal call succeed" —
     /// which is what makes a retry after a partly-applied merge converge
     /// instead of failing forever on the deletions that landed the first time.
+    ///
+    /// It asserts on `outstanding_deletions`, not `is_deleted`: the whiteout
+    /// set is append-only, so `is_deleted` (`covers` minus upper presence) stays
+    /// true forever by design. The outstanding set is the one that carries the
+    /// "still to do" contract.
     #[test]
     fn a_deletion_of_something_already_absent_counts_as_applied() {
         let workdir = tempfile::tempdir().unwrap();
@@ -3287,38 +4371,41 @@ mod tests {
         branch
             .commit()
             .expect("a deletion of an absent path is already applied");
-        assert!(
-            !branch.is_deleted("never-existed.txt"),
-            "an applied deletion must be dropped from the set, or a retry re-runs it forever",
+        assert_eq!(
+            branch.outstanding_deletions().count(),
+            0,
+            "an applied deletion must leave the outstanding set, or a retry re-runs it forever",
         );
     }
 
-    /// A directory and everything recorded under it must all apply, in whatever
-    /// order they come out of the set.
+    /// A directory and everything recorded under it must all apply.
     ///
-    /// `deleted` is a `HashSet`, so the iteration order genuinely varies per
-    /// run; only order-INDEPENDENCE is assertable. It holds because each entry
-    /// is tested for absence rather than for a successful removal — the
-    /// recursive delete of the parent takes the children with it, and they are
-    /// then already applied whichever way round they are visited.
+    /// The whiteout set is a `BTreeSet` and its `iter()` is sorted, so the
+    /// visit order is deterministic and parent-first: "d" < "d/e" <
+    /// "d/e/f.txt". The parent's recursive delete therefore takes the children
+    /// with it, and each child is then recorded APPLIED through the "the entry
+    /// is gone" branch rather than through a successful removal call — which is
+    /// what keeps them out of the outstanding set and off the commit's guard.
     #[test]
     fn deletions_of_a_directory_and_its_children_apply_whatever_the_order() {
-        for _ in 0..8 {
-            let workdir = tempfile::tempdir().unwrap();
-            let storage = tempfile::tempdir().unwrap();
-            fs::create_dir_all(workdir.path().join("d/e")).unwrap();
-            fs::write(workdir.path().join("d/e/f.txt"), "doomed").unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workdir.path().join("d/e")).unwrap();
+        fs::write(workdir.path().join("d/e/f.txt"), "doomed").unwrap();
 
-            let mut branch =
-                SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-            branch.mark_deleted("d");
-            branch.mark_deleted("d/e");
-            branch.mark_deleted("d/e/f.txt");
-            branch
-                .commit()
-                .expect("overlapping deletions must apply in any order");
-            assert!(!workdir.path().join("d").exists(), "the whole subtree must be gone");
-        }
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("d");
+        branch.mark_deleted("d/e");
+        branch.mark_deleted("d/e/f.txt");
+        branch
+            .commit()
+            .expect("overlapping deletions must all apply");
+        assert!(!workdir.path().join("d").exists(), "the whole subtree must be gone");
+        assert_eq!(
+            branch.outstanding_deletions().count(),
+            0,
+            "a child swept away by its parent's recursive delete must count as applied",
+        );
     }
 
     /// Deletions run before additions, so `rm -rf d` followed by writing

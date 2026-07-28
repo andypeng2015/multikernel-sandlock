@@ -24,14 +24,22 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      # Ubuntu 24.04 images restrict unprivileged user namespaces via
+      # AppArmor: unshare(CLONE_NEWUSER) yields a capability-less namespace,
+      # the child's uid_map write fails, and the uid-mapping tests see the
+      # overflow uid (65534) instead of the mapped one.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Build
         run: cargo build --release
 
-      - name: Run unit tests
-        run: cargo test --release --lib -- --test-threads=1
-
-      - name: Run integration tests
-        run: cargo test --release --test integration -- --test-threads=1
+      # timeout-minutes: the suite finishes in a few minutes; a hang here is
+      # the known supervisor wedge under load, and should fail fast rather
+      # than hold the job for the 6-hour default.
+      - name: Run all tests
+        timeout-minutes: 20
+        run: cargo test --release --workspace --no-fail-fast -- --test-threads=1
 
   rust-low-abi:
     name: Rust low-ABI (ubuntu-22.04)

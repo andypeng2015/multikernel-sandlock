@@ -118,6 +118,9 @@ pub enum BranchError {
     #[error("disk quota exceeded")]
     QuotaExceeded,
 
+    #[error("operation denied by policy")]
+    Denied,
+
     #[error("file already exists")]
     Exists,
 

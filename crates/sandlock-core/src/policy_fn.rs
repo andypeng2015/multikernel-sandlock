@@ -118,8 +118,12 @@ pub struct SyscallEvent {
     /// `O_WRONLY`, `O_CREAT`). `None` for non-openat syscalls.
     pub flags: Option<u64>,
     /// Socket protocol for network syscalls (connect, sendto, sendmsg, sendmmsg).
-    /// One of "tcp", "udp", "icmp". `None` for non-network syscalls or if
+    /// One of "tcp", "udp", "icmp". `None` for non-network syscalls or when
+    /// protocol resolution fails.
     pub protocol: Option<String>,
+    /// Socket file descriptor for network syscalls (connect, send*, bind).
+    /// `None` for non-network syscalls.
+    pub fd: Option<i64>,
 }
 
 impl SyscallEvent {
@@ -318,11 +322,14 @@ impl Default for Verdict {
 
 /// A callback function invoked for each intercepted syscall.
 ///
-/// Called synchronously on a dedicated thread. For `execve` syscalls,
-/// the child process is held until the callback returns.
+/// Called synchronously on a dedicated thread. For held syscalls the child
+/// process is blocked until the callback returns.
 ///
-/// Return `Verdict::Deny` to block the current syscall. Only effective
-/// for held syscalls (execve/execveat) and network syscalls (connect/sendto).
+/// Return `Verdict::Deny` to block the current syscall. Only effective for
+/// held syscalls: exec (execve/execveat), open (open/openat/openat2), and
+/// network (connect/bind/sendto/sendmsg/sendmmsg). Filesystem-mutation
+/// events (mkdir/unlink/symlink/link/rename/truncate) are observation-only;
+/// their verdicts are ignored. Use `fs_deny` to block paths.
 ///
 /// Wrapped in `Arc` so that `Policy` remains `Clone`.
 pub type PolicyCallback = Arc<dyn Fn(SyscallEvent, &mut PolicyContext) -> Verdict + Send + Sync + 'static>;
@@ -502,6 +509,7 @@ mod tests {
             path2: None,
             flags: None,
             protocol: None,
+            fd: None,
         };
         assert!(event.argv_contains("python3"));
         assert!(event.argv_contains("-c"));
@@ -525,6 +533,7 @@ mod tests {
             path2: None,
             flags: None,
             protocol: None,
+            fd: None,
         };
         assert!(!event.argv_contains("anything"));
     }

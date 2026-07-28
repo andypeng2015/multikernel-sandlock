@@ -104,6 +104,7 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub max_memory: Option<ByteSize>,
 
+    /// Peak concurrent process limit; threads do not count [default: 64]
     #[cfg_attr(feature = "cli", arg(short = 'P', long = "max-processes"))]
     pub max_processes: Option<u32>,
 
@@ -217,7 +218,6 @@ pub struct SandboxBuilder {
     // COW fork work function: runs in each COW clone.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub(crate) work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
-
 }
 
 impl std::fmt::Debug for SandboxBuilder {

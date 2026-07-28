@@ -75,3 +75,6 @@ mod test_restore_stub;
 
 #[path = "integration/test_popen.rs"]
 mod test_popen;
+
+#[path = "integration/test_tty.rs"]
+mod test_tty;

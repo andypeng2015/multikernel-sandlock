@@ -316,6 +316,7 @@ pub(crate) async fn handle_cow_open(
 enum CowWriteOp {
     Unlink { path: String, is_dir: bool },
     Mkdir { path: String },
+    Mknod { path: String, mode: u32, dev: u64 },
     Rename { old_path: String, new_path: String },
     Symlink { target: String, linkpath: String },
     Link { old_path: String, new_path: String },
@@ -329,6 +330,7 @@ impl CowWriteOp {
         match self {
             CowWriteOp::Unlink { path, .. }
             | CowWriteOp::Mkdir { path }
+            | CowWriteOp::Mknod { path, .. }
             | CowWriteOp::Chmod { path, .. }
             | CowWriteOp::Chown { path, .. }
             | CowWriteOp::Truncate { path, .. } => {
@@ -391,6 +393,14 @@ fn parse_cow_write(
             path: read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?,
         });
     }
+    if nr == libc::SYS_mknodat {
+        // mknodat(dirfd, pathname, mode, dev)
+        return Some(CowWriteOp::Mknod {
+            path: read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?,
+            mode: notif.data.args[2] as u32,
+            dev:  notif.data.args[3],
+        });
+    }
     if nr == libc::SYS_renameat2 {
         let old_path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
         let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
@@ -434,6 +444,14 @@ fn parse_cow_write(
             path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
         });
     }
+    if Some(nr) == arch::sys_mknod() {
+        // mknod(pathname, mode, dev)
+        return Some(CowWriteOp::Mknod {
+            path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
+            mode: notif.data.args[1] as u32,
+            dev:  notif.data.args[2],
+        });
+    }
     if Some(nr) == arch::sys_rename() {
         let old_path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
         let new_path = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
@@ -472,11 +490,15 @@ fn cow_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
     match r {
         Ok(true) => NotifAction::ReturnValue(0),
         Err(crate::error::BranchError::QuotaExceeded) => NotifAction::Errno(libc::ENOSPC),
+        Err(crate::error::BranchError::Denied) => NotifAction::Errno(libc::EPERM),
+        // Whiteouted source: Continue would let the kernel act on the lower
+        // entry, which still exists with its pre-delete content.
+        Err(crate::error::BranchError::Deleted) => NotifAction::Errno(libc::ENOENT),
         _ => NotifAction::Continue,
     }
 }
 
-/// Map an unlink result (returns errno directly) to a NotifAction.
+/// Map an errno-style handler result (unlink, rename) to a NotifAction.
 fn unlink_result(r: Result<bool, i32>) -> NotifAction {
     match r {
         Ok(true) => NotifAction::ReturnValue(0),
@@ -603,9 +625,13 @@ pub(crate) async fn handle_cow_write(
             if !cow.matches(path) { return NotifAction::Continue; }
             cow_result(cow.handle_mkdir(path))
         }
+        CowWriteOp::Mknod { ref path, mode, dev } => {
+            if !cow.matches(path) { return NotifAction::Continue; }
+            cow_result(cow.handle_mknod(path, mode, dev))
+        }
         CowWriteOp::Rename { ref old_path, ref new_path } => {
             if !cow.matches(old_path) { return NotifAction::Continue; }
-            cow_result(cow.handle_rename(old_path, new_path))
+            unlink_result(cow.handle_rename(old_path, new_path))
         }
         CowWriteOp::Symlink { ref target, ref linkpath } => {
             if !cow.matches(linkpath) { return NotifAction::Continue; }
@@ -787,9 +813,25 @@ pub(crate) async fn handle_cow_stat(
 
     // newfstatat(dirfd, pathname, statbuf, flags)
     // faccessat(dirfd, pathname, mode, flags)
-    let dirfd = notif.data.args[0] as i64;
+    // stat/lstat(pathname, statbuf), access(pathname, mode)
+    //
+    // The legacy x86_64 variants carry the path in args[0] and have no
+    // dirfd or flags. Parsing them with the at-variant layout reads the
+    // statbuf pointer as the path, never matches the workdir, and falls
+    // through to the kernel, which leaks whiteouted lower entries to any
+    // static-libc child that emits legacy stat (same register-layout bug
+    // handle_cow_open fixed for legacy open).
+    let legacy = [arch::sys_stat(), arch::sys_lstat(), arch::sys_access()]
+        .into_iter()
+        .flatten()
+        .any(|l| l == nr);
+    let (dirfd, path_ptr) = if legacy {
+        (libc::AT_FDCWD as i64, notif.data.args[0])
+    } else {
+        (notif.data.args[0] as i64, notif.data.args[1])
+    };
     let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
-    let path = match read_path(notif, notif.data.args[1], notif_fd) {
+    let path = match read_path(notif, path_ptr, notif_fd) {
         Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
         None => return NotifAction::Continue,
     };
@@ -813,7 +855,10 @@ pub(crate) async fn handle_cow_stat(
         (real, upper_root, workdir_root)
     };
 
-    if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
+    if nr == libc::SYS_faccessat
+        || nr == crate::arch::SYS_FACCESSAT2
+        || arch::sys_access() == Some(nr)
+    {
         // Existence check, confined: lstat succeeds for any present entry
         // (including a dangling symlink), matching the prior semantics.
         let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &real_path) {
@@ -826,12 +871,16 @@ pub(crate) async fn handle_cow_stat(
         return NotifAction::Errno(libc::ENOENT);
     }
 
-    // newfstatat — stat the resolved path (confined to its layer root) and
-    // write the native libc layout back to the child. Do not hand-pack struct
-    // stat; its layout is architecture-specific.
-    let statbuf_addr = notif.data.args[2];
-    let flags = (notif.data.args[3] & 0xFFFF_FFFF) as i32;
-    let follow = (flags & libc::AT_SYMLINK_NOFOLLOW) == 0;
+    // newfstatat/stat/lstat — stat the resolved path (confined to its layer
+    // root) and write the native libc layout back to the child. Do not
+    // hand-pack struct stat; its layout is architecture-specific.
+    let statbuf_addr = if legacy { notif.data.args[1] } else { notif.data.args[2] };
+    let follow = if legacy {
+        arch::sys_lstat() != Some(nr)
+    } else {
+        let flags = (notif.data.args[3] & 0xFFFF_FFFF) as i32;
+        (flags & libc::AT_SYMLINK_NOFOLLOW) == 0
+    };
     let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &real_path) {
         Ok(v) => v,
         Err(e) => return NotifAction::Errno(e),

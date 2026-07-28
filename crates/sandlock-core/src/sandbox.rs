@@ -241,6 +241,14 @@ impl StdioSpec {
     fn inherit() -> Self {
         StdioSpec { stdin: StdioMode::Inherit, stdout: StdioMode::Inherit, stderr: StdioMode::Inherit }
     }
+
+    /// True when every stream inherits, i.e. the run is interactive and the
+    /// child may take the terminal foreground group.
+    fn all_inherit(&self) -> bool {
+        self.stdin == StdioMode::Inherit
+            && self.stdout == StdioMode::Inherit
+            && self.stderr == StdioMode::Inherit
+    }
 }
 
 /// Private runtime state.  Only allocated after `start()` / `run()` is
@@ -255,6 +263,12 @@ struct Runtime {
     loadavg_handle: Option<JoinHandle<()>>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
+    // Drains of the capture pipes above, each holding either the task still
+    // reading or the bytes it finished with (see `wait`). Both states belong to
+    // the runtime rather than to the `wait()` that started them, so a cancelled
+    // `wait()` takes neither the reader nor what it has already produced.
+    stdout_drain: Option<ParkedDrain>,
+    stderr_drain: Option<ParkedDrain>,
     // Parent-held write end of a piped stdin (popen). The caller takes it via
     // `Process::take_stdin`; closing it signals EOF to the child.
     _stdin_write: Option<std::os::fd::OwnedFd>,
@@ -277,6 +291,9 @@ struct Runtime {
     /// `wait()` nor `Drop` take/commit/abort the branch — the transaction
     /// coordinator owns the single commit/abort. See [`SharedCow`].
     shared_cow: Option<SharedCow>,
+    // The interactive child took the terminal's foreground process group at
+    // spawn; whoever reaps it must hand the foreground back to this process.
+    tty_foreground_taken: bool,
 }
 
 /// A COW branch (one `upper` over the workdir) shared by every stage of a
@@ -764,25 +781,79 @@ impl Sandbox {
         HashMap::new()
     }
 
+    /// Return observed resource peaks from the supervisor state.
+    /// Returns `(peak_mem_used_bytes, peak_proc_count)`.
+    pub async fn resource_peaks(&self) -> (u64, u32) {
+        if let Some(res) = self.runtime.as_ref().and_then(|rt| rt.supervisor_resource.as_ref()) {
+            let rs = res.lock().await;
+            (rs.peak_mem_used, rs.peak_proc_count)
+        } else {
+            (0, 0)
+        }
+    }
+
     /// Wait for the child process to exit.
+    ///
+    /// Dropping the returned future does not cost the captured output: the pipe
+    /// drains belong to the `Sandbox`, so a caller that cancels this `wait()`
+    /// (a `timeout` or `select!` around it) and calls `wait()` again still gets
+    /// what the child wrote. That holds wherever the cancellation lands —
+    /// before the drains start, while the child is still running, or while the
+    /// final join is blocked because a descendant is still holding the write
+    /// end open past the child's own exit.
     pub async fn wait(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
         use crate::result::RunResult;
 
         let pid = self.rt().child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
 
-        if let RuntimeState::Stopped(ref es) = self.rt().state {
-            return Ok(RunResult {
-                exit_status: es.clone(),
-                stdout: None,
-                stderr: None,
-            });
+        // Already reaped: hand back the same status again, plus whatever the
+        // drains collected. They outlive the `wait()` that started them, so a
+        // second call still reports the output of a first one that was
+        // cancelled — including one cancelled while joining them here, since a
+        // join only unparks a drain once it has completed. A `wait()` that ran
+        // to the end took them with it, and both streams are then `None`.
+        let stopped = match self.rt().state {
+            RuntimeState::Stopped(ref es) => Some(es.clone()),
+            _ => None,
+        };
+        if let Some(exit_status) = stopped {
+            let (stdout, stderr) = self.collect_pipe_drains().await;
+            return Ok(RunResult { exit_status, stdout, stderr });
         }
 
         // Deliver EOF to a piped stdin the caller never took: otherwise a child
         // that reads stdin (e.g. `cat`) blocks forever and this wait never
         // returns. A taken stdin is already None here (the caller owns it).
         drop(self.rt_mut()._stdin_write.take());
+
+        // Start draining the capture pipes BEFORE waiting for the child to exit.
+        //
+        // Reading them after the exit wait deadlocks the moment the child writes
+        // more than one pipe buffer (64 KiB by default): the pipe fills, the
+        // child blocks in `write()` and can never exit, while this function waits
+        // for exactly that exit. The run then hangs until the caller's timeout
+        // (forever if there is none) and the output is lost. Draining
+        // concurrently keeps the pipe moving, so the child can finish writing and
+        // exit, and the reads still end at EOF — which arrives once the child and
+        // every descendant holding the write end are gone.
+        //
+        // The drains are parked in the runtime rather than in this future: a
+        // caller that cancels `wait()` (a `timeout` or `select!` around it) must
+        // be able to `wait()` again and still be given the output. The
+        // `is_none()` guard is what makes that second call reuse them instead of
+        // starting a second reader. A stream the caller took through
+        // `Process::take_stdout`/`take_stderr` is `None` here and stays theirs.
+        if self.rt().stdout_drain.is_none() {
+            if let Some(fd) = self.rt_mut()._stdout_read.take() {
+                self.rt_mut().stdout_drain = sandbox_spawn_pipe_drain(fd);
+            }
+        }
+        if self.rt().stderr_drain.is_none() {
+            if let Some(fd) = self.rt_mut()._stderr_read.take() {
+                self.rt_mut().stderr_drain = sandbox_spawn_pipe_drain(fd);
+            }
+        }
 
         // Wait for the top-level child to exit. Prefer the child's pidfd via
         // `AsyncFd`: pidfd readiness fires only on *exit*, so — unlike a
@@ -798,6 +869,11 @@ impl Sandbox {
         };
 
         self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
+
+        if self.rt().tty_foreground_taken {
+            sandbox_restore_tty_foreground(pid);
+            self.rt_mut().tty_foreground_taken = false;
+        }
 
         let rt = self.rt_mut();
         if let Some(h) = rt.notif_handle.take() { h.abort(); }
@@ -815,10 +891,33 @@ impl Sandbox {
             }
         }
 
-        let stdout = self.rt_mut()._stdout_read.take().map(sandbox_read_fd_to_end);
-        let stderr = self.rt_mut()._stderr_read.take().map(sandbox_read_fd_to_end);
+        let (stdout, stderr) = self.collect_pipe_drains().await;
 
         Ok(RunResult { exit_status, stdout, stderr })
+    }
+
+    /// Join the capture-pipe drains, if this runtime still holds them.
+    ///
+    /// Only called once the child has been reaped, so the EOF each drain is
+    /// reading towards is already reachable — but not necessarily *reached*: a
+    /// descendant that inherited the write end keeps the join blocked for as
+    /// long as it lives, which is exactly when a caller's timeout fires. So
+    /// each handle is joined in place and only unparked once that join
+    /// completes; see `finish_parked_drain`.
+    ///
+    /// `None` means the stream was never piped, was taken by the caller, or was
+    /// already collected by an earlier `wait()`; a drain that panicked or was
+    /// aborted reports empty bytes rather than failing the run.
+    async fn collect_pipe_drains(&mut self) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        // Finish both first — each stores its bytes into the runtime as it
+        // completes — and only then take them out. A cancellation between the
+        // two joins therefore loses nothing: whatever finished is parked.
+        // One statement per stream: each borrow of the runtime ends with it.
+        finish_parked_drain(&mut self.rt_mut().stdout_drain).await;
+        finish_parked_drain(&mut self.rt_mut().stderr_drain).await;
+        let stdout = take_drained(&mut self.rt_mut().stdout_drain);
+        let stderr = take_drained(&mut self.rt_mut().stderr_drain);
+        (stdout, stderr)
     }
 
     /// Fork the sandboxed child and install policy (seccomp + notif
@@ -1349,6 +1448,8 @@ impl Sandbox {
                 loadavg_handle: None,
                 _stdout_read: None,
                 _stderr_read: None,
+                stdout_drain: None,
+                stderr_drain: None,
                 _stdin_write: None,
                 seccomp_cow: None,
                 supervisor_resource: None,
@@ -1363,6 +1464,7 @@ impl Sandbox {
                 handlers: Vec::new(),
                 ready_w: None,
                 shared_cow: None,
+                tty_foreground_taken: false,
             }));
             clones.push(clone_sb);
         }
@@ -1444,6 +1546,8 @@ impl Sandbox {
             loadavg_handle: None,
             _stdout_read: None,
             _stderr_read: None,
+            stdout_drain: None,
+            stderr_drain: None,
             _stdin_write: None,
             seccomp_cow: None,
             supervisor_resource: None,
@@ -1458,6 +1562,7 @@ impl Sandbox {
             handlers: Vec::new(),
             ready_w: None,
             shared_cow: None,
+            tty_foreground_taken: false,
         }));
         Ok(())
     }
@@ -1692,6 +1797,12 @@ impl Sandbox {
         // without assuming PID 1 is always init (wrong in containers).
         let parent_pid = unsafe { libc::getpid() };
 
+        // Interactive (fully inherited) stdio on a terminal: the child will
+        // take the tty foreground group, and this process must take it back
+        // once the child is reaped.
+        let foreground = stdio.all_inherit();
+        let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
+
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
@@ -1770,6 +1881,7 @@ impl Sandbox {
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
                 parent_pid,
+                foreground,
             });
         }
 
@@ -1782,6 +1894,7 @@ impl Sandbox {
         self.rt_mut()._stderr_read = stderr_p.map(|(r, _w)| r);
 
         self.rt_mut().child_pid = Some(pid);
+        self.rt_mut().tty_foreground_taken = tty_foreground_taken;
         // State remains `Created` until `do_start` writes ready_w to release
         // the child to execve.
 
@@ -2134,6 +2247,27 @@ impl Process<'_> {
     }
 }
 
+/// Hand the terminal's foreground process group back to this process after
+/// reaping an interactive child that took it. Restores only while the child's
+/// group still owns the terminal, so a foreground the caller has since given
+/// to someone else is left alone. SIGTTOU is blocked around `tcsetpgrp`:
+/// this process is a background group at that moment, and an unblocked
+/// SIGTTOU would stop it, which is the exact symptom being prevented.
+fn sandbox_restore_tty_foreground(child_pid: i32) {
+    unsafe {
+        if libc::isatty(0) != 1 || libc::tcgetpgrp(0) != child_pid {
+            return;
+        }
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        libc::sigaddset(&mut block, libc::SIGTTOU);
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+        libc::tcsetpgrp(0, libc::getpgrp());
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+    }
+}
+
 // ================================================================
 // Drop for Sandbox — kills and reaps child if still running
 // ================================================================
@@ -2147,11 +2281,21 @@ impl Drop for Sandbox {
                     let mut status: i32 = 0;
                     unsafe { libc::waitpid(pid, &mut status, 0) };
                 }
+                if rt.tty_foreground_taken {
+                    sandbox_restore_tty_foreground(pid);
+                    rt.tty_foreground_taken = false;
+                }
             }
 
             if let Some(h) = rt.notif_handle.take() { h.abort(); }
             if let Some(h) = rt.throttle_handle.take() { h.abort(); }
             if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
+            // Nobody is left to collect these; aborting closes the read ends.
+            // A drain that already finished holds only bytes, dropped with the
+            // runtime.
+            for slot in [rt.stdout_drain.take(), rt.stderr_drain.take()] {
+                if let Some(ParkedDrain::Running(h)) = slot { h.abort(); }
+            }
 
             let is_error = matches!(
                 rt.state,
@@ -2314,6 +2458,89 @@ unsafe fn wire_child_stdio(mode: StdioMode, target: i32, pipe_src: Option<i32>, 
             } else {
                 libc::close(fd);
             }
+        }
+    }
+}
+
+/// A capture pipe's drain, parked on the `Runtime`: the task while it reads,
+/// then the bytes it read.
+///
+/// Both states have to be parked, not just the first. Handing the finished
+/// bytes back to the `wait()` future and clearing the slot would leave them in
+/// a stack local of a cancellable future, and the sibling stream is joined
+/// after it, which is a suspension point whenever that one is still draining.
+/// A timeout landing there would then destroy a capture that had already been
+/// read in full, with nothing left on the runtime to recover it from.
+enum ParkedDrain {
+    Running(JoinHandle<Vec<u8>>),
+    Done(Vec<u8>),
+}
+
+/// Spawn a task that reads one capture pipe to EOF, for `wait` to join once the
+/// child has been reaped.
+///
+/// An ordinary task, not `spawn_blocking`: a blocking read would hold a thread
+/// of the shared blocking pool for the child's entire lifetime (even for a
+/// child that writes nothing), and that pool is also what the COW copier and
+/// the fork-tracking worker need *while* a child is alive, so a saturated pool
+/// is a deadlock rather than a slowdown.
+///
+/// `Receiver::from_owned_fd` sets O_NONBLOCK on this fd and registers it with
+/// the runtime's I/O driver (which `wait` needs anyway, for the pidfd). The
+/// flag belongs to the open file description behind the *read* end; the child
+/// writes to the write end, a separate description, so its `write()`s stay
+/// blocking, which is what keeps the pipe applying back-pressure rather than
+/// dropping output. The conversion can only fail if the fd is not a readable
+/// pipe, which cannot happen for the pipes `do_create_stdio` creates; if it
+/// somehow did, the stream is left uncaptured rather than the run failing.
+fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<ParkedDrain> {
+    let mut rx = match tokio::net::unix::pipe::Receiver::from_owned_fd(fd) {
+        Ok(rx) => rx,
+        Err(_) => return None,
+    };
+    Some(ParkedDrain::Running(tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let _ = rx.read_to_end(&mut buf).await;
+        buf
+    })))
+}
+
+/// Drive one parked drain to completion, leaving its bytes in the slot.
+///
+/// The handle is awaited *through* the slot, and the store happens in the same
+/// step as the await resolving, so there is no point at which the bytes exist
+/// only inside this future: cancelling it leaves either the still-running task
+/// or the finished bytes parked for the next `wait()`. Taking the handle out
+/// first would hand it to the awaiting future, so dropping that future (which
+/// is all a caller's `timeout` or `select!` does) would drop the handle with
+/// it and every later `wait()` would report no output.
+///
+/// This join is not instantaneous: the child is reaped by the time it runs,
+/// but a descendant still holding the write end keeps the read short of EOF,
+/// which is precisely the case a caller times out on. `JoinHandle` is `Unpin`,
+/// so it can be polled through `&mut`, and dropping this future does not abort
+/// the task: the drain left behind is still reading and a later `wait()` picks
+/// it up.
+///
+/// A drain that panicked or was aborted parks empty bytes, so the run reports
+/// an empty capture rather than failing.
+async fn finish_parked_drain(slot: &mut Option<ParkedDrain>) {
+    if let Some(ParkedDrain::Running(handle)) = slot.as_mut() {
+        let buf = handle.await.unwrap_or_default();
+        *slot = Some(ParkedDrain::Done(buf));
+    }
+}
+
+/// Unpark the bytes of a drain that has finished. Not async on purpose: it runs
+/// after every join, so no cancellation can land between the two streams.
+fn take_drained(slot: &mut Option<ParkedDrain>) -> Option<Vec<u8>> {
+    match slot.take() {
+        Some(ParkedDrain::Done(buf)) => Some(buf),
+        // Still running (nothing joined it) — leave it parked.
+        other => {
+            *slot = other;
+            None
         }
     }
 }
