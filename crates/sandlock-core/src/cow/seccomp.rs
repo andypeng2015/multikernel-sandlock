@@ -1979,6 +1979,14 @@ impl SeccompCowBranch {
                     dst.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))
                         .map_err(|e| BranchError::Operation(format!("chmod: {}", e)))?;
                 }
+                // The merged bytes, before the directory entry that names them.
+                // The tail below fsyncs each destination directory but the file
+                // itself was never synced, and the successful tail then removes
+                // the storage that held the only other copy — so a power loss
+                // could leave a durable name over unwritten blocks with nothing
+                // left to re-merge. Best-effort: this is a durability
+                // improvement, not a new way for a merge to fail.
+                let _ = dst.sync_all();
                 drop((src, dst));
                 self.drop_merged_entry(entry.path());
                 synced_dirs.insert(dest.parent().unwrap().to_path_buf());
