@@ -449,7 +449,7 @@ fn resolve_default_storage_base(
 /// a foreign or symlinked base closes that; the caller falls back to a base it
 /// can create securely.
 fn ensure_secure_base(base: &Path, uid: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::MetadataExt;
     match base.symlink_metadata() {
         Ok(meta) => {
             if !meta.is_dir() {
@@ -478,23 +478,34 @@ fn ensure_secure_base(base: &Path, uid: u32) -> std::io::Result<()> {
             }
             Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Non-recursive create on the leaf: a plain mkdir(2) fails `EEXIST` on a
-            // symlink WITHOUT following it, closing the create-through-a-planted-symlink
-            // TOCTOU that `recursive(true)` (create_dir_all, which accepts an existing
-            // symlink-to-dir) would leave open in a world-writable `$TMPDIR`. The parent
-            // (`$XDG_RUNTIME_DIR` or `$TMPDIR`) always exists, so no intermediates are
-            // needed. If someone raced us to the name, re-validate what is actually there
-            // rather than trust it: the branch above accepts a same-user directory and
-            // rejects a symlink or a foreign-owned one.
-            match fs::DirBuilder::new().mode(0o700).create(base) {
-                Ok(()) => Ok(()),
-                Err(e2) if e2.kind() == std::io::ErrorKind::AlreadyExists => {
-                    ensure_secure_base(base, uid)
-                }
-                Err(e2) => Err(e2),
-            }
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_base_or_revalidate(base, uid),
+        Err(e) => Err(e),
+    }
+}
+
+/// The "base is absent" arm of [`ensure_secure_base`]: create the leaf, and if
+/// something got there first, re-validate what is actually there rather than
+/// trust it.
+///
+/// Non-recursive create on the leaf: a plain mkdir(2) fails `EEXIST` on a
+/// symlink WITHOUT following it, closing the create-through-a-planted-symlink
+/// TOCTOU that `recursive(true)` (create_dir_all, which accepts an existing
+/// symlink-to-dir) would leave open in a world-writable `$TMPDIR`. The parent
+/// (`$XDG_RUNTIME_DIR` or `$TMPDIR`) always exists, so no intermediates are
+/// needed. On `EEXIST` the re-validation goes back through
+/// [`ensure_secure_base`], which accepts a same-user 0700 directory and rejects
+/// a symlink, a foreign-owned dir or a widened one.
+///
+/// Split out from its caller so the `EEXIST` path can be exercised directly.
+/// It is otherwise reachable only by losing a create race, and what it does
+/// depends solely on what is at the name — not on how it got there — so
+/// planting the obstruction up front tests the same code with no dependence on
+/// thread scheduling.
+fn create_base_or_revalidate(base: &Path, uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match fs::DirBuilder::new().mode(0o700).create(base) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => ensure_secure_base(base, uid),
         Err(e) => Err(e),
     }
 }
@@ -756,8 +767,6 @@ impl SeccompCowBranch {
         self.deleted.iter().filter(|r| !self.applied_deletions.contains(*r))
     }
 
-    /// Check whether `additional` bytes would exceed the disk quota.
-    /// Returns `Ok(())` if within quota or quota is unlimited (0).
     /// Check whether `additional` bytes would exceed the disk quota.
     /// Returns `Ok(())` if within quota or quota is unlimited (0).
     /// When `additional` is 0 the check uses `>=` — meaning "quota is
@@ -6617,71 +6626,45 @@ mod tests {
         );
     }
 
-    /// GAP-6: the NotFound -> create -> AlreadyExists -> recurse arm re-validates
-    /// and REJECTS a planted symlink rather than failing open. This arm is only
-    /// reachable by a create race (lstat sees the leaf absent, then mkdir loses the
-    /// race and returns EEXIST), so it is driven by racing a planter thread that
-    /// spams `symlink(base)`.
+    /// GAP-6: the create -> `EEXIST` -> re-validate arm REJECTS a planted symlink
+    /// rather than failing open, and does not follow it.
     ///
-    /// The invariant is sound regardless of which arm wins: after the planter is
-    /// joined nothing else touches `base` (the planter only ever calls `symlink`,
-    /// which cannot replace a directory), so if `base` is then a symlink,
-    /// `ensure_secure_base` MUST have returned Err — the first arm and the recurse
-    /// arm both reject a symlink. Mutating the recurse arm to `Ok(())` makes the
-    /// recurse-arm iterations return Ok while `base` is a symlink, failing this.
+    /// In production that arm is reached by losing a create race: `lstat` sees
+    /// the leaf absent, then `mkdir(2)` returns `EEXIST`. What the arm does,
+    /// though, depends only on WHAT is at the name, not on how it got there —
+    /// `mkdir(2)` reports `EEXIST` on a symlink without following it either way
+    /// — so planting the symlink first and calling the arm directly reaches
+    /// exactly the state a lost race leaves, with no dependence on thread
+    /// scheduling. (It used to be driven by a spin-loop planter thread that had
+    /// to win a race within a fixed number of attempts, which failed whenever
+    /// the machine was busy.)
+    ///
+    /// Mutating the `AlreadyExists` arm to `Ok(())` makes this return Ok over a
+    /// symlinked base, failing here.
     #[test]
-    fn ensure_secure_base_revalidates_on_create_race() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
+    fn create_base_or_revalidate_rejects_a_planted_symlink() {
         let uid = unsafe { libc::getuid() };
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("target");
         fs::create_dir(&target).unwrap();
-        let base = root.path().join("racy-base");
+        let base = root.path().join("planted-base");
+        std::os::unix::fs::symlink(&target, &base).unwrap();
 
-        let mut saw_symlink_outcome = false;
-        for _ in 0..3000 {
-            let _ = fs::remove_dir_all(&base);
-            let _ = fs::remove_file(&base);
-
-            let go = Arc::new(AtomicBool::new(false));
-            let stop = Arc::new(AtomicBool::new(false));
-            let (pg, ps, pb, pt) = (go.clone(), stop.clone(), base.clone(), target.clone());
-            let planter = std::thread::spawn(move || {
-                while !pg.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-                // Spam the symlink so it can land in the tiny window between the
-                // function's lstat and its mkdir (the recurse arm), as well as
-                // before the lstat (the first arm). `symlink` fails EEXIST once
-                // anything is there, so it never replaces a dir the function made.
-                while !ps.load(Ordering::Acquire) {
-                    let _ = std::os::unix::fs::symlink(&pt, &pb);
-                }
-            });
-
-            go.store(true, Ordering::Release);
-            let result = ensure_secure_base(&base, uid);
-            stop.store(true, Ordering::Release);
-            planter.join().unwrap();
-
-            // Race-free now: the planter has stopped and `base` is stable.
-            let is_symlink =
-                base.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false);
-            if is_symlink {
-                saw_symlink_outcome = true;
-                assert!(
-                    result.is_err(),
-                    "a base that is a symlink must be rejected, however the race landed",
-                );
-            }
-        }
-        let _ = fs::remove_dir_all(&base);
-        let _ = fs::remove_file(&base);
+        let err = create_base_or_revalidate(&base, uid)
+            .expect_err("a symlink at the base must be rejected, not accepted or followed");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "expected the symlink rejection, got: {err:?}",
+        );
         assert!(
-            saw_symlink_outcome,
-            "the planter never won the race in 3000 attempts; the arm was not exercised",
+            base.symlink_metadata().unwrap().file_type().is_symlink(),
+            "the planted symlink must be left exactly as it was",
+        );
+        assert_eq!(
+            fs::read_dir(&target).unwrap().count(),
+            0,
+            "nothing may have been created THROUGH the symlink into its target",
         );
     }
 
