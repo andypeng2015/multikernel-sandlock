@@ -741,7 +741,7 @@ fn capture_policy() -> Sandbox {
 #[tokio::test]
 async fn test_run_captures_stdout_larger_than_the_pipe_buffer() {
     let cmd = format!("head -c {} /dev/zero | tr '\\0' 'X'", OVER_PIPE_BUFFER);
-    let mut sb = capture_policy().with_name("test");
+    let mut sb = capture_policy();
     let args = ["sh", "-c", cmd.as_str()];
     let fut = sb.run(&args);
     let result = tokio::time::timeout(std::time::Duration::from_secs(60), fut)
@@ -764,7 +764,7 @@ async fn test_run_captures_stdout_larger_than_the_pipe_buffer() {
 #[tokio::test]
 async fn test_run_captures_stderr_larger_than_the_pipe_buffer() {
     let cmd = format!("head -c {} /dev/zero | tr '\\0' 'E' 1>&2", OVER_PIPE_BUFFER);
-    let mut sb = capture_policy().with_name("test");
+    let mut sb = capture_policy();
     let args = ["sh", "-c", cmd.as_str()];
     let fut = sb.run(&args);
     let result = tokio::time::timeout(std::time::Duration::from_secs(60), fut)
@@ -793,7 +793,7 @@ async fn test_run_captures_large_stdout_and_stderr_together() {
         "head -c {n} /dev/zero | tr '\\0' 'O'; head -c {n} /dev/zero | tr '\\0' 'E' 1>&2",
         n = OVER_PIPE_BUFFER
     );
-    let mut sb = capture_policy().with_name("test");
+    let mut sb = capture_policy();
     let args = ["sh", "-c", cmd.as_str()];
     let fut = sb.run(&args);
     let result = tokio::time::timeout(std::time::Duration::from_secs(60), fut)

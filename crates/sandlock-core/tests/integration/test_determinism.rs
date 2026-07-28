@@ -210,17 +210,21 @@ async fn test_hostname_virtualization() {
         .build()
         .unwrap();
 
+    // Unique per process so concurrent test binaries never collide on the
+    // per-name runtime dir.
+    let name = format!("mybox-{}", std::process::id());
+
     // Verify uname() returns the virtual hostname.
-    let result = policy.clone().with_name("mybox").run(&["hostname"]).await.unwrap();
+    let result = policy.clone().with_name(&name).run(&["hostname"]).await.unwrap();
     assert!(result.success(), "hostname command failed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "mybox", "Expected hostname 'mybox', got: {:?}", stdout.trim());
+    assert_eq!(stdout.trim(), name, "Expected hostname {name:?}, got: {:?}", stdout.trim());
 
     // Verify /etc/hostname also returns the virtual hostname.
-    let result = policy.clone().with_name("mybox").run(&["cat", "/etc/hostname"]).await.unwrap();
+    let result = policy.clone().with_name(&name).run(&["cat", "/etc/hostname"]).await.unwrap();
     assert!(result.success(), "cat /etc/hostname failed");
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "mybox", "Expected /etc/hostname 'mybox', got: {:?}", stdout.trim());
+    assert_eq!(stdout.trim(), name, "Expected /etc/hostname {name:?}, got: {:?}", stdout.trim());
 }
 
 /// The /etc/hostname shim used to do a literal `path == "/etc/hostname"`
@@ -251,10 +255,13 @@ async fn test_hostname_virtualization_resists_path_bypasses() {
         "print(results)\n",
     );
 
-    let result = policy.clone().with_name("mybox").run(&["python3", "-c", script]).await.unwrap();
+    // Unique per process and distinct from test_hostname_virtualization's
+    // name; both tests run concurrently in this binary.
+    let name = format!("mybox-bypass-{}", std::process::id());
+    let result = policy.clone().with_name(&name).run(&["python3", "-c", script]).await.unwrap();
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     for label in ["dirfd", "dotdot", "curdir", "slash2"] {
-        let needle = format!("'{label}': 'mybox'");
+        let needle = format!("'{label}': '{name}'");
         assert!(
             stdout.contains(&needle),
             "{label}: host /etc/hostname leaked. stdout: {stdout}"

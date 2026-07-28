@@ -342,7 +342,7 @@ async fn test_seccomp_cow_legacy_stat_honors_whiteout() {
         .unwrap();
 
     let script = "rm gone.txt ; legacy-stat gone.txt ; legacy-lstat gone.txt ; legacy-access gone.txt";
-    let result = policy.clone().with_name("test")
+    let result = policy.clone()
         .run(&[helper.to_str().unwrap(), "sh", "-c", script]).await;
     match result {
         Ok(r) => {
@@ -1204,7 +1204,7 @@ async fn test_cow_child_rm_r_directory_stays_deleted() {
         .unwrap();
 
     let cmd = format!("rm -r {}/d", workdir.display());
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(r) => {
             assert!(r.success(), "rm -r should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
@@ -1235,7 +1235,7 @@ async fn test_cow_child_mv_directory_preserves_contents() {
         .unwrap();
 
     let cmd = format!("mv {}/d {}/d2", workdir.display(), workdir.display());
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(r) => {
             assert!(r.success(), "mv should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
@@ -1270,7 +1270,7 @@ async fn test_cow_child_rmdir_nonempty_fails() {
         .unwrap();
 
     let cmd = format!("rmdir {}/d", workdir.display());
-    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    let result = policy.clone().run(&["sh", "-c", &cmd]).await;
     match result {
         Ok(r) => {
             assert!(!r.success(), "rmdir of a non-empty directory must fail");
