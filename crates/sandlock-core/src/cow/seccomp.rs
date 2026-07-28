@@ -1709,6 +1709,13 @@ impl SeccompCowBranch {
     /// any retry, and the exposure they leave is a removal that a power loss
     /// could undo, which is not destructive.
     ///
+    /// `refresh preserved marker: ...` is from that same window too, and it is
+    /// NOT the head `preserve marker: ...` failure: deletions have landed, and
+    /// the marker still on disk is the head one, which OVER-lists what is
+    /// outstanding (the safe direction, since nothing has been drained from the
+    /// upper), so a sweep CAN find this branch. Retryable; the retry rewrites
+    /// the marker from the current outstanding set.
+    ///
     /// The deletions remainder is NOT derivable from `changes()`. The whiteout
     /// set is append-only (a landed deletion has to stay in it, or the path
     /// would reappear in the merged view), and a deletion whose path the upper
@@ -2030,7 +2037,7 @@ impl SeccompCowBranch {
             // OVER-lists — the safe direction, because nothing has been
             // drained.
             self.preserve_durable(PreserveReason::MergeInterrupted)
-                .map_err(|e| BranchError::Operation(format!("preserve marker: {e}")))?;
+                .map_err(|e| BranchError::Operation(format!("refresh preserved marker: {e}")))?;
         }
 
         // A deletion left outstanding is a merge that did not happen. Stopping
