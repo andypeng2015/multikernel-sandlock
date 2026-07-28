@@ -61,6 +61,7 @@ use crate::result::{ExitStatus, RunResult};
 pub struct Transaction {
     stages: Vec<Stage>,
     commit_lock_wait: Duration,
+    tee_stderr: bool,
 }
 
 impl Transaction {
@@ -78,7 +79,21 @@ impl Transaction {
     /// `|`-built chain means "connect these by pipes", which a transaction does
     /// not do.
     pub fn new(stages: impl IntoIterator<Item = Stage>) -> Self {
-        Self { stages: stages.into_iter().collect(), commit_lock_wait: COMMIT_LOCK_WAIT }
+        Self {
+            stages: stages.into_iter().collect(),
+            commit_lock_wait: COMMIT_LOCK_WAIT,
+            tee_stderr: true,
+        }
+    }
+
+    /// Whether each stage's stderr, besides being captured in the outcome, is
+    /// also streamed live to this process's fd 2. Defaults to true — the right
+    /// behavior for an interactive CLI. Turn it off when the embedding
+    /// process's stderr is not the place for workload output (a daemon or GUI
+    /// embedder, a test harness whose capture raw fd writes bypass).
+    pub fn tee_stderr(mut self, tee: bool) -> Self {
+        self.tee_stderr = tee;
+        self
     }
 
     /// How long the commit may wait for another transaction to release the
@@ -120,7 +135,7 @@ impl Transaction {
     /// [`list_preserved`](crate::recovery::list_preserved).
     pub async fn run(self, timeout: Option<Duration>) -> Result<TxnOutcome, TxnError> {
         validate_txn_stages(&self.stages)?;
-        run_txn(self.stages, timeout, Disposition::Commit, self.commit_lock_wait).await
+        run_txn(self.stages, timeout, Disposition::Commit, self.commit_lock_wait, self.tee_stderr).await
     }
 
     /// Run every stage and report what the transaction *would* change, then
@@ -134,7 +149,7 @@ impl Transaction {
     /// out first.
     pub async fn dry_run(self, timeout: Option<Duration>) -> Result<TxnOutcome, TxnError> {
         validate_txn_stages(&self.stages)?;
-        run_txn(self.stages, timeout, Disposition::DryRun, self.commit_lock_wait).await
+        run_txn(self.stages, timeout, Disposition::DryRun, self.commit_lock_wait, self.tee_stderr).await
     }
 }
 
@@ -496,6 +511,7 @@ async fn run_txn(
     timeout: Option<Duration>,
     disposition: Disposition,
     commit_lock_wait: Duration,
+    tee_stderr: bool,
 ) -> Result<TxnOutcome, TxnError> {
     // All stages share the validated workdir; take COW storage/quota from the
     // first stage (they overlay the same lower).
@@ -517,7 +533,7 @@ async fn run_txn(
     // so a timeout that cancels the driver future does not take the completed
     // stages' results down with it.
     let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::<RunResult>::new()));
-    let drive = drive_txn_stages(stages, shared, std::sync::Arc::clone(&results));
+    let drive = drive_txn_stages(stages, shared, std::sync::Arc::clone(&results), tee_stderr);
     let driven: Result<Option<AbortReason>, TxnError> = match timeout {
         Some(dur) => match tokio::time::timeout(dur, drive).await {
             Ok(r) => r,
@@ -665,13 +681,16 @@ async fn drive_txn_stages(
     stages: Vec<Stage>,
     shared: crate::sandbox::SharedCow,
     results: std::sync::Arc<std::sync::Mutex<Vec<RunResult>>>,
+    tee_stderr: bool,
 ) -> Result<Option<AbortReason>, TxnError> {
     use std::os::fd::{AsRawFd, OwnedFd};
 
     // An INDEPENDENT, non-blocking open file description onto the parent's fd 2,
     // cloned per stage to tee each stage's captured stderr back to fd 2
     // (best-effort). See `open_stderr_tee` for why it must not be a dup of fd 2.
-    let tee_fd: Option<OwnedFd> = open_stderr_tee();
+    // `None` when the caller opted out via Transaction::tee_stderr(false):
+    // stages are then capture-only.
+    let tee_fd: Option<OwnedFd> = if tee_stderr { open_stderr_tee() } else { None };
 
     // Stage names share one unique run id so concurrent transactions in the
     // same UID never collide on their runtime dirs.
