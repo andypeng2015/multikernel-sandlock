@@ -4438,6 +4438,135 @@ mod tests {
         );
     }
 
+    /// A deletion that is BOTH outstanding AND re-created in the upper must
+    /// still be applied by the retry.
+    ///
+    /// This is where the two deletion questions genuinely diverge, and nothing
+    /// else exercises it. `changes()` answers "what will the next commit do to
+    /// the MERGED VIEW": a whiteouted path the upper holds is reported by the
+    /// upper walk as an addition, never as `Deleted`. The remainder ledger (and
+    /// the PRESERVED marker fed from it) answers "what is LEFT TO DO": the same
+    /// path still has stale workdir contents under it, and the merge has to
+    /// remove them before the addition is published. Filtering the remainder by
+    /// upper presence collapses the second question into the first and loses
+    /// the deletion.
+    ///
+    /// The obstruction is the one from
+    /// `a_commit_that_failed_on_a_deletion_completes_after_the_obstruction_is_cleared`:
+    /// a symlinked parent component, which the confined removal resolves inside
+    /// the workdir root and so cannot reach, while `exists()` follows it out and
+    /// still sees the entry. No permission games, so it holds under root too.
+    #[test]
+    fn an_outstanding_deletion_the_upper_re_created_is_still_applied_by_the_retry() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("d")).unwrap();
+        fs::write(outside.path().join("d/stale.txt"), "from a previous run").unwrap();
+        std::os::unix::fs::symlink(outside.path(), workdir.path().join("link")).unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("link/d");
+        // Re-create the whiteouted directory in the upper through the production
+        // path: `handle_mkdir` is what puts the entry there in a real run, and
+        // it is what makes `upper_has("link/d")` true while the deletion is
+        // still outstanding.
+        let recreated = format!("{}/link/d", branch.workdir.display());
+        assert!(branch.handle_mkdir(&recreated).unwrap(), "the upper mkdir must succeed");
+        fs::write(branch.upper.join("link/d/new.txt"), "fresh").unwrap();
+        assert!(branch.upper_has("link/d"), "the upper must hold the re-created path");
+
+        let err = branch.commit().expect_err("the obstructed deletion must fail the merge");
+        assert!(
+            matches!(err, BranchError::Operation(ref m) if m.starts_with("delete:")),
+            "expected the deletion step to fail, got: {err:?}"
+        );
+        assert_eq!(
+            branch.outstanding_deletions().count(),
+            1,
+            "the remainder must still hold the deletion the upper re-created",
+        );
+        // The DOCUMENTED divergence, asserted so it is behaviour and not an
+        // oversight: the merged-view report folds it into the upper walk.
+        assert!(
+            branch
+                .changes()
+                .unwrap()
+                .iter()
+                .all(|c| c.kind != crate::dry_run::ChangeKind::Deleted),
+            "a whiteout the upper re-created must not be reported as a deletion",
+        );
+
+        // Clear the obstruction: the symlinked component becomes a real
+        // directory holding the same stale contents.
+        fs::remove_file(workdir.path().join("link")).unwrap();
+        fs::create_dir_all(workdir.path().join("link/d")).unwrap();
+        fs::write(workdir.path().join("link/d/stale.txt"), "from a previous run").unwrap();
+
+        branch.commit().expect("the retry must finish the remainder");
+        assert!(
+            !workdir.path().join("link/d/stale.txt").exists(),
+            "the deletion had to run again even though the upper held the path",
+        );
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("link/d/new.txt")).unwrap(),
+            "fresh",
+            "and the addition must publish into the emptied directory",
+        );
+    }
+
+    /// A retry must not re-run a deletion whose path the copy phase already
+    /// published — the upper no longer holds a copy to put back.
+    ///
+    /// Attempt 1 removes `f.txt` from the workdir, copies the upper's version
+    /// across, and drops it from the upper; a later entry then fails the merge.
+    /// If the retry treats that whiteout as still outstanding it unlinks the
+    /// freshly published file with nothing left to restore it — a silent loss,
+    /// not a visible error.
+    ///
+    /// The obstruction is a FILE in the workdir under an upper DIRECTORY, the
+    /// merge's documented hard failure. A file rather than a directory on
+    /// purpose: `drop_merged_entry` leaves directories in the upper, so a
+    /// directory-shaped obstruction would be rescued by an upper-presence
+    /// filter and would not discriminate. The walk is `sort_by_file_name`, so
+    /// "f.txt" merges before "z" fails.
+    #[test]
+    fn a_retry_after_a_partial_merge_must_not_re_delete_a_path_the_upper_already_published() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("f.txt"), "old").unwrap();
+        fs::write(workdir.path().join("z"), "a file where the upper has a dir").unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("f.txt");
+        fs::write(branch.upper.join("f.txt"), "new").unwrap();
+        fs::create_dir(branch.upper.join("z")).unwrap();
+
+        let err = branch.commit().expect_err("the type clash at z must fail the merge");
+        assert!(
+            matches!(err, BranchError::Operation(ref m) if m.starts_with("mkdir:")),
+            "expected the copy phase to fail at z, got: {err:?}"
+        );
+
+        fs::remove_file(workdir.path().join("z")).unwrap();
+
+        // Inspect the workdir BEFORE unwrapping. A retry that re-deletes the
+        // published file goes on to fail the commit on a whiteout it can never
+        // clear, and unwrapping first would record that error instead of the
+        // loss it is a symptom of.
+        let retry = branch.commit();
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("f.txt")).unwrap_or_default(),
+            "new",
+            "the retry must not re-delete a path the copy phase already published",
+        );
+        retry.expect("the retry must finish the remainder");
+        assert!(
+            workdir.path().join("z").is_dir(),
+            "and the entry that blocked the first attempt must land",
+        );
+    }
+
     /// When one deletion cannot be applied, the ones that CAN already have
     /// been: deletions are applied one at a time, not as a group.
     ///
