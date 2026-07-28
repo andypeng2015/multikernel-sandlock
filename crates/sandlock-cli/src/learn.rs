@@ -518,7 +518,9 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     // Use the three-step lifecycle (create/start/wait) so we can get the child
     // PID from sandbox.pid() and sample /proc/<pid> for resource peaks.
-    let mut sandbox = policy.with_name("sandlock-learn");
+    // No explicit name: the auto-generated sandbox-<pid>-<counter> is unique,
+    // so concurrent learn invocations never collide on the runtime dir.
+    let mut sandbox = policy;
     sandbox.create_interactive(&cmd_refs).await
         .map_err(|e| anyhow!("sandbox error: {e}"))?;
     let child_pid = sandbox.pid().expect("child pid after create") as u32;
