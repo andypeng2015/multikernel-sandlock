@@ -313,6 +313,58 @@ async fn test_seccomp_cow_legacy_open_syscall() {
     let _ = fs::remove_file(&out_file);
 }
 
+/// Legacy stat/lstat/access must honor whiteouts.
+///
+/// Regression test: handle_cow_stat parsed every syscall with the at-variant
+/// layout (dirfd=args[0], path=args[1]), but the legacy x86_64 variants put
+/// the path in args[0]. The handler read the statbuf pointer as the path,
+/// never matched the workdir, and fell through to the kernel, so a
+/// static-libc child emitting legacy stat could see whiteouted lower entries
+/// that newfstatat already reported as ENOENT. On aarch64/riscv64 the
+/// helper's legacy-* commands fall back to newfstatat, keeping the test as
+/// an at-variant whiteout check there.
+#[tokio::test]
+async fn test_seccomp_cow_legacy_stat_honors_whiteout() {
+    let workdir = temp_dir("seccomp-legacy-stat");
+    fs::write(workdir.join("gone.txt"), "SECRET").unwrap();
+    let helper = helper_binary();
+    let helper_dir = helper.parent().unwrap().to_path_buf();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_read(&helper_dir)
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let script = "rm gone.txt ; legacy-stat gone.txt ; legacy-lstat gone.txt ; legacy-access gone.txt";
+    let result = policy.clone().with_name("test")
+        .run(&[helper.to_str().unwrap(), "sh", "-c", script]).await;
+    match result {
+        Ok(r) => {
+            let out = r.stdout_str().unwrap_or("").to_string();
+            println!("legacy_stat_whiteout: stdout={:?}", out);
+            assert_eq!(
+                out.matches("ERR 2").count(),
+                3,
+                "legacy stat/lstat/access of a whiteouted file must all be ENOENT: {:?}",
+                out
+            );
+            assert!(
+                !out.contains("OK"),
+                "whiteouted entry leaked through a legacy stat variant: {:?}",
+                out
+            );
+        }
+        Err(e) => eprintln!("legacy stat whiteout test skipped: {}", e),
+    }
+    let _ = fs::remove_dir_all(&workdir);
+}
+
 /// Test that O_CREAT|O_EXCL succeeds after unlink in COW mode.
 ///
 /// Regression test: after unlink marked a file as deleted, the subsequent
@@ -609,6 +661,109 @@ async fn test_seccomp_cow_exec_packed_argv_relocation() {
         "argv[1] must survive the path rewrite, stdout={:?}",
         result.stdout_str()
     );
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+// ============================================================
+// Deletion-model regressions (issues #159/#160/#161)
+// ============================================================
+
+/// A directory the child removed stays removed after commit, including its
+/// contents (issue #159: whiteouts cover the subtree).
+#[tokio::test]
+async fn test_cow_child_rm_r_directory_stays_deleted() {
+    let workdir = temp_dir("seccomp-rm-r");
+    fs::create_dir_all(workdir.join("d")).unwrap();
+    fs::write(workdir.join("d/secret.txt"), "SECRET").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    let cmd = format!("rm -r {}/d", workdir.display());
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    match result {
+        Ok(r) => {
+            assert!(r.success(), "rm -r should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(!workdir.join("d").exists(), "d should be gone after commit");
+            assert!(!workdir.join("d/secret.txt").exists());
+        }
+        Err(e) => eprintln!("Seccomp COW test skipped: {}", e),
+    }
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// Renaming a directory preserves its contents through the commit
+/// (issue #160: the rename is staged with a recursive copy-up).
+#[tokio::test]
+async fn test_cow_child_mv_directory_preserves_contents() {
+    let workdir = temp_dir("seccomp-mv-dir");
+    fs::create_dir_all(workdir.join("d")).unwrap();
+    fs::write(workdir.join("d/inner.txt"), "PRECIOUS").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    let cmd = format!("mv {}/d {}/d2", workdir.display(), workdir.display());
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    match result {
+        Ok(r) => {
+            assert!(r.success(), "mv should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(!workdir.join("d").exists(), "d should be gone after commit");
+            assert_eq!(
+                fs::read_to_string(workdir.join("d2/inner.txt")).unwrap(),
+                "PRECIOUS",
+                "d2/inner.txt must survive the rename"
+            );
+        }
+        Err(e) => eprintln!("Seccomp COW test skipped: {}", e),
+    }
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// rmdir on a non-empty directory fails inside the sandbox and the contents
+/// survive the commit (issue #161: ENOTEMPTY from the merged view).
+#[tokio::test]
+async fn test_cow_child_rmdir_nonempty_fails() {
+    let workdir = temp_dir("seccomp-rmdir-nonempty");
+    fs::create_dir_all(workdir.join("d")).unwrap();
+    fs::write(workdir.join("d/inner.txt"), "DATA").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    let cmd = format!("rmdir {}/d", workdir.display());
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    match result {
+        Ok(r) => {
+            assert!(!r.success(), "rmdir of a non-empty directory must fail");
+            assert!(
+                workdir.join("d/inner.txt").exists(),
+                "contents must survive the failed rmdir and the commit"
+            );
+        }
+        Err(e) => eprintln!("Seccomp COW test skipped: {}", e),
+    }
 
     let _ = fs::remove_dir_all(&workdir);
 }

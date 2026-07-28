@@ -986,8 +986,8 @@ pub(crate) async fn handle_chroot_write(
                 if cow.matches(&old_str) {
                     match cow.handle_rename(&old_str, &new_host.to_string_lossy()) {
                         Ok(true) => return NotifAction::ReturnValue(0),
-                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                        _ => {}
+                        Err(errno) => return NotifAction::Errno(errno),
+                        Ok(false) => {}
                     }
                 }
             }
