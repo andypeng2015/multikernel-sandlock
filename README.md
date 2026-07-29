@@ -217,8 +217,8 @@ sandlock run --name web.local --port-remap --net-allow-bind 8080 -r /usr -r /lib
 sandlock ps
 
 # Show effective policy for a running sandbox (JSON or TOML)
-sandlock config api.local
-sandlock config api.local --toml
+sandlock inspect api.local
+sandlock inspect api.local --toml
 
 # Kill a running sandbox by name
 sandlock kill web.local
@@ -770,7 +770,7 @@ NAME                                  PID        UPTIME  CMD
 api.local                           12345            5m  python3 server.py
 web.local                           12346            3m  python3 server.py
 
-$ sandlock config api.local --toml | head -10
+$ sandlock inspect api.local --toml | head -10
 [config]
 http_inject_ca = []
 

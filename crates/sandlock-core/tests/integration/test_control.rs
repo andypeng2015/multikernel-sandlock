@@ -117,30 +117,30 @@ fn test_control_list_sandboxes_via_cli() {
 }
 
 #[test]
-fn test_control_config_returns_policy_via_cli() {
+fn test_control_inspect_returns_policy_via_cli() {
     let name = format!("test-ctrl-config-{}", std::process::id());
     let mut child = start_sleep_sandbox(&name);
 
     match wait_for_sandbox(&name) {
         Ok(()) => {
             let out = sandlock_bin()
-                .args(["config", &name])
+                .args(["inspect", &name])
                 .output()
-                .expect("sandlock config");
+                .expect("sandlock inspect");
             assert!(
                 out.status.success(),
-                "config should succeed: stderr={}",
+                "inspect should succeed: stderr={}",
                 String::from_utf8_lossy(&out.stderr)
             );
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(
                 stdout.contains("filesystem"),
-                "config JSON should contain 'filesystem': {}",
+                "inspect JSON should contain 'filesystem': {}",
                 stdout
             );
             assert!(
                 stdout.contains("/usr"),
-                "config JSON should contain /usr: {}",
+                "inspect JSON should contain /usr: {}",
                 stdout
             );
         }
@@ -156,12 +156,12 @@ fn test_control_config_returns_policy_via_cli() {
 }
 
 #[test]
-fn test_control_config_nonexistent_sandbox() {
+fn test_control_inspect_nonexistent_sandbox() {
     let out = sandlock_bin()
-        .args(["config", "nonexistent-sandbox-xyz-99999"])
+        .args(["inspect", "nonexistent-sandbox-xyz-99999"])
         .output()
-        .expect("sandlock config");
-    assert!(!out.status.success(), "config for nonexistent sandbox should fail");
+        .expect("sandlock inspect");
+    assert!(!out.status.success(), "inspect for nonexistent sandbox should fail");
 }
 
 #[test]
@@ -351,6 +351,47 @@ fn test_control_name_collision() {
             assert!(
                 !out.status.success(),
                 "second sandbox with same name must fail"
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("already running"),
+                "error should indicate name collision: {}",
+                stderr
+            );
+        }
+        Err(e) => {
+            let stderr_output = child_stderr(&mut first);
+            let _ = first.kill();
+            panic!("{}; child stderr: {}", e, stderr_output);
+        }
+    }
+
+    let _ = first.kill();
+    let _ = first.wait();
+}
+
+#[test]
+fn test_control_name_collision_no_supervisor() {
+    // The no_supervisor path shares setup_runtime_dir_no_socket and must
+    // hard-fail on a live-name collision just like the supervisor path;
+    // continuing would leave a second sandbox running invisible to ps.
+    let name = format!("test-ctrl-collision-nosup-{}", std::process::id());
+    let mut first = start_sleep_sandbox(&name);
+
+    match wait_for_sandbox(&name) {
+        Ok(()) => {
+            let out = sandlock_bin()
+                .args([
+                    "run", "--name", &name, "--no-supervisor",
+                    "-r", "/usr", "-r", "/bin", "-r", "/etc",
+                    "-r", "/proc", "-r", "/dev",
+                    "--", "/bin/sleep", "5",
+                ])
+                .output()
+                .expect("sandlock run --no-supervisor (collision)");
+            assert!(
+                !out.status.success(),
+                "no_supervisor sandbox with a live name must fail"
             );
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
@@ -578,20 +619,20 @@ fn test_control_cli_kill_rejects_bad_names() {
 }
 
 #[test]
-fn test_control_cli_config_rejects_bad_names() {
+fn test_control_cli_inspect_rejects_bad_names() {
     for bad in &["..", ".", "a/b"] {
         let out = sandlock_bin()
-            .args(["config", bad])
+            .args(["inspect", bad])
             .output()
-            .expect("sandlock config");
+            .expect("sandlock inspect");
         assert!(
             !out.status.success(),
-            "sandlock config {:?} should fail", bad
+            "sandlock inspect {:?} should fail", bad
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("must not"),
-            "config {:?} should produce a validation error, got: {}",
+            "inspect {:?} should produce a validation error, got: {}",
             bad, stderr
         );
     }
@@ -621,13 +662,7 @@ fn test_control_cli_kill_nonexistent() {
 
 #[test]
 fn test_control_single_line_pid_file_is_pruned() {
-    let uid = unsafe { libc::getuid() };
-    let root = sandlock_core::control::runtime_dir_uid(uid);
-    if !root.exists() {
-        std::fs::create_dir_all(&root).expect("create sandlock root");
-    }
-
-    let dir = root.join("test-single-line-pid");
+    let dir = sandlock_core::control::sandbox_dir("test-single-line-pid");
     std::fs::create_dir_all(&dir).expect("create test dir");
 
     // Write a pid file with only one line — the format that never shipped.

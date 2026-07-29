@@ -195,7 +195,7 @@ pub struct SandboxBuilder {
 
     /// Enable the per-sandbox control socket for introspection. Defaults to
     /// `true`. When `false`, no runtime dir, pid file, or control-socket task
-    /// is created — `sandlock ps` and `sandlock config` will not see this
+    /// is created — `sandlock ps` and `sandlock inspect` will not see this
     /// sandbox.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub control_socket: bool,
@@ -679,7 +679,7 @@ impl SandboxBuilder {
 
     /// Enable or disable the per-sandbox control socket. Defaults to `true`.
     /// When `false`, no runtime dir, pid file, or control-socket task is
-    /// created — `sandlock ps` and `sandlock config` will not see this
+    /// created — `sandlock ps` and `sandlock inspect` will not see this
     /// sandbox.
     pub fn control_socket(mut self, v: bool) -> Self {
         self.control_socket = v;

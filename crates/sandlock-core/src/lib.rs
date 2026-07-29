@@ -52,10 +52,10 @@ pub use recovery::{list_preserved, read_preserved, PreserveReason, PreservedBran
 pub use dry_run::{Change, ChangeKind, DryRunResult};
 // Sectioned-profile parsing types: ProfileInput is the top-level deserialization
 // target; ProgramSpec carries [program].exec/args (not a Sandbox field).
-pub use crate::profile::{
-    ProfileInput, ProgramSpec, format_net_rule, format_http_rule,
-    sandbox_to_profile, sandbox_to_toml, sandbox_to_json,
-};
+// format_net_rule renders a NetRule back into the --net-allow/--net-deny
+// grammar (the CLI round-trips profiles through it); the other reverse
+// serializers live unre-exported in `profile`.
+pub use crate::profile::{ProfileInput, ProgramSpec, format_net_rule};
 
 // Public extension API — see docs/extension-handlers.md.
 pub use seccomp::dispatch::{Handler, HandlerCtx, HandlerError};

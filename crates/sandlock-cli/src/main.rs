@@ -23,7 +23,7 @@ enum Command {
     /// List all running sandboxes
     Ps,
     /// Show effective policy for a running sandbox
-    Config {
+    Inspect {
         /// Sandbox name (as shown by `sandlock ps`)
         name: String,
         /// Output TOML instead of JSON
@@ -285,7 +285,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Config { name, toml } => {
+        Command::Inspect { name, toml } => {
             if let Err(e) = validate_cli_name(&name) {
                 eprintln!("sandlock: {e}");
                 std::process::exit(1);
@@ -307,16 +307,16 @@ async fn main() -> Result<()> {
                             println!("{}", json_str);
                         }
                     } else {
-                        eprintln!("sandlock: empty config response");
+                        eprintln!("sandlock: empty response from sandbox");
                         std::process::exit(1);
                     }
                 }
                 Ok(resp) => {
-                    eprintln!("sandlock: config error: {}", resp.err.as_deref().unwrap_or("unknown"));
+                    eprintln!("sandlock: inspect error: {}", resp.err.as_deref().unwrap_or("unknown"));
                     std::process::exit(1);
                 }
                 Err(e) => {
-                    eprintln!("sandlock: config failed: {}", e);
+                    eprintln!("sandlock: inspect failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -943,7 +943,7 @@ fn parse_branch_action(flag: &str, s: &str) -> Result<BranchAction> {
 // /proc helpers for sandlock ps
 // ============================================================
 
-/// Validate a sandbox name coming from CLI argv (kill/config paths).
+/// Validate a sandbox name coming from CLI argv (kill/inspect paths).
 /// Mirrors `sandbox_validate_name` but returns a plain `Result` so the
 /// CLI can format its own error messages.
 fn validate_cli_name(name: &str) -> Result<(), String> {
