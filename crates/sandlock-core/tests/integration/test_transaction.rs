@@ -563,6 +563,8 @@ async fn test_txn_stage_failure_is_not_masked_by_a_backgrounded_descendant() {
                 &["sh", "-c", "(while :; do :; done) & echo boom 1>&2; exit 1"],
             ),
         ])
+        // Capture-only, so 'boom' does not leak to the test terminal.
+        .tee_stderr(false)
         .run(Some(Duration::from_secs(8))),
     )
     .await
@@ -1170,6 +1172,8 @@ async fn test_txn_stages_capture_stderr() {
         Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
         Stage::new(&policy, &["sh", "-c", "echo boom 1>&2; exit 1"]),
     ])
+    // Capture-only, so 'boom' does not leak to the test terminal.
+    .tee_stderr(false)
     .run(None)
     .await
     .expect("transaction should run");
@@ -1231,6 +1235,9 @@ async fn test_txn_stage_stderr_is_capped_and_tail_biased() {
             &["sh", "-c", "yes X | head -c 131072 1>&2; printf ZZZEND 1>&2; exit 1"],
         ),
     ])
+    // Capture-only: the live tee would flood the test terminal with the X's
+    // (raw fd 2 writes bypass libtest's capture).
+    .tee_stderr(false)
     .run(None)
     .await
     .expect("transaction should run");
@@ -1293,6 +1300,9 @@ async fn test_txn_stages_inherit_stdout_but_capture_stderr() {
         Stage::new(&policy, &["sh", "-c", &s0]),
         Stage::new(&policy, &["sh", "-c", &s1]),
     ])
+    // Capture-only: the tee is parent-side, so disabling it does not change
+    // the stage fd wiring this test asserts.
+    .tee_stderr(false)
     .run(None)
     .await
     .expect("transaction should run");

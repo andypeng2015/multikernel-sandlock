@@ -563,6 +563,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     };
 
     // 14. exec
+    //
+    // Restore SIGPIPE first: the Rust runtime ignores it process-wide, and an
+    // ignored disposition survives execve, so without this every sandboxed
+    // program sees write() fail with EPIPE instead of dying silently the way
+    // it would under a shell (std::process::Command does the same reset).
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     debug_assert!(!cmd.is_empty(), "cmd must not be empty");
     let argv_ptrs: Vec<*const libc::c_char> = cmd
         .iter()
