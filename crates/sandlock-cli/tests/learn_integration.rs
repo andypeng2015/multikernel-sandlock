@@ -181,16 +181,17 @@ fn test_learn_then_run_collapse() {
     let profile = tempfile::NamedTempFile::new().expect("tempfile");
     let profile_path = profile.path().to_str().unwrap().to_owned();
     let dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let dir_path = dir.path().canonicalize().expect("canonicalize tempdir");
 
     // Four observed files meet the pinned collapse threshold.
     let observed: Vec<String> = (1..=4)
         .map(|i| {
-            let p = dir.path().join(format!("observed{i}.txt"));
+            let p = dir_path.join(format!("observed{i}.txt"));
             std::fs::write(&p, "collapse me\n").expect("write observed file");
             p.to_str().unwrap().to_owned()
         })
         .collect();
-    let extra = dir.path().join("unobserved.txt");
+    let extra = dir_path.join("unobserved.txt");
     std::fs::write(&extra, "covered by directory grant\n").expect("write unobserved file");
 
     let mut learn_cmd = sandlock_bin();
