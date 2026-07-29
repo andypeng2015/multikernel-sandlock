@@ -429,21 +429,40 @@ fn sandlock_sleep_args(name: &str) -> Vec<String> {
 
 /// Start a background sandbox, wait for it to be listed by `ps`, then
 /// return its PID. The caller is responsible for killing it.
+///
+/// stderr is captured so wait_for_sandbox can report why a sandbox never
+/// appeared instead of a bare timeout.
 fn spawn_sandbox(name: &str) -> std::process::Child {
     let bin = env!("CARGO_BIN_EXE_sandlock");
     let args = sandlock_sleep_args(name);
     std::process::Command::new(bin)
         .args(&args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn sandlock")
 }
 
+/// Kill `child` if still running and return whatever it wrote to stderr.
+fn drain_child_stderr(child: &mut std::process::Child) -> String {
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    stderr
+}
+
 /// Wait for a sandbox to appear in `sandlock ps` output.
-fn wait_for_sandbox(name: &str) -> Result<(), String> {
+///
+/// Fails fast with the child's exit status and stderr if the sandbox process
+/// dies before appearing. The 15s ceiling leaves room for slow hosts running
+/// several sandbox startups in parallel (riscv64 boards).
+fn wait_for_sandbox(child: &mut std::process::Child, name: &str) -> Result<(), String> {
     let bin = env!("CARGO_BIN_EXE_sandlock");
-    for _ in 0..10 {
+    for _ in 0..30 {
         let out = std::process::Command::new(bin)
             .args(["ps"])
             .output()
@@ -452,9 +471,18 @@ fn wait_for_sandbox(name: &str) -> Result<(), String> {
         if stdout.contains(name) {
             return Ok(());
         }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "sandbox '{}' exited ({}) before appearing in ps: {}",
+                name, status, drain_child_stderr(child)
+            ));
+        }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    Err(format!("sandbox '{}' did not appear in ps output", name))
+    Err(format!(
+        "sandbox '{}' did not appear in ps output within 15s: {}",
+        name, drain_child_stderr(child)
+    ))
 }
 
 #[test]
@@ -462,7 +490,7 @@ fn test_ps_lists_running_sandbox() {
     let name = format!("test-ps-cli-{}", std::process::id());
     let mut child = spawn_sandbox(&name);
 
-    match wait_for_sandbox(&name) {
+    match wait_for_sandbox(&mut child, &name) {
         Ok(()) => {
             let out = sandlock_bin()
                 .args(["ps"])
@@ -514,7 +542,7 @@ fn test_config_returns_json_policy() {
     let name = format!("test-config-cli-{}", std::process::id());
     let mut child = spawn_sandbox(&name);
 
-    match wait_for_sandbox(&name) {
+    match wait_for_sandbox(&mut child, &name) {
         Ok(()) => {
             let out = sandlock_bin()
                 .args(["config", &name])
@@ -553,7 +581,7 @@ fn test_config_toml_flag_produces_toml() {
     let name = format!("test-config-toml-cli-{}", std::process::id());
     let mut child = spawn_sandbox(&name);
 
-    match wait_for_sandbox(&name) {
+    match wait_for_sandbox(&mut child, &name) {
         Ok(()) => {
             let out = sandlock_bin()
                 .args(["config", "--toml", &name])
@@ -601,7 +629,7 @@ fn test_kill_stops_sandbox() {
     let name = format!("test-kill-cli-{}", std::process::id());
     let mut child = spawn_sandbox(&name);
 
-    match wait_for_sandbox(&name) {
+    match wait_for_sandbox(&mut child, &name) {
         Ok(()) => {
             let out = sandlock_bin()
                 .args(["kill", &name])

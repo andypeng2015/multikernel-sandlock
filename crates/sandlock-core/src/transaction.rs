@@ -673,10 +673,13 @@ async fn drive_txn_stages(
     // (best-effort). See `open_stderr_tee` for why it must not be a dup of fd 2.
     let tee_fd: Option<OwnedFd> = open_stderr_tee();
 
+    // Stage names share one unique run id so concurrent transactions in the
+    // same UID never collide on their runtime dirs.
+    let run = crate::sandbox::unique_instance_id();
     for (i, stage) in stages.into_iter().enumerate() {
         let at = |source: SandlockError| TxnError::Stage { index: i, source };
         let cmd_refs: Vec<&str> = stage.args.iter().map(|s| s.as_str()).collect();
-        let mut sb = stage.sandbox.with_name(format!("txn-stage-{i}"));
+        let mut sb = stage.sandbox.with_name(format!("txn-{run}-stage-{i}"));
         sb.set_shared_cow(shared.clone()).map_err(at)?;
 
         // Redirect the stage's fd 2 onto a pipe the coordinator drains, keeping

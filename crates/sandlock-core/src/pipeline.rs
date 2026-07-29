@@ -47,7 +47,10 @@ impl Stage {
     /// Run this single stage and return the result.
     pub async fn run(self, timeout: Option<Duration>) -> Result<RunResult, SandlockError> {
         let cmd_refs: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
-        let mut sb = self.sandbox.with_name("stage");
+        // Names claim a per-UID runtime dir and a live collision is a hard
+        // error, so every internally assigned name carries a unique id.
+        let mut sb = self.sandbox.with_name(
+            format!("stage-{}", crate::sandbox::unique_instance_id()));
         if let Some(dur) = timeout {
             match tokio::time::timeout(dur, sb.run_interactive(&cmd_refs)).await {
                 Ok(result) => result,
@@ -180,11 +183,13 @@ async fn run_pipeline(stages: Vec<Stage>) -> Result<RunResult, SandlockError> {
     let (cap_stdout_r, cap_stdout_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
     let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
 
-    // Spawn each stage
+    // Spawn each stage. Stage names share one unique run id so concurrent
+    // pipelines in the same UID never collide on their runtime dirs.
+    let run = crate::sandbox::unique_instance_id();
     let mut sandboxes: Vec<Sandbox> = Vec::with_capacity(n);
 
     for (i, stage) in stages.into_iter().enumerate() {
-        let name = format!("pipeline-stage-{}", i);
+        let name = format!("pipeline-{run}-stage-{i}");
         let mut sb = stage.sandbox.clone().with_name(name);
 
         // Determine stdin for this stage
@@ -363,10 +368,13 @@ async fn run_gather(
     let (cap_stdout_r, cap_stdout_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
     let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
 
-    // Spawn producers: each writes stdout to its pipe
+    // Spawn producers: each writes stdout to its pipe. Source and consumer
+    // names share one unique run id so concurrent gathers in the same UID
+    // never collide on their runtime dirs.
+    let run = crate::sandbox::unique_instance_id();
     let mut sandboxes: Vec<Sandbox> = Vec::with_capacity(n + 1);
     for (i, ns) in sources.into_iter().enumerate() {
-        let name = format!("gather-source-{}", ns.name);
+        let name = format!("gather-{run}-source-{}", ns.name);
         let mut sb = ns.stage.sandbox.clone().with_name(name);
         let stdout_fd = source_pipes[i].1.as_raw_fd();
         let cmd_refs: Vec<&str> = ns.stage.args.iter().map(|s| s.as_str()).collect();
@@ -380,7 +388,7 @@ async fn run_gather(
     // Inject _SANDLOCK_GATHER env var
     consumer_sandbox.env.insert("_SANDLOCK_GATHER".to_string(), gather_env);
 
-    let mut consumer_sb = consumer_sandbox.clone().with_name("gather-consumer");
+    let mut consumer_sb = consumer_sandbox.clone().with_name(format!("gather-{run}-consumer"));
     let stdin_fd = source_pipes[n - 1].0.as_raw_fd();
 
     // Build extra fd mappings for non-stdin sources

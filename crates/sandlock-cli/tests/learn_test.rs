@@ -539,13 +539,27 @@ fn test_read_dedup_removes_leaf_when_ancestor_present() {
 }
 
 /// N-threshold collapse replaces individual files with their parent directory.
+///
+/// Uses a private tempdir rather than /usr/bin: learn canonicalizes observed
+/// paths, and on hosts where coreutils are symlinks into a multicall link farm
+/// (e.g. Ubuntu rust-coreutils on riscv64) the /usr/bin names scatter across
+/// parents that never reach the collapse threshold (issue #170).
 #[test]
 fn test_collapse_threshold_reads() {
-    let output = sandlock_bin()
-        .args(["learn", "--collapse", "--", "sh", "-c",
-               "cat /usr/bin/cat /usr/bin/sh /usr/bin/ls /usr/bin/env"])
-        .output()
-        .expect("failed to run sandlock learn");
+    let dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let dir_path = dir.path().canonicalize().expect("canonicalize tempdir");
+    let observed: Vec<String> = (1..=4)
+        .map(|i| {
+            let p = dir_path.join(format!("observed{i}.txt"));
+            std::fs::write(&p, "collapse me\n").expect("write observed file");
+            p.to_str().unwrap().to_owned()
+        })
+        .collect();
+
+    let mut cmd = sandlock_bin();
+    cmd.args(["learn", "--collapse=4", "--", "cat"]);
+    cmd.args(&observed);
+    let output = cmd.output().expect("failed to run sandlock learn");
     assert!(
         output.status.success(),
         "sandlock learn failed: stderr={}",
@@ -554,20 +568,35 @@ fn test_collapse_threshold_reads() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
     assert!(
-        read_line.contains("/usr/bin\"") || read_line.contains("/usr/bin,"),
-        "expected /usr/bin collapsed in reads, got: {read_line}",
+        read_line.contains(&format!("\"{}\"", dir_path.display())),
+        "expected {} collapsed in reads, got: {read_line}",
+        dir_path.display(),
     );
-    assert!(!read_line.contains("/usr/bin/cat"),
-        "expected individual /usr/bin files removed after collapse, got: {read_line}");
+    assert!(!read_line.contains("observed1.txt"),
+        "expected individual files removed after collapse, got: {read_line}");
 }
 
 /// --collapse-prefix forces collapse regardless of the file count threshold.
+///
+/// Two observed files stay below the N=4 default threshold, so only the
+/// prefix can produce the directory grant. Hermetic for the same reason as
+/// test_collapse_threshold_reads (issue #170).
 #[test]
 fn test_collapse_prefix_forces_collapse() {
-    let output = sandlock_bin()
-        .args(["learn", "--collapse-prefix", "/usr/bin", "--", "cat", "/usr/bin/cat", "/usr/bin/sh"])
-        .output()
-        .expect("failed to run sandlock learn");
+    let dir = tempfile::TempDir::new_in("/var/tmp").expect("tempdir in /var/tmp");
+    let dir_path = dir.path().canonicalize().expect("canonicalize tempdir");
+    let observed: Vec<String> = (1..=2)
+        .map(|i| {
+            let p = dir_path.join(format!("observed{i}.txt"));
+            std::fs::write(&p, "collapse me\n").expect("write observed file");
+            p.to_str().unwrap().to_owned()
+        })
+        .collect();
+
+    let mut cmd = sandlock_bin();
+    cmd.args(["learn", "--collapse-prefix", dir_path.to_str().unwrap(), "--", "cat"]);
+    cmd.args(&observed);
+    let output = cmd.output().expect("failed to run sandlock learn");
     assert!(
         output.status.success(),
         "sandlock learn failed: stderr={}",
@@ -576,11 +605,12 @@ fn test_collapse_prefix_forces_collapse() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
     assert!(
-        read_line.contains("/usr/bin\"") || read_line.contains("/usr/bin,"),
-        "expected /usr/bin collapsed in reads, got: {read_line}",
+        read_line.contains(&format!("\"{}\"", dir_path.display())),
+        "expected {} collapsed in reads, got: {read_line}",
+        dir_path.display(),
     );
-    assert!(!read_line.contains("/usr/bin/cat"),
-        "expected /usr/bin/cat removed after prefix collapse, got: {read_line}");
+    assert!(!read_line.contains("observed1.txt"),
+        "expected individual files removed after prefix collapse, got: {read_line}");
 }
 
 /// Guarded paths are not collapsed by the N-threshold; individual files are kept.

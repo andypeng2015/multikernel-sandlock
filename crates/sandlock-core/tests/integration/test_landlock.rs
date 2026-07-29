@@ -1565,7 +1565,6 @@ async fn test_deny_carveout_on_behalf_open_preserves_io() {
     // Allowed read still works (on-behalf probe + reopen path).
     let r = policy
         .clone()
-        .with_name("t")
         .run(&["cat", ok.to_str().unwrap()])
         .await
         .unwrap();
@@ -1575,7 +1574,6 @@ async fn test_deny_carveout_on_behalf_open_preserves_io() {
     let cmd = format!("echo hi > {}", created.display());
     let w = policy
         .clone()
-        .with_name("t")
         .run_interactive(&["sh", "-c", &cmd])
         .await
         .unwrap();
@@ -1585,7 +1583,6 @@ async fn test_deny_carveout_on_behalf_open_preserves_io() {
     // The denied carve-out stays blocked.
     let d = policy
         .clone()
-        .with_name("t")
         .run(&["cat", secret.to_str().unwrap()])
         .await
         .unwrap();
@@ -1638,7 +1635,6 @@ async fn test_deny_openat2_does_not_bypass() {
 
     let r = policy
         .clone()
-        .with_name("t")
         .run(&["python3", "-c", &script])
         .await
         .unwrap();

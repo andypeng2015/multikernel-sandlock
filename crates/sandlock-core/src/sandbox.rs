@@ -2487,12 +2487,20 @@ static NEXT_SANDBOX_NAME: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 fn sandbox_resolve_name(name: Option<&str>) -> Result<String, crate::error::SandlockError> {
     match name {
         Some(n) => sandbox_validate_name(n.to_string()),
-        None => Ok(format!(
-            "sandbox-{}-{}",
-            std::process::id(),
-            NEXT_SANDBOX_NAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        )),
+        None => Ok(format!("sandbox-{}", unique_instance_id())),
     }
+}
+
+/// A `<pid>-<counter>` suffix that makes an internally generated sandbox name
+/// unique across processes and within one. The runtime dir under
+/// /dev/shm/sandlock-$UID/ is claimed per name and a live collision is a hard
+/// error, so no internal caller may use a fixed name.
+pub(crate) fn unique_instance_id() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT_SANDBOX_NAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 fn sandbox_validate_name(name: String) -> Result<String, crate::error::SandlockError> {
