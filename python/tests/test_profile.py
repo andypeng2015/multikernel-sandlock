@@ -205,6 +205,53 @@ class TestPolicyFromDict:
         with pytest.raises(PolicyError, match=r"both VIRTUAL and HOST"):
             policy_from_dict({"filesystem": {"mount": [":/host"]}})
 
+    def test_mount_ro_suffix_raises(self):
+        # The CLI accepts 'VIRTUAL:HOST:ro'; the SDK cannot express a
+        # read-only mount, so it must refuse instead of folding ':ro' into
+        # the host path.
+        with pytest.raises(
+            PolicyError, match=r"':ro' suffix, which the Python SDK cannot honour"
+        ):
+            policy_from_dict({"filesystem": {"mount": ["/work:/host:ro"]}})
+
+    def test_mount_rw_suffix_raises(self):
+        # ':rw' is refused for a different reason: it is outside this
+        # parser's grammar, not something the SDK cannot express. The
+        # message must not claim a read-only mount is involved.
+        with pytest.raises(
+            PolicyError, match=r"':rw' suffix, which is the sandlock CLI's default"
+        ):
+            policy_from_dict({"filesystem": {"mount": ["/work:/host:rw"]}})
+
+    def test_mount_rw_error_does_not_claim_a_read_only_mount(self):
+        with pytest.raises(PolicyError) as excinfo:
+            policy_from_dict({"filesystem": {"mount": ["/work:/host:rw"]}})
+        message = str(excinfo.value)
+        assert "read-only" not in message, message
+        assert "remove it" in message
+
+    def test_mount_suffix_error_names_spec_and_remedy(self):
+        with pytest.raises(PolicyError) as excinfo:
+            policy_from_dict({"filesystem": {"mount": ["/work:/host:ro"]}})
+        message = str(excinfo.value)
+        assert "'/work:/host:ro'" in message
+        # The profile is often one the CLI itself wrote, so the remedy is
+        # to run it with the CLI, not to retype it as a flag.
+        assert "sandlock --profile-file" in message
+
+    def test_mount_without_suffix_still_parses(self):
+        # Control: the rejection must not touch ordinary specs.
+        p = policy_from_dict({"filesystem": {"mount": ["/work:/host"]}})
+        assert p.fs_mount == {"/work": "/host"}
+
+    def test_mount_colon_in_host_without_suffix_still_parses(self):
+        # Only a trailing ':ro'/':rw' is refused: inner colons belong to the
+        # host path (core splits on the first colon), and ':root' is not ':ro'.
+        p = policy_from_dict({
+            "filesystem": {"mount": ["/v:/a:b", "/v2:/host:root"]},
+        })
+        assert p.fs_mount == {"/v": "/a:b", "/v2": "/host:root"}
+
 
 class TestLoadProfilePath:
     def test_load_valid_toml(self, tmp_path):

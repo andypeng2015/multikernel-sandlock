@@ -14,6 +14,10 @@ Rust CLI). Each section maps to a subset of ``Sandbox`` fields:
     [filesystem]  → fs_readable (read), fs_writable (write),
                     fs_denied (deny), chroot,
                     fs_mount (mount), on_exit, on_error
+                    (mount entries are ``"VIRTUAL:HOST"`` only; a trailing
+                    ``:ro``/``:rw`` is part of the CLI's grammar, not this
+                    one, and is rejected — ``:ro`` because this mapping
+                    cannot express a read-only mount at all)
     [network]     → net_allow_bind (allow_bind), net_deny_bind (deny_bind), net_allow (allow), net_deny (deny), port_remap
     [http]        → http_ports (ports), http_allow (allow),
                     http_deny (deny)
@@ -233,6 +237,36 @@ def _coerce(
                 raise PolicyError(
                     f"{source}: [{section}].{toml_key} entry {spec!r} "
                     "must be 'VIRTUAL:HOST'"
+                )
+            # The Rust CLI strips a trailing ':ro'/':rw' before splitting on
+            # the first colon; this parser does not, so the suffix would end
+            # up baked into the host path. Both forms are refused, but for
+            # different reasons, so the message must say which.
+            if spec.endswith(":ro"):
+                # Dropping ':ro' would be worse than refusing: Sandbox.fs_mount
+                # is a plain virtual -> host mapping with no read-only channel,
+                # so the target would be mounted read-write instead.
+                raise PolicyError(
+                    f"{source}: [{section}].{toml_key} entry {spec!r} uses a "
+                    "':ro' suffix, which the Python SDK cannot honour: its "
+                    "mount mapping cannot express a read-only mount, and "
+                    "dropping the suffix would silently mount the host path "
+                    "read-write. Run this profile with the sandlock CLI "
+                    "('sandlock --profile-file <path>' or '-p <name>'), which "
+                    "honours ':ro', or drop the suffix and accept a "
+                    "read-write mount"
+                )
+            if spec.endswith(":rw"):
+                # ':rw' is the CLI's explicit default and means exactly what
+                # this mapping already does, but the suffix is not part of the
+                # grammar this parser accepts, so it must not be swallowed.
+                raise PolicyError(
+                    f"{source}: [{section}].{toml_key} entry {spec!r} uses a "
+                    "':rw' suffix, which is the sandlock CLI's default and is "
+                    "not part of this parser's 'VIRTUAL:HOST' grammar; remove "
+                    "it — the mount is read-write already. To keep the suffix, "
+                    "run the profile with the sandlock CLI "
+                    "('sandlock --profile-file <path>' or '-p <name>')"
                 )
             virt, host = spec.split(":", 1)
             if not virt or not host:
