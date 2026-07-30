@@ -547,23 +547,40 @@ impl SandboxBuilder {
 
     /// Cap the sandboxed process's file-descriptor table via `RLIMIT_NOFILE`.
     ///
-    /// Both the soft and the hard limit are set to `n` in the child, just
-    /// before it execs, so the process cannot raise the cap back afterwards and
-    /// every descendant inherits it. Unset (the default) leaves the inherited
-    /// system limit alone.
+    /// Both the soft and the hard limit are lowered in the child, just before
+    /// it execs, so every descendant inherits the cap. Unset (the default)
+    /// leaves the inherited system limit alone.
     ///
-    /// `n` is clamped to the hard limit sandlock itself inherited: raising a
-    /// hard limit requires `CAP_SYS_RESOURCE`, so a larger request would abort
-    /// the child. The cap is therefore an upper bound, never a grant.
+    /// The effective value is `n` clamped to *both* limits sandlock itself
+    /// inherited, which keeps the cap an upper bound and never a grant: a
+    /// request above the inherited hard limit cannot be applied at all (raising
+    /// a hard limit needs `CAP_SYS_RESOURCE`), and a request above the
+    /// inherited *soft* limit is clamped too, so the guest never ends up with
+    /// more descriptors than the same command gets unsandboxed. Raise the limit
+    /// on sandlock itself (`prlimit`, systemd `LimitNOFILE=`) if a guest
+    /// legitimately needs a bigger budget.
+    ///
+    /// Lowering the hard limit as well makes the cap one-way *for an
+    /// unprivileged sandlock*: raising it back needs `CAP_SYS_RESOURCE`, which
+    /// the child does not have. It is **not** one-way when sandlock itself runs
+    /// privileged (root, or with `CAP_SYS_RESOURCE`): nothing drops that
+    /// capability, so the guest can raise the cap straight back. Treat this as
+    /// a resource budget, not as confinement — Landlock and seccomp stay
+    /// irreversible either way.
     ///
     /// The limit also has to cover what starting the process costs: stdio, the
     /// descriptors the dynamic loader opens per shared library, and under
     /// `chroot` the injected exec fd. Set it too low and the child never
-    /// reaches `main` — `execve` or the loader fails with `EMFILE` and the run
-    /// exits 127 with the reason on stderr. Measured floors for a trivial
-    /// command: 4 for a plain dynamically linked exec, 17 under `chroot`.
-    /// Treat those as the shape of the constraint, not a guarantee — a program
-    /// linking more libraries needs more.
+    /// reaches `main`; the run exits 127 with the reason on stderr, but the
+    /// errno depends on the mode — a plain exec reports `EMFILE` from the
+    /// loader, while under `chroot` the supervisor cannot install the exec fd
+    /// and the `execve` fails with `EIO`. The same split applies once the guest
+    /// is running: an `open` the kernel services returns `EMFILE`, but one the
+    /// supervisor services (`chroot`, COW, procfs virtualisation) is refused
+    /// with `EACCES`, indistinguishable from a policy denial. Measured floors
+    /// for a trivial command: 4 for a plain dynamically linked exec, 17 under
+    /// `chroot`. Treat those as the shape of the constraint, not a guarantee —
+    /// a program linking more libraries needs more.
     pub fn max_open_files(mut self, n: u32) -> Self {
         self.max_open_files = Some(n);
         self
@@ -786,11 +803,13 @@ impl SandboxBuilder {
 
         // Validate: max_open_files must be non-zero. A zero cap cannot be
         // honoured — the child needs descriptors to reach `main` at all, so it
-        // would die with EMFILE from the dynamic loader and exit 127, far from
-        // the setting that caused it. Catching it here keeps the check in one
-        // place instead of one per binding: the C ABI and the CLI both pass the
-        // value straight through, and only the Go SDK filters zero, which it
-        // must, because a Go struct field cannot express "unset" any other way.
+        // would die before it and exit 127 with an errno far from the setting
+        // that caused it (EMFILE from the dynamic loader on a plain exec, EIO
+        // from the exec-fd injection under chroot). Catching it here keeps the
+        // check in one place instead of one per binding: the C ABI and the CLI
+        // both pass the value straight through, and only the Go SDK filters
+        // zero, which it must, because a Go struct field cannot express "unset"
+        // any other way.
         if self.max_open_files == Some(0) {
             return Err(SandboxError::Invalid(
                 "max_open_files must be greater than 0; omit it to inherit the \

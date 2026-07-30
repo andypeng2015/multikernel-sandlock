@@ -358,9 +358,24 @@ async fn test_max_open_files_enforced() {
     // Both bounds lowered: a soft-only cap would be advisory, since the guest
     // may call setrlimit itself.
     assert!(out.contains("RLIM 64 64"), "guest should see soft=hard=64, got: {}", out);
-    assert!(out.contains("RAISE_DENIED"), "lowering the hard limit must be one-way, got: {}", out);
-    assert!(!out.contains("OPEN_OK"), "200 descriptors must exceed the limit of 64, got: {}", out);
-    assert!(out.contains("OPEN_DENIED 24"), "excess open() should fail with EMFILE, got: {}", out);
+    // Lowering the hard limit is one-way only for an *unprivileged* sandlock.
+    // Nothing drops CAP_SYS_RESOURCE, so a child of a root supervisor raises the
+    // cap right back — and then opens all 200 descriptors. Asserting the
+    // unprivileged behaviour unconditionally would fail every run under `sudo`
+    // on a correct build, so the guest-side assertions are split by euid; the
+    // cap itself (RLIM above) is checked in both modes.
+    if unsafe { libc::geteuid() } == 0 {
+        assert!(
+            out.contains("RAISE_OK"),
+            "a privileged sandlock keeps CAP_SYS_RESOURCE, so the guest may raise the cap back \
+             (documented caveat on max_open_files); got: {}",
+            out
+        );
+    } else {
+        assert!(out.contains("RAISE_DENIED"), "lowering the hard limit must be one-way, got: {}", out);
+        assert!(!out.contains("OPEN_OK"), "200 descriptors must exceed the limit of 64, got: {}", out);
+        assert!(out.contains("OPEN_DENIED 24"), "excess open() should fail with EMFILE, got: {}", out);
+    }
     assert_eq!(restricted.code(), Some(0));
 
     let baseline = base_policy()
@@ -373,6 +388,83 @@ async fn test_max_open_files_enforced() {
     assert!(!out.contains("RLIM 64 64"), "unset max_open_files must inherit, got: {}", out);
     assert!(out.contains("OPEN_OK 200"), "no limit means 200 descriptors open fine, got: {}", out);
     assert_eq!(baseline.code(), Some(0));
+}
+
+/// The cap never *widens* the guest's descriptor budget: a request above the
+/// limit sandlock itself runs under is clamped to the inherited soft limit, not
+/// granted. Clamping against the hard limit alone is not enough — the common
+/// host layout is a soft/hard split (1024 / 1048576), where every request in
+/// between would otherwise hand the sandboxed process more descriptors than the
+/// same command gets unsandboxed.
+#[tokio::test]
+async fn test_max_open_files_does_not_raise_inherited_limit() {
+    let mut orig = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut orig) }, 0);
+
+    // The test needs a soft < hard split to ask for "more than we have but less
+    // than the kernel would refuse". Create one if the host has none, keeping
+    // the soft limit high enough for the rest of the suite (the change is
+    // process-wide and restored right after the run).
+    let soft = orig.rlim_cur.min(4096);
+    if soft >= orig.rlim_max {
+        eprintln!("skipped: no soft<hard RLIMIT_NOFILE split available on this host");
+        return;
+    }
+    let lowered = libc::rlimit { rlim_cur: soft, rlim_max: orig.rlim_max };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+
+    // Request well above the inherited soft limit but still below the hard one,
+    // so a hard-limit-only clamp would let it through unchanged.
+    let requested = (soft + 1024) as u32;
+    let result = base_policy()
+        .max_open_files(requested)
+        .build()
+        .unwrap()
+        .run(&["python3", "-c", NOFILE_PROBE])
+        .await;
+
+    // Restore before asserting: a panic here must not leave the whole test
+    // binary running under the lowered limit.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &orig) }, 0);
+
+    let result = result.unwrap();
+    let out = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or(b"")).into_owned();
+    assert_eq!(result.code(), Some(0), "the run must succeed, got: {}", out);
+    assert!(
+        out.contains(&format!("RLIM {} {}", soft, soft)),
+        "requesting {} with an inherited soft limit of {} must clamp to {}, not widen the guest's \
+         budget; got: {}",
+        requested,
+        soft,
+        soft,
+        out
+    );
+}
+
+/// The setrlimit must stay the *last* confinement step. A cap this small is
+/// below what Landlock (one O_PATH fd per rule path plus the ruleset fd) and
+/// the seccomp notify listener need, so applying it any earlier makes the child
+/// die with "landlock: create ruleset: Too many open files" instead of running.
+/// With the correct placement those descriptors are already spent and closed,
+/// and the cap only has to cover stdio plus the loader.
+#[tokio::test]
+async fn test_max_open_files_applied_after_landlock_and_seccomp() {
+    let result = base_policy()
+        .max_open_files(12)
+        .build()
+        .unwrap()
+        .run(&["/bin/true"])
+        .await
+        .expect(
+            "the child must survive confinement setup under a small cap — an early setrlimit \
+             starves Landlock/seccomp and kills the child before it reports back",
+        );
+    assert_eq!(
+        result.code(),
+        Some(0),
+        "a cap smaller than the confinement setup needs must still run, stderr: {}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or(b""))
+    );
 }
 
 #[tokio::test]

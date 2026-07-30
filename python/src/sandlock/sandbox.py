@@ -274,8 +274,13 @@ class Sandbox:
 
     max_open_files: int | None = None
     """Maximum number of open file descriptors.  Enforced via
-    RLIMIT_NOFILE — kernel-enforced, survives exec.  Prevents fd
-    exhaustion attacks.  None = inherit system default."""
+    RLIMIT_NOFILE (soft and hard) in the child — kernel-enforced,
+    survives exec, inherited by descendants.  Clamped to the limits
+    sandlock itself runs under, so it only ever caps, never grants.
+    A budget against fd exhaustion rather than a confinement boundary:
+    a sandbox launched by a privileged (root) supervisor keeps
+    CAP_SYS_RESOURCE and can raise the cap back.  None = inherit system
+    default."""
 
     max_cpu: int | None = None
     """CPU throttle as a percentage of one core (1–100).  E.g. ``50``

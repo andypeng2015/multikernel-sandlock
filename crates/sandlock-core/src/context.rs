@@ -253,6 +253,28 @@ fn set_proc_name(name: &CStr) {
     unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0) };
 }
 
+/// The `RLIMIT_NOFILE` value a `max_open_files` request of `requested` yields,
+/// given the limits sandlock itself inherited.
+///
+/// Clamped against *both* inherited bounds, for two different reasons:
+///
+/// * the hard bound is a kernel requirement — raising a hard limit needs
+///   `CAP_SYS_RESOURCE`, so a larger request would fail with `EPERM` and abort
+///   the child;
+/// * the soft bound is the contract — `max_open_files` is a cap, not a grant.
+///   Without this clamp a request between the inherited soft and hard limits
+///   would *widen* the guest's descriptor budget past what the same command
+///   gets unsandboxed (soft 1024 / hard 1048576 is the distro default, so
+///   `max_open_files(65536)` would hand the guest 64x the usual budget under a
+///   setting named "max").
+///
+/// Callers who genuinely need a bigger budget raise it on sandlock itself
+/// (`prlimit`, systemd `LimitNOFILE=`); the guest then inherits the higher soft
+/// limit and this clamp stops constraining.
+fn effective_nofile(requested: u32, inherited: &libc::rlimit) -> libc::rlim_t {
+    (requested as libc::rlim_t).min(inherited.rlim_cur).min(inherited.rlim_max)
+}
+
 /// Apply irreversible confinement (Landlock + seccomp), then either `execve` the
 /// command or run an in-process entrypoint, per [`ChildEntry`].
 ///
@@ -562,17 +584,17 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // Lower both the soft and the hard limit. setrlimit/prlimit64 are not
         // blocked by the seccomp filter, so a soft-only cap would be advisory:
         // the sandboxed process could raise it straight back to the hard limit.
-        // Raising a hard limit needs CAP_SYS_RESOURCE, which the child (with
-        // NO_NEW_PRIVS and no capabilities) does not have, so this is one-way.
-        //
-        // Clamp to the inherited hard limit: a request above it would make
-        // setrlimit fail with EPERM and abort the child. Clamping only ever
-        // yields a *lower* limit, so the "no more than N" contract holds.
+        // Raising a hard limit needs CAP_SYS_RESOURCE, so an *unprivileged*
+        // sandlock makes this one-way. It is not one-way when sandlock itself
+        // runs privileged: nothing here drops CAP_SYS_RESOURCE, so a root child
+        // can setrlimit the cap straight back up. Treat the limit as a resource
+        // budget, not as confinement — unlike Landlock (step 8) and seccomp
+        // (step 9), which stay irreversible for root too.
         let mut inherited = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) } != 0 {
             fail!("getrlimit(RLIMIT_NOFILE)");
         }
-        let target = (n as libc::rlim_t).min(inherited.rlim_max);
+        let target = effective_nofile(n, &inherited);
         let rlim = libc::rlimit { rlim_cur: target, rlim_max: target };
         if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
             fail!(format!("setrlimit(RLIMIT_NOFILE, {})", target));

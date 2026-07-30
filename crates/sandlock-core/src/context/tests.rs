@@ -338,3 +338,30 @@ fn test_syscall_name_to_nr_covers_defaults() {
     }
     assert_eq!(skipped, expected_unresolved.len());
 }
+
+#[test]
+fn test_effective_nofile_clamps_to_both_inherited_bounds() {
+    // A request below both bounds is applied verbatim — the ordinary case.
+    let split = libc::rlimit { rlim_cur: 1024, rlim_max: 1_048_576 };
+    assert_eq!(effective_nofile(64, &split), 64);
+
+    // A request *between* the inherited soft and hard limits must not widen the
+    // guest's budget: with the distro-default 1024/1048576 split, asking for
+    // 65536 would otherwise hand the sandboxed process 64x the descriptors the
+    // same command gets unsandboxed, under a setting named "max".
+    assert_eq!(effective_nofile(65_536, &split), 1024);
+
+    // A request above the hard limit cannot be applied at all (raising a hard
+    // limit needs CAP_SYS_RESOURCE), so it clamps rather than aborting the
+    // child.
+    assert_eq!(effective_nofile(u32::MAX, &split), 1024);
+    let raised = libc::rlimit { rlim_cur: 4096, rlim_max: 4096 };
+    assert_eq!(effective_nofile(u32::MAX, &raised), 4096);
+
+    // An unlimited inheritance leaves the request alone.
+    let unlimited = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    assert_eq!(effective_nofile(4096, &unlimited), 4096);
+}

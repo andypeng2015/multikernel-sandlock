@@ -861,3 +861,56 @@ async fn test_chroot_etc_hosts_no_duplicate_loopback() {
 
     cleanup_rootfs(&rootfs);
 }
+
+/// `max_open_files` under `chroot`: the cap applies as usual, but a value too
+/// low to start the process does *not* surface as `EMFILE`. Under `chroot` the
+/// exec fd is injected by the supervisor, and an injection the guest's
+/// descriptor limit refuses is answered `EIO`, so the run exits 127 with
+/// "Input/output error". The documentation promises that errno for this mode —
+/// this test is what keeps it honest.
+#[tokio::test]
+async fn test_max_open_files_chroot_exec_error_is_eio() {
+    let rootfs = build_test_rootfs("max-open-files");
+
+    // A workable cap changes nothing about the run.
+    let ok = minimal_exec_policy(&rootfs)
+        .max_open_files(64)
+        .build()
+        .unwrap()
+        .run(&["rootfs-helper", "true"])
+        .await;
+    match ok {
+        Ok(r) => assert!(
+            r.success(),
+            "a 64-descriptor cap should still run under chroot, stderr: {}",
+            r.stderr_str().unwrap_or("")
+        ),
+        Err(e) => {
+            eprintln!("Chroot test skipped: {}", e);
+            cleanup_rootfs(&rootfs);
+            return;
+        }
+    }
+
+    // Too low to install the injected exec fd: the guest never reaches `main`.
+    let too_low = minimal_exec_policy(&rootfs)
+        .max_open_files(4)
+        .build()
+        .unwrap()
+        .run(&["rootfs-helper", "true"])
+        .await
+        .unwrap();
+    assert_eq!(
+        too_low.code(),
+        Some(127),
+        "a cap below the chroot startup floor must fail the exec, stderr: {}",
+        too_low.stderr_str().unwrap_or("")
+    );
+    let stderr = too_low.stderr_str().unwrap_or("").to_string();
+    assert!(
+        stderr.contains("Input/output error") || stderr.contains("os error 5"),
+        "the chroot exec failure is reported as EIO, not EMFILE, got: {stderr}"
+    );
+
+    cleanup_rootfs(&rootfs);
+}
