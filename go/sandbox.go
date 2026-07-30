@@ -240,7 +240,7 @@ type Sandbox struct {
 	MaxDisk      string   // disk quota for COW storage, e.g. "1G"
 	MaxProcesses uint32   // peak concurrent process cap; 0 = sandlock default
 	MaxCPU       uint8    // CPU throttle, percent of one core (1-100); 0 = unset
-	MaxOpenFiles uint32   // RLIMIT_NOFILE; 0 = inherit system default
+	MaxOpenFiles uint32   // RLIMIT_NOFILE soft+hard in the child, clamped to sandlock's own limits; 0 = inherit
 	CPUCores     []uint32 // cores to pin to via sched_setaffinity
 	NumCPUs      uint32   // synthetic /proc/cpuinfo processor count; 0 = unset
 	GPUDevices   []uint32 // GPU device indices to expose; nil = none

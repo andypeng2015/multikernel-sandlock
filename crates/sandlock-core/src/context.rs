@@ -253,6 +253,28 @@ fn set_proc_name(name: &CStr) {
     unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0) };
 }
 
+/// The `RLIMIT_NOFILE` value a `max_open_files` request of `requested` yields,
+/// given the limits sandlock itself inherited.
+///
+/// Clamped against *both* inherited bounds, for two different reasons:
+///
+/// * the hard bound is a kernel requirement — raising a hard limit needs
+///   `CAP_SYS_RESOURCE`, so a larger request would fail with `EPERM` and abort
+///   the child;
+/// * the soft bound is the contract — `max_open_files` is a cap, not a grant.
+///   Without this clamp a request between the inherited soft and hard limits
+///   would *widen* the guest's descriptor budget past what the same command
+///   gets unsandboxed (soft 1024 / hard 1048576 is the distro default, so
+///   `max_open_files(65536)` would hand the guest 64x the usual budget under a
+///   setting named "max").
+///
+/// Callers who genuinely need a bigger budget raise it on sandlock itself
+/// (`prlimit`, systemd `LimitNOFILE=`); the guest then inherits the higher soft
+/// limit and this clamp stops constraining.
+fn effective_nofile(requested: u32, inherited: &libc::rlimit) -> libc::rlim_t {
+    (requested as libc::rlim_t).min(inherited.rlim_cur).min(inherited.rlim_max)
+}
+
 /// Apply irreversible confinement (Landlock + seccomp), then either `execve` the
 /// command or run an in-process entrypoint, per [`ChildEntry`].
 ///
@@ -544,6 +566,39 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             std::env::set_var("ROCR_VISIBLE_DEVICES", &vis);
         }
         // Empty list = all GPUs visible, don't set env vars
+    }
+
+    // 13c. Optional: cap the file-descriptor table.
+    //
+    // Deliberately the *last* confinement step: RLIMIT_NOFILE bounds the fd
+    // *number* the kernel may hand out, not the count of live descriptors, and
+    // every earlier step still needs to open files — Landlock takes an O_PATH
+    // fd per rule path plus the ruleset fd (step 8), seccomp allocates the
+    // notify listener (step 9), and `close_fds_above` reads /proc/self/fd
+    // (step 12). Setting the limit before those turns them into EMFILE and the
+    // child dies with a message blaming Landlock instead of the limit. After
+    // step 12 the table is {0,1,2} + keep_fds, which is what a caller means by
+    // "at most N open files". Placing it before the `entry` match applies it to
+    // the in-process entrypoint too, not only to the exec path.
+    if let Some(n) = sandbox.max_open_files {
+        // Lower both the soft and the hard limit. setrlimit/prlimit64 are not
+        // blocked by the seccomp filter, so a soft-only cap would be advisory:
+        // the sandboxed process could raise it straight back to the hard limit.
+        // Raising a hard limit needs CAP_SYS_RESOURCE, so an *unprivileged*
+        // sandlock makes this one-way. It is not one-way when sandlock itself
+        // runs privileged: nothing here drops CAP_SYS_RESOURCE, so a root child
+        // can setrlimit the cap straight back up. Treat the limit as a resource
+        // budget, not as confinement — unlike Landlock (step 8) and seccomp
+        // (step 9), which stay irreversible for root too.
+        let mut inherited = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) } != 0 {
+            fail!("getrlimit(RLIMIT_NOFILE)");
+        }
+        let target = effective_nofile(n, &inherited);
+        let rlim = libc::rlimit { rlim_cur: target, rlim_max: target };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
+            fail!(format!("setrlimit(RLIMIT_NOFILE, {})", target));
+        }
     }
 
     // 14. Terminal action: run the in-process entrypoint, or fall through to

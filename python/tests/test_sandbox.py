@@ -675,11 +675,12 @@ class TestNewPolicyFields:
         assert result.stdout.strip() == b"ok"
 
     def test_max_open_files(self):
-        # max_open_files is accepted by the policy but not yet enforced
-        # in the sandbox — just verify it doesn't crash.
+        # max_open_files lowers RLIMIT_NOFILE in the child, so the guest shell
+        # reports the capped value instead of the (much larger) host default.
         p = _policy(max_open_files=64)
-        result = p.run(["echo", "ok"])
+        result = p.run(["sh", "-c", "ulimit -n"])
         assert result.success
+        assert result.stdout.strip() == b"64"
 
 
 
