@@ -211,6 +211,48 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_mount(
     Box::into_raw(Box::new(builder.fs_mount(vp, hp)))
 }
 
+/// Add a read-only filesystem mount mapping (virtual_path -> host_path).
+///
+/// Same mapping as [`sandlock_sandbox_builder_fs_mount`], but writes under
+/// `virtual_path` are denied with `EACCES` (reads, exec and directory listing
+/// still go through), and the denial wins over any broader writable rule such
+/// as a read-write rootfs granting `/`.
+///
+/// Mount mappings — and therefore this read-only marking — are only enforced
+/// when [`sandlock_sandbox_builder_chroot`] is also set; without a chroot this
+/// call has no effect on the guest's filesystem view.
+///
+/// Both paths must be non-empty UTF-8; anything else is ignored and adds no
+/// mount (an empty virtual path would match every guest path).
+///
+/// # Safety
+/// `b`, `virtual_path`, and `host_path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_fs_mount_ro(
+    b: *mut SandboxBuilder,
+    virtual_path: *const c_char,
+    host_path: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || virtual_path.is_null() || host_path.is_null() {
+        return b;
+    }
+    // Reject instead of degrading to "": an empty virtual path is a prefix of
+    // every guest path, so it would mount the whole tree read-only and make
+    // `can_read` true everywhere, voiding the read allowlist. Core's
+    // `parse_mount_spec` enforces the same non-empty rule for mount specs.
+    let (Ok(vp), Ok(hp)) = (
+        CStr::from_ptr(virtual_path).to_str(),
+        CStr::from_ptr(host_path).to_str(),
+    ) else {
+        return b;
+    };
+    if vp.is_empty() || hp.is_empty() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.fs_mount_ro(vp, hp)))
+}
+
 /// Set the COW branch action on successful exit.
 /// `action`: 0 = Commit, 1 = Abort, 2 = Keep.
 ///

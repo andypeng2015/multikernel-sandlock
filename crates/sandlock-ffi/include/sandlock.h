@@ -372,6 +372,28 @@ sandlock_builder_t *sandlock_sandbox_builder_fs_mount(sandlock_builder_t *b,
                                                       const char *host_path);
 
 /**
+ * Add a read-only filesystem mount mapping (virtual_path -> host_path).
+ *
+ * Same mapping as [`sandlock_sandbox_builder_fs_mount`], but writes under
+ * `virtual_path` are denied with `EACCES` (reads, exec and directory listing
+ * still go through), and the denial wins over any broader writable rule such
+ * as a read-write rootfs granting `/`.
+ *
+ * Mount mappings — and therefore this read-only marking — are only enforced
+ * when [`sandlock_sandbox_builder_chroot`] is also set; without a chroot this
+ * call has no effect on the guest's filesystem view.
+ *
+ * Both paths must be non-empty UTF-8; anything else is ignored and adds no
+ * mount (an empty virtual path would match every guest path).
+ *
+ * # Safety
+ * `b`, `virtual_path`, and `host_path` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_fs_mount_ro(sandlock_builder_t *b,
+                                                         const char *virtual_path,
+                                                         const char *host_path);
+
+/**
  * Set the COW branch action on successful exit.
  * `action`: 0 = Commit, 1 = Abort, 2 = Keep.
  *
