@@ -322,6 +322,59 @@ async fn test_cpu_cores_affinity() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// A probe that reports the descriptor limit it sees, whether it can raise it
+/// back, and how far it gets opening descriptors. Shared by the restricted and
+/// the baseline arm so the two runs differ only by `max_open_files`.
+const NOFILE_PROBE: &str = concat!(
+    "import os, resource\n",
+    "print('STARTED', flush=True)\n",
+    "soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)\n",
+    "print('RLIM', soft, hard)\n",
+    "try:\n",
+    "    resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096)); print('RAISE_OK')\n",
+    "except (ValueError, OSError): print('RAISE_DENIED')\n",
+    "fds = []\n",
+    "try:\n",
+    "    for _ in range(200): fds.append(os.open('/dev/null', os.O_RDONLY))\n",
+    "    print('OPEN_OK', len(fds))\n",
+    "except OSError as e: print('OPEN_DENIED', e.errno, len(fds))\n",
+);
+
+/// `max_open_files` is enforced via RLIMIT_NOFILE in the child: the guest sees
+/// the lowered limit, cannot raise it back, and hits EMFILE past it. The
+/// control run (same probe, no limit) opens every descriptor — without the
+/// setrlimit call the two runs are indistinguishable and this test fails.
+#[tokio::test]
+async fn test_max_open_files_enforced() {
+    let restricted = base_policy()
+        .max_open_files(64)
+        .build()
+        .unwrap()
+        .run(&["python3", "-c", NOFILE_PROBE])
+        .await
+        .unwrap();
+    let out = String::from_utf8_lossy(restricted.stdout.as_deref().unwrap_or(b"")).into_owned();
+    assert!(out.contains("STARTED"), "guest should start, got: {}", out);
+    // Both bounds lowered: a soft-only cap would be advisory, since the guest
+    // may call setrlimit itself.
+    assert!(out.contains("RLIM 64 64"), "guest should see soft=hard=64, got: {}", out);
+    assert!(out.contains("RAISE_DENIED"), "lowering the hard limit must be one-way, got: {}", out);
+    assert!(!out.contains("OPEN_OK"), "200 descriptors must exceed the limit of 64, got: {}", out);
+    assert!(out.contains("OPEN_DENIED 24"), "excess open() should fail with EMFILE, got: {}", out);
+    assert_eq!(restricted.code(), Some(0));
+
+    let baseline = base_policy()
+        .build()
+        .unwrap()
+        .run(&["python3", "-c", NOFILE_PROBE])
+        .await
+        .unwrap();
+    let out = String::from_utf8_lossy(baseline.stdout.as_deref().unwrap_or(b"")).into_owned();
+    assert!(!out.contains("RLIM 64 64"), "unset max_open_files must inherit, got: {}", out);
+    assert!(out.contains("OPEN_OK 200"), "no limit means 200 descriptors open fine, got: {}", out);
+    assert_eq!(baseline.code(), Some(0));
+}
+
 #[tokio::test]
 async fn test_pause_resume() {
     let policy = base_policy().build().unwrap();

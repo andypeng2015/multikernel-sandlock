@@ -107,6 +107,7 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(short = 'P', long = "max-processes"))]
     pub max_processes: Option<u32>,
 
+    /// Open file-descriptor limit (RLIMIT_NOFILE, soft and hard) [default: inherit]
     #[cfg_attr(feature = "cli", arg(long = "max-open-files"))]
     pub max_open_files: Option<u32>,
 
@@ -544,6 +545,25 @@ impl SandboxBuilder {
         self
     }
 
+    /// Cap the sandboxed process's file-descriptor table via `RLIMIT_NOFILE`.
+    ///
+    /// Both the soft and the hard limit are set to `n` in the child, just
+    /// before it execs, so the process cannot raise the cap back afterwards and
+    /// every descendant inherits it. Unset (the default) leaves the inherited
+    /// system limit alone.
+    ///
+    /// `n` is clamped to the hard limit sandlock itself inherited: raising a
+    /// hard limit requires `CAP_SYS_RESOURCE`, so a larger request would abort
+    /// the child. The cap is therefore an upper bound, never a grant.
+    ///
+    /// The limit also has to cover what starting the process costs: stdio, the
+    /// descriptors the dynamic loader opens per shared library, and under
+    /// `chroot` the injected exec fd. Set it too low and the child never
+    /// reaches `main` — `execve` or the loader fails with `EMFILE` and the run
+    /// exits 127 with the reason on stderr. Measured floors for a trivial
+    /// command: 4 for a plain dynamically linked exec, 17 under `chroot`.
+    /// Treat those as the shape of the constraint, not a guarantee — a program
+    /// linking more libraries needs more.
     pub fn max_open_files(mut self, n: u32) -> Self {
         self.max_open_files = Some(n);
         self
@@ -762,6 +782,23 @@ impl SandboxBuilder {
             if cpu == 0 || cpu > 100 {
                 return Err(SandboxError::InvalidCpuPercent(cpu));
             }
+        }
+
+        // Validate: max_open_files must be non-zero. A zero cap cannot be
+        // honoured — the child needs descriptors to reach `main` at all, so it
+        // would die with EMFILE from the dynamic loader and exit 127, far from
+        // the setting that caused it. Catching it here keeps the check in one
+        // place instead of one per binding: the C ABI and the CLI both pass the
+        // value straight through, and only the Go SDK filters zero, which it
+        // must, because a Go struct field cannot express "unset" any other way.
+        if self.max_open_files == Some(0) {
+            return Err(SandboxError::Invalid(
+                "max_open_files must be greater than 0; omit it to inherit the \
+                 system limit. Note that a workable floor is well above 1: a \
+                 plain dynamically linked exec needs about 4 descriptors, and \
+                 about 17 under chroot."
+                    .into(),
+            ));
         }
 
         // Validate: http_ca and http_key must both be set or both unset
@@ -1060,6 +1097,37 @@ fn exposing_grant<'a>(
 mod tests {
     use super::exposing_grant;
     use std::path::PathBuf;
+
+    #[test]
+    fn max_open_files_zero_is_rejected_at_build() {
+        // Zero cannot be honoured: the child needs descriptors to reach `main`,
+        // so without this check it would die with EMFILE from the loader and
+        // exit 127, with nothing pointing at the setting responsible.
+        let err = super::SandboxBuilder::default()
+            .max_open_files(0)
+            .build()
+            .expect_err("a zero descriptor cap must not build");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_open_files"),
+            "the error must name the setting, got: {msg}"
+        );
+        assert!(
+            msg.contains("omit"),
+            "the error must say how to get the inherited limit, got: {msg}"
+        );
+
+        // Unset stays valid — the check must not reject the default.
+        super::SandboxBuilder::default()
+            .build()
+            .expect("an unset cap must still build");
+
+        // A usable value stays valid.
+        super::SandboxBuilder::default()
+            .max_open_files(64)
+            .build()
+            .expect("a non-zero cap must build");
+    }
 
     #[test]
     fn exposing_grant_reports_overlap_and_fs_deny_suppresses() {

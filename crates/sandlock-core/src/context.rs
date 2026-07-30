@@ -546,6 +546,39 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // Empty list = all GPUs visible, don't set env vars
     }
 
+    // 13c. Optional: cap the file-descriptor table.
+    //
+    // Deliberately the *last* confinement step: RLIMIT_NOFILE bounds the fd
+    // *number* the kernel may hand out, not the count of live descriptors, and
+    // every earlier step still needs to open files — Landlock takes an O_PATH
+    // fd per rule path plus the ruleset fd (step 8), seccomp allocates the
+    // notify listener (step 9), and `close_fds_above` reads /proc/self/fd
+    // (step 12). Setting the limit before those turns them into EMFILE and the
+    // child dies with a message blaming Landlock instead of the limit. After
+    // step 12 the table is {0,1,2} + keep_fds, which is what a caller means by
+    // "at most N open files". Placing it before the `entry` match applies it to
+    // the in-process entrypoint too, not only to the exec path.
+    if let Some(n) = sandbox.max_open_files {
+        // Lower both the soft and the hard limit. setrlimit/prlimit64 are not
+        // blocked by the seccomp filter, so a soft-only cap would be advisory:
+        // the sandboxed process could raise it straight back to the hard limit.
+        // Raising a hard limit needs CAP_SYS_RESOURCE, which the child (with
+        // NO_NEW_PRIVS and no capabilities) does not have, so this is one-way.
+        //
+        // Clamp to the inherited hard limit: a request above it would make
+        // setrlimit fail with EPERM and abort the child. Clamping only ever
+        // yields a *lower* limit, so the "no more than N" contract holds.
+        let mut inherited = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) } != 0 {
+            fail!("getrlimit(RLIMIT_NOFILE)");
+        }
+        let target = (n as libc::rlim_t).min(inherited.rlim_max);
+        let rlim = libc::rlimit { rlim_cur: target, rlim_max: target };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
+            fail!(format!("setrlimit(RLIMIT_NOFILE, {})", target));
+        }
+    }
+
     // 14. Terminal action: run the in-process entrypoint, or fall through to
     // execve the command. The in-process arm diverges (`_exit`), so the match
     // yields the command slice only on the `Exec` path.
