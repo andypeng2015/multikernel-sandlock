@@ -192,7 +192,34 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_chroot(
     Box::into_raw(Box::new(builder.chroot(path)))
 }
 
+/// Validate one mount pair coming in over the C ABI.
+///
+/// Returns `None` — meaning "add no mount" — for anything that is not a pair
+/// of non-empty UTF-8 strings. The usual `to_str().unwrap_or("")` degradation
+/// is unsafe here specifically: an empty virtual path is a prefix of *every*
+/// guest path, so `ChrootCtx::is_mounted` would match the whole tree and
+/// short-circuit both `can_read` and `can_write` to true, voiding the read
+/// and write allowlists. Core's `parse_mount_spec` enforces the same
+/// non-empty rule for `--fs-mount` specs.
+///
+/// # Safety
+/// Both pointers must be non-null and point at valid NUL-terminated strings.
+unsafe fn mount_pair<'a>(
+    virtual_path: *const c_char,
+    host_path: *const c_char,
+) -> Option<(&'a str, &'a str)> {
+    let vp = CStr::from_ptr(virtual_path).to_str().ok()?;
+    let hp = CStr::from_ptr(host_path).to_str().ok()?;
+    if vp.is_empty() || hp.is_empty() {
+        return None;
+    }
+    Some((vp, hp))
+}
+
 /// Add a filesystem mount mapping (virtual_path -> host_path).
+///
+/// Both paths must be non-empty UTF-8; anything else is ignored and adds no
+/// mount (an empty virtual path would match every guest path).
 ///
 /// # Safety
 /// `b`, `virtual_path`, and `host_path` must be valid pointers.
@@ -205,18 +232,25 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_mount(
     if b.is_null() || virtual_path.is_null() || host_path.is_null() {
         return b;
     }
-    let vp = CStr::from_ptr(virtual_path).to_str().unwrap_or("");
-    let hp = CStr::from_ptr(host_path).to_str().unwrap_or("");
+    let Some((vp, hp)) = mount_pair(virtual_path, host_path) else {
+        return b;
+    };
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.fs_mount(vp, hp)))
 }
 
 /// Add a read-only filesystem mount mapping (virtual_path -> host_path).
 ///
-/// Same mapping as [`sandlock_sandbox_builder_fs_mount`], but writes under
-/// `virtual_path` are denied with `EACCES` (reads, exec and directory listing
-/// still go through), and the denial wins over any broader writable rule such
-/// as a read-write rootfs granting `/`.
+/// Same mapping as [`sandlock_sandbox_builder_fs_mount`], but a write that
+/// resolves to a path under `virtual_path` is denied with `EACCES` (reads,
+/// exec and directory listing still go through), and that denial wins over any
+/// broader writable rule such as a read-write rootfs granting `/`.
+///
+/// The marking is enforced per resolved path, not per inode: a guest that also
+/// holds a writable mount on the same host filesystem can hard-link a file out
+/// of the read-only mount and then write through the alias. Treat this as a
+/// mount-shaped access rule, not as an immutability guarantee for the host
+/// files behind it.
 ///
 /// Mount mappings — and therefore this read-only marking — are only enforced
 /// when [`sandlock_sandbox_builder_chroot`] is also set; without a chroot this
@@ -236,19 +270,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_mount_ro(
     if b.is_null() || virtual_path.is_null() || host_path.is_null() {
         return b;
     }
-    // Reject instead of degrading to "": an empty virtual path is a prefix of
-    // every guest path, so it would mount the whole tree read-only and make
-    // `can_read` true everywhere, voiding the read allowlist. Core's
-    // `parse_mount_spec` enforces the same non-empty rule for mount specs.
-    let (Ok(vp), Ok(hp)) = (
-        CStr::from_ptr(virtual_path).to_str(),
-        CStr::from_ptr(host_path).to_str(),
-    ) else {
+    let Some((vp, hp)) = mount_pair(virtual_path, host_path) else {
         return b;
     };
-    if vp.is_empty() || hp.is_empty() {
-        return b;
-    }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.fs_mount_ro(vp, hp)))
 }

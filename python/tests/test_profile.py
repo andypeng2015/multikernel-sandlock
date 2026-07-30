@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import textwrap
 
 import pytest
@@ -237,7 +238,24 @@ class TestPolicyFromDict:
         assert "'/work:/host:ro'" in message
         # The profile is often one the CLI itself wrote, so the remedy is
         # to run it with the CLI, not to retype it as a flag.
-        assert "sandlock --profile-file" in message
+        assert "sandlock run --profile-file <path>" in message
+        assert "sandlock run -p <name>" in message
+
+    @pytest.mark.parametrize("spec", ["/work:/host:ro", "/work:/host:rw"])
+    def test_mount_suffix_error_suggests_a_runnable_command(self, spec):
+        # Both flags live on the `run` subcommand (RunArgs in
+        # crates/sandlock-cli/src/main.rs), not on the top-level parser:
+        # `sandlock --profile-file p.toml` exits 2 with "unexpected
+        # argument". A loud rejection that routes the user to a command
+        # which cannot run is not a remedy, so the suggestion must always
+        # carry the subcommand.
+        with pytest.raises(PolicyError) as excinfo:
+            policy_from_dict({"filesystem": {"mount": [spec]}})
+        message = str(excinfo.value)
+        quoted = re.findall(r"'(sandlock[^']*)'", message)
+        assert quoted, f"no quoted sandlock invocation in {message!r}"
+        for invocation in quoted:
+            assert invocation.startswith("sandlock run "), message
 
     def test_mount_without_suffix_still_parses(self):
         # Control: the rejection must not touch ordinary specs.

@@ -252,9 +252,9 @@ def _coerce(
                     "mount mapping cannot express a read-only mount, and "
                     "dropping the suffix would silently mount the host path "
                     "read-write. Run this profile with the sandlock CLI "
-                    "('sandlock --profile-file <path>' or '-p <name>'), which "
-                    "honours ':ro', or drop the suffix and accept a "
-                    "read-write mount"
+                    "('sandlock run --profile-file <path>' or "
+                    "'sandlock run -p <name>'), which honours ':ro', or drop "
+                    "the suffix and accept a read-write mount"
                 )
             if spec.endswith(":rw"):
                 # ':rw' is the CLI's explicit default and means exactly what
@@ -266,7 +266,8 @@ def _coerce(
                     "not part of this parser's 'VIRTUAL:HOST' grammar; remove "
                     "it — the mount is read-write already. To keep the suffix, "
                     "run the profile with the sandlock CLI "
-                    "('sandlock --profile-file <path>' or '-p <name>')"
+                    "('sandlock run --profile-file <path>' or "
+                    "'sandlock run -p <name>')"
                 )
             virt, host = spec.split(":", 1)
             if not virt or not host:

@@ -209,6 +209,42 @@ fn builder_fs_mount_ro_refuses_non_utf8_paths() {
     );
 }
 
+#[test]
+fn builder_fs_mount_refuses_unusable_paths_exactly_like_fs_mount_ro() {
+    // The plain setter is the *more* dangerous door for the same input:
+    // an empty virtual path there voids the write allowlist as well as the
+    // read one (`ChrootCtx::can_write` short-circuits on `is_mounted`),
+    // with no read-only marking left to hold writes closed. Both setters
+    // must therefore drop the mount rather than degrade the path to "".
+    // `sandlock_sandbox_builder_fs_mount` is what the Go binding
+    // (go/sandlock_linux.go) and the Python `Sandbox` dataclass
+    // (python/src/sandlock/_sdk.py) call, so this is the reachable one.
+    let good = cstr("/work");
+    let bad_utf8 = CString::new(vec![b'/', 0xff, b'x']).unwrap();
+    let empty = cstr("");
+
+    let cases: [(&str, &CString, &CString); 4] = [
+        ("empty virtual_path", &empty, &good),
+        ("empty host_path", &good, &empty),
+        ("non-UTF-8 virtual_path", &bad_utf8, &good),
+        ("non-UTF-8 host_path", &good, &bad_utf8),
+    ];
+
+    for (label, vp, hp) in cases {
+        let sandbox = build_via_ffi(|b| unsafe {
+            sandlock_sandbox_builder_fs_mount(b, vp.as_ptr(), hp.as_ptr())
+        });
+        assert!(
+            sandbox.fs_mount.is_empty(),
+            "fs_mount with {label} must add no mount, got {:?}",
+            sandbox.fs_mount,
+        );
+        // Nothing marks it read-only either, so a recorded mount here would
+        // be a tree-wide read-write mapping.
+        assert!(sandbox.fs_mount_ro.is_empty());
+    }
+}
+
 // ----------------------------------------------------------------
 // End-to-end: what a read-only mount enforces on a real guest
 // ----------------------------------------------------------------
