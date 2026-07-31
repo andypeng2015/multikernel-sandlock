@@ -16,7 +16,7 @@ Rust CLI). Each section maps to a subset of ``Sandbox`` fields:
                     fs_mount (mount), on_exit, on_error
                     (mount entries are ``"VIRTUAL:HOST"`` only; a trailing
                     ``:ro``/``:rw`` is part of the CLI's grammar, not this
-                    one, and is rejected — ``:ro`` because this mapping
+                    one, and is rejected; ``:ro`` because this mapping
                     cannot express a read-only mount at all)
     [network]     → net_allow_bind (allow_bind), net_deny_bind (deny_bind), net_allow (allow), net_deny (deny), port_remap
     [http]        → http_ports (ports), http_allow (allow),
@@ -264,7 +264,7 @@ def _coerce(
                     f"{source}: [{section}].{toml_key} entry {spec!r} uses a "
                     "':rw' suffix, which is the sandlock CLI's default and is "
                     "not part of this parser's 'VIRTUAL:HOST' grammar; remove "
-                    "it — the mount is read-write already. To keep the suffix, "
+                    "it: the mount is read-write already. To keep the suffix, "
                     "run the profile with the sandlock CLI "
                     "('sandlock run --profile-file <path>' or "
                     "'sandlock run -p <name>')"

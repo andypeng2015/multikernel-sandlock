@@ -194,7 +194,7 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_chroot(
 
 /// Validate one mount pair coming in over the C ABI.
 ///
-/// Returns `None` — meaning "add no mount" — for anything that is not a pair
+/// Returns `None` (meaning "add no mount") for anything that is not a pair
 /// of non-empty UTF-8 strings. The usual `to_str().unwrap_or("")` degradation
 /// is unsafe here specifically: an empty virtual path is a prefix of *every*
 /// guest path, so `ChrootCtx::is_mounted` would match the whole tree and
@@ -252,7 +252,7 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_mount(
 /// mount-shaped access rule, not as an immutability guarantee for the host
 /// files behind it.
 ///
-/// Mount mappings — and therefore this read-only marking — are only enforced
+/// Mount mappings (and therefore this read-only marking) are only enforced
 /// when [`sandlock_sandbox_builder_chroot`] is also set; without a chroot this
 /// call has no effect on the guest's filesystem view.
 ///

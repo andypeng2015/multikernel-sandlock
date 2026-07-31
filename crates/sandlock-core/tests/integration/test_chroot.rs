@@ -866,7 +866,7 @@ async fn test_chroot_etc_hosts_no_duplicate_loopback() {
 /// low to start the process does *not* surface as `EMFILE`. Under `chroot` the
 /// exec fd is injected by the supervisor, and an injection the guest's
 /// descriptor limit refuses is answered `EIO`, so the run exits 127 with
-/// "Input/output error". The documentation promises that errno for this mode —
+/// "Input/output error". The documentation promises that errno for this mode;
 /// this test is what keeps it honest.
 #[tokio::test]
 async fn test_max_open_files_chroot_exec_error_is_eio() {

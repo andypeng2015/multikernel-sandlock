@@ -3,8 +3,8 @@
 //! `builder_*` tests drive the FFI symbols directly (no C compilation
 //! step) and read back state through the public Rust `Sandbox` API.
 //!
-//! The `read_only_mount_*` test goes the whole way through the C ABI —
-//! builder setters, `sandlock_sandbox_build`, `sandlock_run` — and runs a
+//! The `read_only_mount_*` test goes the whole way through the C ABI
+//! (builder setters, `sandlock_sandbox_build`, `sandlock_run`) and runs a
 //! real guest inside a chroot to check what the mount actually enforces:
 //! reads succeed, writes are refused. A read-only mount is a policy
 //! decision in the seccomp-notify chroot handlers (writes get EACCES),
@@ -122,7 +122,7 @@ fn builder_mount_setters_chain_and_stay_distinguishable() {
 fn builder_fs_mount_ro_tolerates_null_arguments() {
     let (vp, hp) = (cstr("/work"), cstr("/host/work"));
 
-    // Null in, builder out unchanged — the convention every other
+    // Null in, builder out unchanged: the convention every other
     // `sandlock_sandbox_builder_*` setter follows.
     let out =
         unsafe { sandlock_sandbox_builder_fs_mount_ro(ptr::null_mut(), vp.as_ptr(), hp.as_ptr()) };
@@ -153,7 +153,7 @@ fn builder_fs_mount_ro_tolerates_null_arguments() {
 fn builder_fs_mount_ro_refuses_empty_paths() {
     // An empty virtual path is a prefix of *every* path, so recording it
     // would mount the whole tree and make ChrootCtx::can_read return true
-    // everywhere — the read allowlist would be gone. Core's
+    // everywhere, and the read allowlist would be gone. Core's
     // parse_mount_spec rejects empty components for the same reason, so
     // the C ABI must not be the one door that accepts them.
     let (vp, hp) = (cstr("/work"), cstr("/host/work"));
@@ -255,7 +255,7 @@ fn helper_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/rootfs-helper")
         .canonicalize()
-        .expect("rootfs-helper not found — sandlock-core's build.rs should have compiled it")
+        .expect("rootfs-helper not found; sandlock-core's build.rs should have compiled it")
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -445,7 +445,7 @@ fn read_only_mount_allows_reads_and_denies_writes() {
     );
 
     // 4. Control: the very same policy, the very same guest command, on
-    //    a mount registered with `fs_mount` instead — writes land. This
+    //    a mount registered with `fs_mount` instead: writes land. This
     //    is what pins the denial on the read-only marking rather than on
     //    a broken mount setup.
     let r = run_in_sandbox(

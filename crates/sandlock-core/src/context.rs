@@ -258,10 +258,10 @@ fn set_proc_name(name: &CStr) {
 ///
 /// Clamped against *both* inherited bounds, for two different reasons:
 ///
-/// * the hard bound is a kernel requirement — raising a hard limit needs
+/// * the hard bound is a kernel requirement: raising a hard limit needs
 ///   `CAP_SYS_RESOURCE`, so a larger request would fail with `EPERM` and abort
 ///   the child;
-/// * the soft bound is the contract — `max_open_files` is a cap, not a grant.
+/// * the soft bound is the contract: `max_open_files` is a cap, not a grant.
 ///   Without this clamp a request between the inherited soft and hard limits
 ///   would *widen* the guest's descriptor budget past what the same command
 ///   gets unsandboxed (soft 1024 / hard 1048576 is the distro default, so
@@ -572,7 +572,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     //
     // Deliberately the *last* confinement step: RLIMIT_NOFILE bounds the fd
     // *number* the kernel may hand out, not the count of live descriptors, and
-    // every earlier step still needs to open files — Landlock takes an O_PATH
+    // every earlier step still needs to open files: Landlock takes an O_PATH
     // fd per rule path plus the ruleset fd (step 8), seccomp allocates the
     // notify listener (step 9), and `close_fds_above` reads /proc/self/fd
     // (step 12). Setting the limit before those turns them into EMFILE and the
@@ -588,7 +588,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // sandlock makes this one-way. It is not one-way when sandlock itself
         // runs privileged: nothing here drops CAP_SYS_RESOURCE, so a root child
         // can setrlimit the cap straight back up. Treat the limit as a resource
-        // budget, not as confinement — unlike Landlock (step 8) and seccomp
+        // budget, not as confinement, unlike Landlock (step 8) and seccomp
         // (step 9), which stay irreversible for root too.
         let mut inherited = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) } != 0 {

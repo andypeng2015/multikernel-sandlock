@@ -342,7 +342,7 @@ const NOFILE_PROBE: &str = concat!(
 
 /// `max_open_files` is enforced via RLIMIT_NOFILE in the child: the guest sees
 /// the lowered limit, cannot raise it back, and hits EMFILE past it. The
-/// control run (same probe, no limit) opens every descriptor — without the
+/// control run (same probe, no limit) opens every descriptor; without the
 /// setrlimit call the two runs are indistinguishable and this test fails.
 #[tokio::test]
 async fn test_max_open_files_enforced() {
@@ -360,7 +360,7 @@ async fn test_max_open_files_enforced() {
     assert!(out.contains("RLIM 64 64"), "guest should see soft=hard=64, got: {}", out);
     // Lowering the hard limit is one-way only for an *unprivileged* sandlock.
     // Nothing drops CAP_SYS_RESOURCE, so a child of a root supervisor raises the
-    // cap right back — and then opens all 200 descriptors. Asserting the
+    // cap right back, and then opens all 200 descriptors. Asserting the
     // unprivileged behaviour unconditionally would fail every run under `sudo`
     // on a correct build, so the guest-side assertions are split by euid; the
     // cap itself (RLIM above) is checked in both modes.
@@ -392,7 +392,7 @@ async fn test_max_open_files_enforced() {
 
 /// The cap never *widens* the guest's descriptor budget: a request above the
 /// limit sandlock itself runs under is clamped to the inherited soft limit, not
-/// granted. Clamping against the hard limit alone is not enough — the common
+/// granted. Clamping against the hard limit alone is not enough: the common
 /// host layout is a soft/hard split (1024 / 1048576), where every request in
 /// between would otherwise hand the sandboxed process more descriptors than the
 /// same command gets unsandboxed.
@@ -456,7 +456,7 @@ async fn test_max_open_files_applied_after_landlock_and_seccomp() {
         .run(&["/bin/true"])
         .await
         .expect(
-            "the child must survive confinement setup under a small cap — an early setrlimit \
+            "the child must survive confinement setup under a small cap; an early setrlimit \
              starves Landlock/seccomp and kills the child before it reports back",
         );
     assert_eq!(

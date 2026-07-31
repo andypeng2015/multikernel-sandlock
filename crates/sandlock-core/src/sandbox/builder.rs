@@ -565,22 +565,23 @@ impl SandboxBuilder {
     /// the child does not have. It is **not** one-way when sandlock itself runs
     /// privileged (root, or with `CAP_SYS_RESOURCE`): nothing drops that
     /// capability, so the guest can raise the cap straight back. Treat this as
-    /// a resource budget, not as confinement — Landlock and seccomp stay
+    /// a resource budget, not as confinement; Landlock and seccomp stay
     /// irreversible either way.
     ///
     /// The limit also has to cover what starting the process costs: stdio, the
     /// descriptors the dynamic loader opens per shared library, and under
     /// `chroot` the injected exec fd. Set it too low and the child never
     /// reaches `main`; the run exits 127 with the reason on stderr, but the
-    /// errno depends on the mode — a plain exec reports `EMFILE` from the
+    /// errno depends on the mode: a plain exec reports `EMFILE` from the
     /// loader, while under `chroot` the supervisor cannot install the exec fd
     /// and the `execve` fails with `EIO`. The same split applies once the guest
     /// is running: an `open` the kernel services returns `EMFILE`, but one the
     /// supervisor services (`chroot`, COW, procfs virtualisation) is refused
     /// with `EACCES`, indistinguishable from a policy denial. Measured floors
-    /// for a trivial command: 4 for a plain dynamically linked exec, 17 under
-    /// `chroot`. Treat those as the shape of the constraint, not a guarantee —
-    /// a program linking more libraries needs more.
+    /// for a trivial command: 4 for a plain dynamically linked exec, about 12
+    /// under `chroot`. Treat those as the shape of the constraint, not a
+    /// guarantee: the chroot figure varies slightly by host, and a program
+    /// linking more libraries needs more.
     pub fn max_open_files(mut self, n: u32) -> Self {
         self.max_open_files = Some(n);
         self
@@ -802,7 +803,7 @@ impl SandboxBuilder {
         }
 
         // Validate: max_open_files must be non-zero. A zero cap cannot be
-        // honoured — the child needs descriptors to reach `main` at all, so it
+        // honoured: the child needs descriptors to reach `main` at all, so it
         // would die before it and exit 127 with an errno far from the setting
         // that caused it (EMFILE from the dynamic loader on a plain exec, EIO
         // from the exec-fd injection under chroot). Catching it here keeps the
@@ -815,7 +816,7 @@ impl SandboxBuilder {
                 "max_open_files must be greater than 0; omit it to inherit the \
                  system limit. Note that a workable floor is well above 1: a \
                  plain dynamically linked exec needs about 4 descriptors, and \
-                 about 17 under chroot."
+                 about 12 under chroot."
                     .into(),
             ));
         }
@@ -1136,7 +1137,7 @@ mod tests {
             "the error must say how to get the inherited limit, got: {msg}"
         );
 
-        // Unset stays valid — the check must not reject the default.
+        // Unset stays valid: the check must not reject the default.
         super::SandboxBuilder::default()
             .build()
             .expect("an unset cap must still build");

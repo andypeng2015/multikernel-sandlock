@@ -388,7 +388,7 @@ sandlock_builder_t *sandlock_sandbox_builder_fs_mount(sandlock_builder_t *b,
  * mount-shaped access rule, not as an immutability guarantee for the host
  * files behind it.
  *
- * Mount mappings — and therefore this read-only marking — are only enforced
+ * Mount mappings (and therefore this read-only marking) are only enforced
  * when [`sandlock_sandbox_builder_chroot`] is also set; without a chroot this
  * call has no effect on the guest's filesystem view.
  *

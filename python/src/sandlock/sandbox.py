@@ -274,7 +274,7 @@ class Sandbox:
 
     max_open_files: int | None = None
     """Maximum number of open file descriptors.  Enforced via
-    RLIMIT_NOFILE (soft and hard) in the child — kernel-enforced,
+    RLIMIT_NOFILE (soft and hard) in the child: kernel-enforced,
     survives exec, inherited by descendants.  Clamped to the limits
     sandlock itself runs under, so it only ever caps, never grants.
     A budget against fd exhaustion rather than a confinement boundary:

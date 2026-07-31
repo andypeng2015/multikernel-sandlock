@@ -341,7 +341,7 @@ fn test_syscall_name_to_nr_covers_defaults() {
 
 #[test]
 fn test_effective_nofile_clamps_to_both_inherited_bounds() {
-    // A request below both bounds is applied verbatim — the ordinary case.
+    // A request below both bounds is applied verbatim, the ordinary case.
     let split = libc::rlimit { rlim_cur: 1024, rlim_max: 1_048_576 };
     assert_eq!(effective_nofile(64, &split), 64);
 
