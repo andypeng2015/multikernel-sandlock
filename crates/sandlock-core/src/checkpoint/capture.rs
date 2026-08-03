@@ -638,35 +638,50 @@ mod tests {
     /// path) as well as the dump decision.
     #[test]
     fn shared_anonymous_contents_reach_the_image() {
-        const ADDR: u64 = 0x4700_0000_0000;
         const PAT: u8 = 0x3C;
+
+        // The kernel picks the address and the child reports it back. Naming one
+        // here would be a bet on the architecture's virtual address layout: the
+        // high addresses that are free on x86_64 do not exist on riscv64, whose
+        // Sv39 user space ends at 256 GiB, so a MAP_FIXED there fails and the
+        // child dies before the test can look at it.
+        let mut pipefd = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipefd.as_mut_ptr()) }, 0);
+        let (r, w) = (pipefd[0], pipefd[1]);
 
         let child = unsafe { libc::fork() };
         if child == 0 {
             unsafe {
+                libc::close(r);
                 let p = libc::mmap(
-                    ADDR as *mut libc::c_void,
+                    std::ptr::null_mut(),
                     4096,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS,
                     -1,
                     0,
                 );
-                if p != ADDR as *mut libc::c_void {
+                if p == libc::MAP_FAILED {
                     libc::_exit(1);
                 }
                 let mut i = 0usize;
                 while i < 4096 {
-                    *(ADDR as *mut u8).add(i) = PAT;
+                    *(p as *mut u8).add(i) = PAT;
                     i += 1;
                 }
+                let addr = p as u64;
+                libc::write(w, &addr as *const u64 as *const libc::c_void, 8);
                 loop {
                     libc::pause();
                 }
             }
         }
         assert!(child > 0, "fork");
-        unsafe { libc::usleep(100_000) };
+        unsafe { libc::close(w) };
+
+        let mut addr_buf = [0u8; 8];
+        let n = unsafe { libc::read(r, addr_buf.as_mut_ptr() as *mut libc::c_void, 8) };
+        let addr = u64::from_le_bytes(addr_buf);
 
         let policy = Sandbox::builder().build().expect("build policy");
         let captured = capture(child, &policy);
@@ -675,14 +690,16 @@ mod tests {
             libc::kill(child, libc::SIGKILL);
             let mut s = 0;
             libc::waitpid(child, &mut s, 0);
+            libc::close(r);
         }
 
+        assert_eq!(n, 8, "the child must report where the kernel mapped its region");
         let cp = captured.expect("capture");
         let seg = cp
             .process_state
             .memory_data
             .iter()
-            .find(|s| s.start == ADDR)
+            .find(|s| s.start == addr)
             .expect("the shared anonymous region must be in the image");
         assert!(
             seg.data.len() >= 4096 && seg.data[..4096].iter().all(|&b| b == PAT),

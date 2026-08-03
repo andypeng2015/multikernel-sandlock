@@ -326,9 +326,14 @@ mod tests {
     #[test]
     fn write_child_mem_fills_another_process() {
         // Proof that the page-fill primitive reaches a live child's anonymous
-        // mapping: the child maps a known page at a fixed address, waits, and
-        // reports back what it sees after the parent writes into it.
-        const ADDR: u64 = 0x4600_0000_0000;
+        // mapping: the child maps a page, reports where the kernel put it,
+        // waits, and reports back what it sees after the parent writes into it.
+        //
+        // The kernel picks the address and the child sends it over the ready
+        // pipe. Naming one here instead would be a bet on the architecture's
+        // virtual address layout, and the high addresses that are free on
+        // x86_64 do not exist on riscv64, whose Sv39 user space ends at 256 GiB.
+        //
         // Two pipes, so neither side keeps the other's EOF from arriving:
         // `ready` carries the child's "mapping is live", `go` releases it.
         let mut ready = [0i32; 2];
@@ -343,24 +348,29 @@ mod tests {
                 libc::close(ready[0]);
                 libc::close(go[1]);
                 let p = libc::mmap(
-                    ADDR as *mut libc::c_void, 4096,
+                    std::ptr::null_mut(), 4096,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED, -1, 0,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0,
                 );
-                if p != ADDR as *mut libc::c_void { libc::_exit(1) };
-                // Announce readiness, then block until the parent hangs up, so
-                // the write lands while the mapping is live.
-                libc::write(ready[1], b"r".as_ptr() as *const libc::c_void, 1);
+                if p == libc::MAP_FAILED { libc::_exit(1) };
+                // Announce the address, then block until the parent hangs up,
+                // so the write lands while the mapping is live.
+                let addr = p as u64;
+                libc::write(ready[1], &addr as *const u64 as *const libc::c_void, 8);
                 let mut b = 0u8;
                 while libc::read(go[0], &mut b as *mut u8 as *mut libc::c_void, 1) > 0 {}
-                libc::_exit(*(ADDR as *const u8) as i32);
+                libc::_exit(*(p as *const u8) as i32);
             }
         }
         unsafe { libc::close(ready[1]); libc::close(go[0]) };
-        let mut b = 0u8;
-        assert_eq!(unsafe { libc::read(ready[0], &mut b as *mut u8 as *mut libc::c_void, 1) }, 1);
+        let mut addr_buf = [0u8; 8];
+        let n = unsafe {
+            libc::read(ready[0], addr_buf.as_mut_ptr() as *mut libc::c_void, 8)
+        };
+        assert_eq!(n, 8, "the child must report where the kernel mapped its page");
+        let addr = u64::from_le_bytes(addr_buf);
 
-        let res = write_child_mem(child, ADDR, &[0x5Au8; 4096]);
+        let res = write_child_mem(child, addr, &[0x5Au8; 4096]);
 
         unsafe { libc::close(go[1]); libc::close(ready[0]) };
         let mut st = 0i32;
