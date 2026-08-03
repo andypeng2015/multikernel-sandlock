@@ -592,9 +592,13 @@ static int cmd_spawn_loop(int argc, char **argv) {
  * single thread with one open fd: exactly the shape the checkpoint/restore
  * engine supports. Used by the restore test to prove a restored process keeps
  * making vDSO calls (which requires the engine to relocate the vDSO onto the
- * checkpoint-recorded base); as a static-musl binary its clock_gettime routes
- * through the kernel vDSO just as a glibc program's would.
+ * checkpoint-recorded base) and keeps reaching its thread-local storage (which
+ * requires the engine to restore the thread pointer); as a static binary its
+ * clock_gettime routes through the kernel vDSO just as a dynamic program's would.
  */
+/* Thread-local, so the loop below exercises %fs-relative addressing. */
+static __thread unsigned long tls_ticks;
+
 static int cmd_clock_loop(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "clock-loop: missing file operand\n"); return 1; }
     int fd = open(argv[0], O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -605,6 +609,17 @@ static int cmd_clock_loop(int argc, char **argv) {
     struct timespec now;
     for (;;) {
         i++;
+        /* Read and write thread-local storage every iteration, so the loop
+         * faults if a restore did not put the thread pointer back. The x86_64
+         * signal frame cannot carry fs_base, so a restore engine that resumes
+         * through rt_sigreturn has to set it separately; without that, %fs is
+         * whatever the restoring code had. Which libc this is built against
+         * decides whether the rest of the loop would notice on its own (glibc
+         * reads the stack-protector canary at %fs:0x28 on nearly every call,
+         * musl here would not), so touch TLS explicitly rather than depend on
+         * the toolchain to expose the bug. */
+        tls_ticks++;
+        if (tls_ticks != i) _exit(3);
         clock_gettime(CLOCK_MONOTONIC, &now); /* vDSO fast path */
         unsigned long v = i;
         for (int d = 19; d >= 0; d--) { buf[d] = '0' + (v % 10); v /= 10; }

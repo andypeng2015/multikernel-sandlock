@@ -21,7 +21,8 @@
  *   6. mprotect the anonymous regions down to their checkpointed protections;
  *   7. unmap the leftovers of its own startup that the image did not overwrite;
  *   8. reopen the fd table at its saved numbers and offsets;
- *   9. rt_sigreturn into the checkpoint's register context.
+ *   9. restore the thread pointer, which the signal frame cannot carry;
+ *  10. rt_sigreturn into the checkpoint's register context.
  *
  * Two address-space hazards drive the layout, and both are why this file avoids
  * anything the kernel would place for it:
@@ -47,7 +48,7 @@
  *
  * Exit codes (all _exit): 2 blob read, 3 bad magic/version/size, 4 map region,
  * 5 open region file, 6 ready write, 7 go read, 8 mprotect, 9 vdso mremap,
- * 10 fd reopen, 12 sweep entry overlapping the stub's own image.
+ * 10 fd reopen, 12 sweep entry overlapping the stub's own image, 13 arch_prctl.
  * rt_sigreturn does not return; if it does, exit 11.
  */
 #define CTRL_FD 3
@@ -72,6 +73,10 @@
 #define SYS_exit 60
 #define SYS_openat 257
 #define SYS_rt_sigreturn 15
+#define SYS_arch_prctl 158
+
+#define ARCH_SET_GS 0x1001
+#define ARCH_SET_FS 0x1002
 
 #define PROT_READ 0x1
 #define PROT_WRITE 0x2
@@ -176,7 +181,14 @@ struct uctx {
     u64 uc_sigmask[16];/* 128-byte sigset */
 };
 
-/* Captured user_regs_struct order (27 u64), matching capture::ptrace_getregs. */
+/* Captured user_regs_struct order (27 u64), matching capture::ptrace_getregs.
+ *
+ * The signal frame carries 23 of these. Accounting for the other four, because
+ * silently dropping one costs a resumed program that dies with no explanation:
+ * fs_base and gs_base have no slot in the frame and are restored separately with
+ * arch_prctl (step 9); ds and es are ignored under the x86_64 flat memory model;
+ * and orig_rax is consumed in Rust, which uses it to re-arm an interrupted
+ * syscall before serializing rip and rax (see restore_blob.rs). */
 enum { UR_R15=0,UR_R14,UR_R13,UR_R12,UR_RBP,UR_RBX,UR_R11,UR_R10,UR_R9,UR_R8,
        UR_RAX,UR_RCX,UR_RDX,UR_RSI,UR_RDI,UR_ORIG_RAX,UR_RIP,UR_CS,UR_EFLAGS,
        UR_RSP,UR_SS,UR_FS_BASE,UR_GS_BASE,UR_DS,UR_ES,UR_FS,UR_GS };
@@ -350,7 +362,19 @@ static void _start_c(u64 *sp) {
         SC3(SYS_lseek, f->fd, f->offset, SEEK_SET);
     }
 
-    /* 9. Build the rt_sigframe on our private stack and rt_sigreturn into the
+    /* 9. Restore the thread pointer. The x86_64 signal frame has 23 gregs and
+     * none of them is fs_base, so rt_sigreturn cannot carry it and the resumed
+     * program would inherit this stub's, which is zero because a -nostdlib
+     * binary never sets one. Every libc addresses thread-local storage through
+     * %fs, so the first TLS access faults: with glibc that is the stack-protector
+     * canary at %fs:0x28, read on entry to almost every function, so the program
+     * dies immediately with a bare SIGSEGV. (The ptrace engine this replaced got
+     * this for free, since PTRACE_SETREGS writes fs_base.) gs_base is zero for
+     * ordinary user programs; set it only when the checkpoint recorded one. */
+    if (SC2(SYS_arch_prctl, ARCH_SET_FS, gp[UR_FS_BASE]) != 0) die(13);
+    if (gp[UR_GS_BASE] && SC2(SYS_arch_prctl, ARCH_SET_GS, gp[UR_GS_BASE]) != 0) die(13);
+
+    /* 10. Build the rt_sigframe on our private stack and rt_sigreturn into the
      * checkpoint. The frame must be readable when the kernel consumes it; the
      * stub stack is a plain .bss mapping at STUB_BASE, so it always is. */
     struct uctx uc;
