@@ -269,6 +269,8 @@ pub(crate) fn finish_restore(
     // checkpoint and hand the stub the list to unmap.
     let current = crate::checkpoint::capture::parse_proc_maps(pid)
         .map_err(|e| child_err(format!("restore read stub layout: {e}")))?;
+    crate::checkpoint::restore_blob::verify_special_mappings(&current, &plan.maps)
+        .map_err(|e| child_err(format!("restore vdso relocation: {e}")))?;
     let sweep = crate::checkpoint::restore_blob::plan_sweep(&current, &plan.maps);
     if sweep.len() > MAX_SWEEP_ENTRIES {
         return Err(child_err(format!(

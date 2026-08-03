@@ -140,6 +140,47 @@ pub(crate) fn plan_sweep(current: &[MemoryMap], cp: &[MemoryMap]) -> Vec<(u64, u
     sweep
 }
 
+/// Check that the kernel's special mappings ended up where the checkpoint
+/// recorded them, given the layout the stub built.
+///
+/// The stub relocates `[vdso]`/`[vvar]` from a base it derives from auxv, and
+/// reports success on the `mremap` return value alone. If that landed anywhere
+/// other than the recorded base, the restored program's cached vDSO pointers are
+/// stale and it dies with a bare SIGSEGV on its first `clock_gettime`, with
+/// nothing left to say why. The supervisor is already reading `/proc` here for
+/// the sweep, so confirm it and fail the restore with something readable instead.
+///
+/// Only mappings the checkpoint actually recorded are checked; a checkpoint with
+/// no vDSO planned no moves and has nothing to confirm.
+pub(crate) fn verify_special_mappings(
+    current: &[MemoryMap],
+    cp: &[MemoryMap],
+) -> Result<(), String> {
+    for name in ["[vvar]", "[vvar_vclock]", "[vdso]"] {
+        let Some(want) = cp.iter().find(|m| m.path.as_deref() == Some(name)) else {
+            continue;
+        };
+        match current.iter().find(|m| m.path.as_deref() == Some(name)) {
+            Some(got) if got.start == want.start => {}
+            Some(got) => {
+                return Err(format!(
+                    "{name} is at {:#x} but the checkpoint recorded {:#x}; the restored \
+                     program's cached vDSO pointers would be stale",
+                    got.start, want.start,
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "{name} is missing from the restored layout; the checkpoint recorded \
+                     it at {:#x}",
+                    want.start,
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One planned memory-restore action for a saved region.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RestoreRegion {
@@ -624,6 +665,31 @@ mod tests {
             VdsoMove { delta: -0x1000, len: 0x1000, target: 0x1000 }, // [vvar]
             VdsoMove { delta: 0, len: 0x1000, target: 0x2000 },       // [vdso]
         ], "both special mappings relocate, ordered by ascending target");
+    }
+
+    #[test]
+    fn special_mappings_verify_against_the_recorded_bases() {
+        let cp = vec![map(0x1000, 0x2000, Some("[vvar]")), map(0x2000, 0x3000, Some("[vdso]"))];
+        assert!(verify_special_mappings(&cp.clone(), &cp).is_ok(), "an exact match passes");
+
+        // Relocated to the wrong base: the resumed program would jump into a
+        // vDSO that is no longer there.
+        let moved = vec![map(0x1000, 0x2000, Some("[vvar]")), map(0x9000, 0xa000, Some("[vdso]"))];
+        let err = verify_special_mappings(&moved, &cp).expect_err("a stale base is caught");
+        assert!(err.contains("[vdso]") && err.contains("0x2000"), "names what moved: {err}");
+
+        // Gone entirely (unmapped by a MAP_FIXED that landed on it).
+        let gone = vec![map(0x1000, 0x2000, Some("[vvar]"))];
+        assert!(verify_special_mappings(&gone, &cp).unwrap_err().contains("missing"));
+    }
+
+    #[test]
+    fn special_mappings_verify_nothing_a_checkpoint_did_not_record() {
+        // A freestanding checkpoint has no vDSO, so the fresh one is wherever
+        // the kernel put it and that is fine.
+        let cp = vec![map(0x1000, 0x2000, None)];
+        let current = vec![map(0x8000, 0x9000, Some("[vdso]"))];
+        assert!(verify_special_mappings(&current, &cp).is_ok());
     }
 
     #[test]
