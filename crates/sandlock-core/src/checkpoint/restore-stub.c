@@ -19,8 +19,9 @@
  *   5. signal READY and wait for GO, while the supervisor writes the anonymous
  *      page contents in with process_vm_writev;
  *   6. mprotect the anonymous regions down to their checkpointed protections;
- *   7. reopen the fd table at its saved numbers and offsets;
- *   8. rt_sigreturn into the checkpoint's register context.
+ *   7. unmap the leftovers of its own startup that the image did not overwrite;
+ *   8. reopen the fd table at its saved numbers and offsets;
+ *   9. rt_sigreturn into the checkpoint's register context.
  *
  * Two address-space hazards drive the layout, and both are why this file avoids
  * anything the kernel would place for it:
@@ -46,11 +47,18 @@
  *
  * Exit codes (all _exit): 2 blob read, 3 bad magic/version/size, 4 map region,
  * 5 open region file, 6 ready write, 7 go read, 8 mprotect, 9 vdso mremap,
- * 10 fd reopen. rt_sigreturn does not return; if it does, exit 11.
+ * 10 fd reopen, 12 sweep entry overlapping the stub's own image.
+ * rt_sigreturn does not return; if it does, exit 11.
  */
 #define CTRL_FD 3
 #define READY_FD 4
 #define GO_FD 5
+
+/* The window this stub is linked into, mirroring restore_blob::STUB_BASE and
+ * STUB_SPAN and the -Wl,-Ttext-segment= flag in build.rs. Used only to refuse a
+ * sweep entry that would unmap the stub out from under itself. */
+#define STUB_BASE 0x30000000000UL
+#define STUB_SPAN 0x400000UL
 
 #define SYS_read 0
 #define SYS_write 1
@@ -314,11 +322,16 @@ static void _start_c(u64 *sp) {
         if (SC3(SYS_mprotect, r->start, r->end - r->start, r->prot) != 0) die(8);
     }
 
-    /* 7. Shed the leftovers. Safe to do here: the stub runs on its own .bss
-     * stack inside the reserved window, which the supervisor never puts on this
-     * list, so nothing it is standing on can be unmapped. */
+    /* 7. Shed the leftovers. The stub runs on its own .bss stack inside the
+     * reserved window and the supervisor never puts that window on the list, so
+     * nothing the stub is standing on should be here. Check it anyway rather
+     * than trust the peer: unmapping our own text or stack faults instantly and
+     * indistinguishably from a bad restore image, which is a miserable thing to
+     * debug on a host you cannot reproduce. */
     for (i = 0; i < (u32)n_sweep; i++) {
-        SC2(SYS_munmap, sweep[2 * i], sweep[2 * i + 1]);
+        u64 start = sweep[2 * i], len = sweep[2 * i + 1];
+        if (start < STUB_BASE + STUB_SPAN && STUB_BASE < start + len) die(12);
+        SC2(SYS_munmap, start, len);
     }
 
     /* 8. Reopen the fd table. The control fds go first: a restored fd number

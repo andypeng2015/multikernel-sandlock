@@ -142,9 +142,17 @@ fn ptrace_getregset_bytes(pid: i32, set: libc::c_int, max: usize) -> io::Result<
 }
 
 fn ptrace_getfpregs(pid: i32) -> io::Result<Vec<u8>> {
-    // NT_PRFPREG = 2; NT_X86_XSTATE = 0x202. 8 KiB upper-bounds AVX-512 xstate.
+    // NT_PRFPREG = 2; NT_X86_XSTATE = 0x202.
+    //
+    // The buffer must be able to hold the CPU's *whole* user xstate. The kernel
+    // fills what fits and reports how much it wrote, so a buffer that is merely
+    // "big enough for the CPUs we had in mind" yields a silently truncated
+    // capture: 8 KiB covers AVX-512 (~2.7 KiB) but not AMX, whose tile data
+    // alone is 8 KiB. That truncation is invisible here and lethal at restore,
+    // where the image is framed for the signal frame's `xrstor` as if complete.
+    // 64 KiB is far above any current CPU's `CPUID.(EAX=0DH,ECX=0):EBX`.
     #[cfg(target_arch = "x86_64")]
-    { ptrace_getregset_bytes(pid, 0x202, 8192).or_else(|_| ptrace_getregset_bytes(pid, 2, 512)) }
+    { ptrace_getregset_bytes(pid, 0x202, 65536).or_else(|_| ptrace_getregset_bytes(pid, 2, 512)) }
     #[cfg(not(target_arch = "x86_64"))]
     { ptrace_getregset_bytes(pid, 2, 4096) }
 }

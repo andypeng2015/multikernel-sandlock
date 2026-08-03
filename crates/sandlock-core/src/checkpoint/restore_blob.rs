@@ -351,12 +351,30 @@ fn build_fpstate_image(fpregs: &[u8]) -> Vec<u8> {
     if fpregs.len() < 512 {
         return Vec::new();
     }
-    if fpregs.len() < MIN_XSTATE_SIZE {
-        // Legacy fxsave only: hand it over with a cleared sw_reserved so the
-        // kernel takes the fxrstor path rather than reading stale magic.
+    // Legacy fxsave only: hand it over with a cleared sw_reserved so the kernel
+    // takes the fxrstor path rather than reading stale magic. Also the fallback
+    // whenever the capture does not look like a complete xstate the signal frame
+    // can consume: losing the extended components costs fidelity, whereas
+    // pointing `xrstor` at a buffer that is not what it claims to be corrupts
+    // the resumed program's FP state or faults outright.
+    let fx_only = || {
         let mut img = fpregs[..512].to_vec();
         img[SW_RESERVED_OFF..512].fill(0);
-        return img;
+        img
+    };
+    if fpregs.len() < MIN_XSTATE_SIZE {
+        return fx_only();
+    }
+
+    // The xsave header follows the 512-byte fxsave block: xstate_bv at 512,
+    // xcomp_bv at 520, then 48 reserved bytes. Bit 63 of xcomp_bv marks the
+    // *compacted* format, which the signal frame does not accept, and the
+    // reserved bytes must be zero. Either being otherwise means this is not the
+    // uncompacted image ptrace is supposed to hand back, so do not tell the
+    // kernel it is one.
+    let xcomp_bv = u64::from_le_bytes(fpregs[520..528].try_into().unwrap());
+    if xcomp_bv & (1 << 63) != 0 || fpregs[528..576].iter().any(|&b| b != 0) {
+        return fx_only();
     }
 
     let xstate_size = fpregs.len();
@@ -809,6 +827,31 @@ mod tests {
         assert_eq!(u64::from_le_bytes(img[472..480].try_into().unwrap()), 0b111, "xfeatures");
         assert_eq!(u32::from_le_bytes(img[480..484].try_into().unwrap()), 1088, "xstate_size");
         assert_eq!(u32::from_le_bytes(img[1088..1092].try_into().unwrap()), FP_XSTATE_MAGIC2);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn fpstate_image_refuses_to_frame_a_compacted_xstate() {
+        // Bit 63 of xcomp_bv marks the compacted format, which the signal frame
+        // cannot consume. Framing it anyway would point xrstor at a buffer whose
+        // component layout is not the one it assumes.
+        let mut fp = vec![0u8; 1088];
+        fp[512..520].copy_from_slice(&0b111u64.to_le_bytes());
+        fp[520..528].copy_from_slice(&(1u64 << 63).to_le_bytes());
+        let img = build_fpstate_image(&fp);
+        assert_eq!(img.len(), 512, "falls back to the legacy fxsave image");
+        assert!(img[464..512].iter().all(|&b| b == 0), "no xstate magic claimed");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn fpstate_image_refuses_a_capture_with_a_dirty_xsave_header() {
+        // Non-zero reserved bytes mean this is not the uncompacted image ptrace
+        // hands back (a truncated or mangled capture, say), so do not claim it.
+        let mut fp = vec![0u8; 1088];
+        fp[512..520].copy_from_slice(&0b111u64.to_le_bytes());
+        fp[540] = 0xAB;
+        assert_eq!(build_fpstate_image(&fp).len(), 512);
     }
 
     #[test]
