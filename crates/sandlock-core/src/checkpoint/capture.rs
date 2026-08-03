@@ -249,6 +249,57 @@ fn must_dump(map: &MemoryMap) -> bool {
     true
 }
 
+/// Render a region the way a refusal needs it: the permissions say whether it is
+/// shared or private, and the path says what backs it, which together decide
+/// whether the region should have been dumped at all. An address range alone
+/// leaves that unanswerable from a bug report.
+fn describe(map: &MemoryMap) -> String {
+    format!(
+        "{:#x}-{:#x} {} {}",
+        map.start,
+        map.end,
+        map.perms,
+        map.path.as_deref().unwrap_or("(anonymous)"),
+    )
+}
+
+/// Read one page at `addr`, reporting only whether it could be read.
+fn page_readable(pid: i32, addr: u64, page: usize) -> bool {
+    let mut buf = vec![0u8; page];
+    let local = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: page,
+    };
+    let remote = libc::iovec {
+        iov_base: addr as *mut libc::c_void,
+        iov_len: page,
+    };
+    let n = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+    n == page as isize
+}
+
+/// Walk a region a page at a time to find where a whole-region read gave up.
+///
+/// The distinction is worth the extra syscalls on a path that is already
+/// failing: a region unreadable from its first page is one the kernel will not
+/// expose at all, while one that reads for a while and then stops has a hole in
+/// it, and those want different answers. Reported as an offset because the
+/// absolute address means nothing without the region's base.
+fn first_unreadable_offset(pid: i32, map: &MemoryMap) -> Option<u64> {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    if page == 0 {
+        return None;
+    }
+    let mut addr = map.start;
+    while addr < map.end {
+        if !page_readable(pid, addr, page) {
+            return Some(addr - map.start);
+        }
+        addr += page as u64;
+    }
+    None
+}
+
 fn capture_memory(pid: i32, maps: &[MemoryMap]) -> Result<Vec<MemorySegment>, SandlockError> {
     let refuse = |msg: String| {
         SandlockError::Runtime(SandboxRuntimeError::Child(format!(
@@ -271,11 +322,10 @@ fn capture_memory(pid: i32, maps: &[MemoryMap]) -> Result<Vec<MemorySegment>, Sa
         let size = (map.end - map.start) as usize;
         if size > MAX_REGION_BYTES {
             return Err(refuse(format!(
-                "region {:#x}-{:#x} is {} MiB, over the {} MiB per-region capture limit \
+                "region {} is {} MiB, over the {} MiB per-region capture limit \
                  (MAX_REGION_BYTES); its contents exist nowhere else, so the image would \
                  be missing that memory",
-                map.start,
-                map.end,
+                describe(map),
                 size / (1024 * 1024),
                 MAX_REGION_BYTES / (1024 * 1024),
             )));
@@ -309,9 +359,14 @@ fn capture_memory(pid: i32, maps: &[MemoryMap]) -> Result<Vec<MemorySegment>, Sa
             } else {
                 format!("read {ret} of {size} bytes")
             };
+            let where_ = match first_unreadable_offset(pid, map) {
+                Some(0) => " (unreadable from its first page)".to_string(),
+                Some(off) => format!(" (first unreadable page at +{off:#x} of {size:#x})"),
+                None => " (page-by-page it reads fine, so the region raced the read)".to_string(),
+            };
             return Err(refuse(format!(
-                "reading region {:#x}-{:#x}: {why}",
-                map.start, map.end,
+                "reading region {}: {why}{where_}",
+                describe(map),
             )));
         }
         segments.push(MemorySegment {
