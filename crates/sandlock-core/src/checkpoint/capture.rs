@@ -203,7 +203,21 @@ pub(crate) fn parse_proc_maps(pid: i32) -> io::Result<Vec<MemoryMap>> {
 // Memory capture -- process_vm_readv (scatter-gather, no file I/O)
 // ---------------------------------------------------------------------------
 
-fn capture_memory(pid: i32, maps: &[MemoryMap]) -> io::Result<Vec<MemorySegment>> {
+/// Largest single region capture will dump.
+///
+/// A resource guard, not a supported-size statement: the buffer for a region is
+/// allocated whole, so one pathological mapping could otherwise exhaust the
+/// supervisor. It does not bound the image, which is the sum of every dumped
+/// region. Raise it if real workloads need larger regions; exceeding it is a
+/// refusal to checkpoint, never a partial image.
+const MAX_REGION_BYTES: usize = 256 * 1024 * 1024;
+
+fn capture_memory(pid: i32, maps: &[MemoryMap]) -> Result<Vec<MemorySegment>, SandlockError> {
+    let refuse = |msg: String| {
+        SandlockError::Runtime(SandboxRuntimeError::Child(format!(
+            "cannot checkpoint: {msg}"
+        )))
+    };
     let mut segments = Vec::new();
 
     for map in maps {
@@ -224,9 +238,24 @@ fn capture_memory(pid: i32, maps: &[MemoryMap]) -> io::Result<Vec<MemorySegment>
         if !map.writable() && !unreopenable {
             continue;
         }
+        // Past this point the region's bytes ARE the image. Nothing else can
+        // supply them at restore: with no captured segment and no reopenable
+        // absolute path, `restore_blob::build_memory_plan` omits the region
+        // altogether, so the restored process comes up with that mapping simply
+        // absent and dies at whatever unrelated point first touches it. Skipping
+        // quietly here buys a checkpoint that reports success and cannot work,
+        // which is strictly worse than refusing to take one.
         let size = (map.end - map.start) as usize;
-        if size > 256 * 1024 * 1024 {
-            continue; // skip segments > 256MB
+        if size > MAX_REGION_BYTES {
+            return Err(refuse(format!(
+                "region {:#x}-{:#x} is {} MiB, over the {} MiB per-region capture limit \
+                 (MAX_REGION_BYTES); its contents exist nowhere else, so the image would \
+                 be missing that memory",
+                map.start,
+                map.end,
+                size / (1024 * 1024),
+                MAX_REGION_BYTES / (1024 * 1024),
+            )));
         }
 
         let mut data = vec![0u8; size];
@@ -251,13 +280,21 @@ fn capture_memory(pid: i32, maps: &[MemoryMap]) -> io::Result<Vec<MemorySegment>
             )
         };
 
-        if ret == size as isize {
-            segments.push(MemorySegment {
-                start: map.start,
-                data,
-            });
+        if ret != size as isize {
+            let why = if ret < 0 {
+                io::Error::last_os_error().to_string()
+            } else {
+                format!("read {ret} of {size} bytes")
+            };
+            return Err(refuse(format!(
+                "reading region {:#x}-{:#x}: {why}",
+                map.start, map.end,
+            )));
         }
-        // Skip unreadable segments silently (same as old behavior)
+        segments.push(MemorySegment {
+            start: map.start,
+            data,
+        });
     }
     Ok(segments)
 }
@@ -336,28 +373,30 @@ pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, Sandlock
         SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace seize: {}", e)))
     })?;
 
-    // Capture registers
-    let regs = ptrace_getregs(pid).map_err(|e| {
-        SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace getregs: {}", e)))
-    })?;
+    // Everything up to the detach reads the frozen process, and any of it can
+    // fail (a region too large to dump, an unreadable mapping, a /proc read
+    // racing the workload). Gather it all first and detach unconditionally:
+    // returning early here would leave the workload stopped under a tracer that
+    // is walking away, which turns a failed checkpoint into a hung sandbox.
+    let captured = (|| {
+        let regs = ptrace_getregs(pid).map_err(|e| {
+            SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace getregs: {}", e)))
+        })?;
+        // FP state is best-effort: an image without it still restores.
+        let fpregs = ptrace_getfpregs(pid).unwrap_or_default();
+        let maps =
+            parse_proc_maps(pid).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
+        let memory_data = capture_memory(pid, &maps)?;
+        let fd_table = capture_fd_table(pid)
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
+        Ok::<_, SandlockError>((regs, fpregs, maps, memory_data, fd_table))
+    })();
 
-    // Capture FPU/extended register state
-    let fpregs = ptrace_getfpregs(pid).unwrap_or_default();
-
-    // Capture memory maps
-    let maps =
-        parse_proc_maps(pid).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-
-    // Capture memory data
-    let memory_data =
-        capture_memory(pid, &maps).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-
-    // Capture fd table
-    let fd_table =
-        capture_fd_table(pid).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-
-    // Detach
-    ptrace_detach(pid).map_err(|e| {
+    let detached = ptrace_detach(pid);
+    // Surface a capture failure first: it is the reason the caller is here, and
+    // a detach error on top of it is noise.
+    let (regs, fpregs, maps, memory_data, fd_table) = captured?;
+    detached.map_err(|e| {
         SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace detach: {}", e)))
     })?;
 
@@ -462,6 +501,68 @@ mod tests {
     /// register arm plus the on-disk save/load format end to end WITHOUT a sandbox
     /// launch (no Landlock) -- the coverage the sandbox-launch integration test
     /// cannot provide on kernels below the required Landlock ABI.
+    /// A region capture cannot dump must refuse the checkpoint, and must still
+    /// let the workload go.
+    ///
+    /// Skipping the region instead would produce an image that reports success
+    /// and cannot work: with no captured bytes and no reopenable path, restore
+    /// omits the mapping entirely and the resumed process dies wherever it first
+    /// touches that memory, a long way from the cause.
+    #[test]
+    fn capture_refuses_a_region_it_cannot_dump_and_still_detaches() {
+        // The child maps past the limit and parks. The pages are never touched,
+        // so this costs address space rather than memory.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe {
+                let p = libc::mmap(
+                    std::ptr::null_mut(),
+                    MAX_REGION_BYTES + 4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if p == libc::MAP_FAILED {
+                    libc::_exit(1);
+                }
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        assert!(child > 0, "fork");
+        unsafe { libc::usleep(100_000) }; // let the child finish its mmap
+
+        let policy = Sandbox::builder().build().expect("build policy");
+        let result = capture(child, &policy);
+
+        // Read the child's state while it is still alive: a capture that bailed
+        // out without detaching would leave it in 't' (tracing stop) forever.
+        let state = std::fs::read_to_string(format!("/proc/{child}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit(") ").next().and_then(|t| t.split(' ').next()).map(String::from));
+
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            let mut s = 0;
+            libc::waitpid(child, &mut s, 0);
+        }
+
+        let err = result.expect_err("a region over the dump limit must refuse").to_string();
+        assert!(
+            err.contains("MAX_REGION_BYTES"),
+            "the refusal should name the limit that caused it: {err}"
+        );
+        // Anything but a stop ('t' tracing stop, 'T' stopped) means the tracer
+        // let go; whether the child is scheduled or sleeping is up to the kernel.
+        let state = state.expect("read child state");
+        assert!(
+            state != "t" && state != "T",
+            "a refused capture must still detach, leaving the workload runnable; state {state}"
+        );
+    }
+
     #[test]
     fn capture_save_load_roundtrips() {
         let mut child = Command::new("sleep")
