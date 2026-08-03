@@ -212,6 +212,43 @@ pub(crate) fn parse_proc_maps(pid: i32) -> io::Result<Vec<MemoryMap>> {
 /// refusal to checkpoint, never a partial image.
 const MAX_REGION_BYTES: usize = 256 * 1024 * 1024;
 
+/// Whether a region's bytes have to travel inside the image, because restore
+/// cannot obtain them from anywhere else.
+///
+/// The bytes are needed unless some file still holds them at restore time:
+///
+/// * Kernel special mappings are provided by the kernel, never rebuilt.
+/// * A read-only region backed by a real file is remapped from that file, which
+///   is cheaper and shares pages.
+/// * A *shared* writable region backed by a real file wrote through to it, so
+///   remapping from that file recovers the current contents.
+///
+/// Everything else is dumped, including shared **anonymous** regions. Those have
+/// no backing file, so their contents exist only in the process; skipping them
+/// loses the data outright. They come back private, since the restore plan has
+/// no shared arm, which trades sharing for contents. A region backed by a memfd
+/// or a "(deleted)" path counts as anonymous here: the path is real in `/proc`
+/// but nothing can reopen it, and that includes the program text of a workload
+/// exec'd from a memfd.
+fn must_dump(map: &MemoryMap) -> bool {
+    if map.is_special() {
+        return false;
+    }
+    let unreopenable = map
+        .path
+        .as_deref()
+        .map_or(false, |p| p.starts_with("/memfd:") || p.ends_with(" (deleted)"));
+    if !map.writable() && !unreopenable {
+        return false;
+    }
+    let reopenable_file =
+        map.path.as_deref().map_or(false, |p| p.starts_with('/')) && !unreopenable;
+    if !map.private() && reopenable_file {
+        return false;
+    }
+    true
+}
+
 fn capture_memory(pid: i32, maps: &[MemoryMap]) -> Result<Vec<MemorySegment>, SandlockError> {
     let refuse = |msg: String| {
         SandlockError::Runtime(SandboxRuntimeError::Child(format!(
@@ -221,21 +258,7 @@ fn capture_memory(pid: i32, maps: &[MemoryMap]) -> Result<Vec<MemorySegment>, Sa
     let mut segments = Vec::new();
 
     for map in maps {
-        if map.is_special() || !map.private() {
-            continue;
-        }
-        // Dump writable regions (their contents are live process state) and any
-        // region backed by an unreopenable file. A memfd (e.g. the memfd the
-        // launcher execs the image binary from) or a "(deleted)" path has no
-        // file restore can reopen, so its bytes must travel inside the image or
-        // the mapping — including the program text of an imaged workload — is
-        // lost. Read-only regions backed by a real file are left to be remapped
-        // from that file at restore, which is cheaper and shares pages.
-        let unreopenable = map
-            .path
-            .as_deref()
-            .map_or(false, |p| p.starts_with("/memfd:") || p.ends_with(" (deleted)"));
-        if !map.writable() && !unreopenable {
+        if !must_dump(map) {
             continue;
         }
         // Past this point the region's bytes ARE the image. Nothing else can
@@ -501,6 +524,52 @@ mod tests {
     /// register arm plus the on-disk save/load format end to end WITHOUT a sandbox
     /// launch (no Landlock) -- the coverage the sandbox-launch integration test
     /// cannot provide on kernels below the required Landlock ABI.
+    fn region(perms: &str, path: Option<&str>) -> MemoryMap {
+        MemoryMap {
+            start: 0x1000,
+            end: 0x2000,
+            perms: perms.into(),
+            offset: 0,
+            path: path.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn shared_anonymous_regions_are_dumped_like_private_ones() {
+        // Nothing backs these, so their contents live only in the process. They
+        // return private, trading sharing for the data itself.
+        assert!(must_dump(&region("rw-s", None)), "shared anonymous");
+        assert!(must_dump(&region("rw-s", Some("/memfd:scratch (deleted)"))), "shared memfd");
+        assert!(must_dump(&region("rw-s", Some("/SYSV00000000 (deleted)"))), "SysV shm");
+        assert!(must_dump(&region("rw-p", None)), "private anonymous");
+    }
+
+    #[test]
+    fn regions_a_file_still_holds_are_left_to_be_remapped() {
+        // Dumping these would bloat every image with bytes restore can read off
+        // disk, and could push a checkpoint over the per-region ceiling.
+        assert!(!must_dump(&region("rw-s", Some("/data/db"))),
+            "a shared writable file mapping wrote through to the file");
+        assert!(!must_dump(&region("r--p", Some("/lib/libc.so"))),
+            "a read-only file mapping is remapped from the file");
+        assert!(!must_dump(&region("r-xp", Some("/bin/app"))), "program text");
+        assert!(!must_dump(&region("r--s", Some("/lib/libc.so"))), "shared read-only file");
+    }
+
+    #[test]
+    fn kernel_special_mappings_are_never_dumped() {
+        for name in ["[vdso]", "[vvar]", "[vvar_vclock]", "[vsyscall]"] {
+            assert!(!must_dump(&region("rw-p", Some(name))), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_dirtied_private_file_mapping_is_dumped() {
+        // Its contents no longer match the file on disk, so the file cannot
+        // supply them at restore.
+        assert!(must_dump(&region("rw-p", Some("/lib/libc.so"))));
+    }
+
     /// A region capture cannot dump must refuse the checkpoint, and must still
     /// let the workload go.
     ///
@@ -560,6 +629,64 @@ mod tests {
         assert!(
             state != "t" && state != "T",
             "a refused capture must still detach, leaving the workload runnable; state {state}"
+        );
+    }
+
+    /// End-to-end: a live MAP_SHARED|MAP_ANONYMOUS region's contents reach the
+    /// image. Classification alone cannot show this, because the region has to
+    /// survive `/proc/<pid>/maps` parsing (where it appears as `rw-s` with no
+    /// path) as well as the dump decision.
+    #[test]
+    fn shared_anonymous_contents_reach_the_image() {
+        const ADDR: u64 = 0x4700_0000_0000;
+        const PAT: u8 = 0x3C;
+
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe {
+                let p = libc::mmap(
+                    ADDR as *mut libc::c_void,
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                    -1,
+                    0,
+                );
+                if p != ADDR as *mut libc::c_void {
+                    libc::_exit(1);
+                }
+                let mut i = 0usize;
+                while i < 4096 {
+                    *(ADDR as *mut u8).add(i) = PAT;
+                    i += 1;
+                }
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        assert!(child > 0, "fork");
+        unsafe { libc::usleep(100_000) };
+
+        let policy = Sandbox::builder().build().expect("build policy");
+        let captured = capture(child, &policy);
+
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            let mut s = 0;
+            libc::waitpid(child, &mut s, 0);
+        }
+
+        let cp = captured.expect("capture");
+        let seg = cp
+            .process_state
+            .memory_data
+            .iter()
+            .find(|s| s.start == ADDR)
+            .expect("the shared anonymous region must be in the image");
+        assert!(
+            seg.data.len() >= 4096 && seg.data[..4096].iter().all(|&b| b == PAT),
+            "its contents must be captured, not just its address"
         );
     }
 
