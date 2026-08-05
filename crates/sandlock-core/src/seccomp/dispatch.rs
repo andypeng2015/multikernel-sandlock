@@ -322,16 +322,17 @@ pub(crate) fn build_dispatch_table(
             });
         }
 
-        // exec invalidates the per-image brk accounting base; see
-        // handle_exec_brk_reset. Registered first for these nrs (always
-        // Continue), so later chroot/COW exec handlers still run.
+        // exec replaces the address space, invalidating both its charge and
+        // its brk base; see handle_exec_memory_reset. Registered first for
+        // these nrs (always Continue), so later chroot/COW exec handlers
+        // still run.
         for &nr in &[libc::SYS_execve, libc::SYS_execveat] {
             let __sup = Arc::clone(ctx);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let sup = Arc::clone(&__sup);
                 async move {
-                    crate::resource::handle_exec_brk_reset(&notif, &sup).await
+                    crate::resource::handle_exec_memory_reset(&notif, &sup).await
                 }
             });
         }
@@ -1161,26 +1162,54 @@ mod handler_tests {
         })
     }
 
-    /// An execve notification drops the per-process brk accounting base,
-    /// so the post-exec image's first brk re-seeds instead of being
-    /// charged the ASLR distance from the old image's heap.
+    /// An execve notification drops the address space's brk base (so the
+    /// post-exec image's first brk re-seeds instead of being charged the
+    /// ASLR distance from the old heap) and credits its charge back (the
+    /// mappings it covered are gone).
     #[tokio::test]
-    async fn exec_notification_resets_brk_base() {
+    async fn exec_notification_resets_memory_accounting() {
         let ctx = fake_supervisor_ctx();
         let pid = std::process::id() as i32;
         ctx.processes.register(pid).expect("register own pid");
         {
             let entry = ctx.processes.entry_for(pid).unwrap();
-            entry.1.lock().await.brk_base = Some(0xdead_b000);
+            let mut per = entry.1.lock().await;
+            per.brk_base = Some(0xdead_b000);
+            per.mem_charged = 50 << 20;
+            ctx.resource.lock().await.mem_used = 60 << 20;
         }
 
         let mut notif = fake_notif(libc::SYS_execve as i32);
         notif.pid = pid as u32;
-        let action = crate::resource::handle_exec_brk_reset(&notif, &ctx).await;
+        let action = crate::resource::handle_exec_memory_reset(&notif, &ctx).await;
 
         assert!(matches!(action, NotifAction::Continue));
         let entry = ctx.processes.entry_for(pid).unwrap();
-        assert_eq!(entry.1.lock().await.brk_base, None);
+        let per = entry.1.lock().await;
+        assert_eq!(per.brk_base, None);
+        assert_eq!(per.mem_charged, 0);
+        // Only this address space's charge is released; the rest stands.
+        assert_eq!(ctx.resource.lock().await.mem_used, 10 << 20);
+    }
+
+    /// A process that dies holding memory returns its charge to the
+    /// sandbox-wide total, so short-lived children can't exhaust the
+    /// budget for everyone.
+    #[tokio::test]
+    async fn process_exit_credits_its_memory_charge() {
+        let ctx = fake_supervisor_ctx();
+        let pid = std::process::id() as i32;
+        let key = ctx.processes.register(pid).expect("register own pid");
+        {
+            let entry = ctx.processes.entry_for(pid).unwrap();
+            entry.1.lock().await.mem_charged = 64 << 20;
+            ctx.resource.lock().await.mem_used = 64 << 20;
+        }
+
+        crate::seccomp::notif::cleanup_pid(&ctx, key).await;
+
+        assert_eq!(ctx.resource.lock().await.mem_used, 0);
+        assert!(ctx.processes.entry_for(pid).is_none());
     }
 
     /// All registered handlers run, in registration order, when each

@@ -2515,7 +2515,22 @@ pub(crate) fn spawn_pid_watcher(
 /// `ProcessIndex`), this is a single unregister — the entry's `Arc`
 /// drops here, and remaining clones held by in-flight handlers will
 /// drop with their tasks, freeing `PerProcessState` automatically.
+///
+/// The exiting task's memory charge is credited back first: exit tears
+/// down the address space without the munmap/brk events the accounting
+/// learns from, so a process that dies holding memory (SIGKILL, a crash,
+/// `_exit`) would otherwise leave its charge in the sandbox-wide total
+/// forever, and enough such deaths would exhaust the budget and start
+/// killing innocent workloads. Only a thread-group leader's entry carries
+/// a charge, so crediting whatever this entry holds is self-limiting.
 pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::state::PidKey) {
+    if let Some((entry_key, state)) = ctx.processes.entry_for(key.pid) {
+        if entry_key == key {
+            let mut per = state.lock().await;
+            let mut st = ctx.resource.lock().await;
+            crate::resource::release_charge(&mut st, &mut per);
+        }
+    }
     ctx.processes.unregister(key);
 }
 

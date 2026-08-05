@@ -118,6 +118,41 @@ class TestMaxMemoryExecReseed:
             del hoard
 
 
+class TestMaxMemoryReleasedOnExit:
+    def test_hard_exiting_children_do_not_exhaust_the_budget(self):
+        """A child that dies holding memory must return it to the budget.
+
+        The limit is sandbox-wide, so a child that exits without
+        unmapping (os._exit here, but equally a crash or a SIGKILL) used
+        to leave its charge behind forever: three 64 MiB children were
+        enough to exhaust a 256 MiB budget and every later child was
+        killed, even though concurrent usage never exceeded ~64 MiB.
+        """
+        child = (
+            "import os; b = bytearray(64 * 1024 * 1024); "
+            "b[::4096] = b'\\x01' * (len(b) // 4096); "
+            "print('OK', flush=True); os._exit(0)"
+        )
+        driver = (
+            "import subprocess, sys\n"
+            "for i in range(10):\n"
+            f"    r = subprocess.run([sys.executable, '-c', {child!r}],"
+            "        capture_output=True)\n"
+            "    print(i, r.returncode, r.stdout.strip().decode(), flush=True)\n"
+        )
+        result = _policy(
+            fs_writable=["/tmp"], max_memory="256M", max_processes=32
+        ).run([sys.executable, "-c", driver], timeout=90)
+
+        lines = [ln.split() for ln in result.stdout.decode().splitlines() if ln]
+        assert len(lines) == 10, result.stdout
+        for i, rc, *rest in lines:
+            assert rc == "0" and rest == ["OK"], (
+                f"child {i} died (rc={rc}) — freed memory was not credited back: "
+                f"{result.stdout!r}"
+            )
+
+
 class TestNetAllowDenyAll:
     """An empty `net_allow` denies all outbound — including when fs grants are
     present, which turn on the named-`AF_UNIX` connect gate (`has_unix_fs_gate`)

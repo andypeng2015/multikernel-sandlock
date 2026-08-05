@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{read_child_mem, spawn_pid_watcher, NotifAction, NotifPolicy};
-use crate::seccomp::state::ResourceState;
+use crate::seccomp::state::{read_tgid_of_tid, PerProcessState, ResourceState};
 use crate::sys::structs::{
     SeccompNotif, CLONE_NS_FLAGS, EAGAIN, EPERM,
 };
@@ -182,16 +182,6 @@ pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) -> bool {
     // Hand the pidfd to the watcher; it owns the fd's lifetime now.
     spawn_pid_watcher(Arc::clone(ctx), key, pidfd);
     true
-}
-
-fn read_tgid_of_tid(tid: i32) -> Option<i32> {
-    let status = std::fs::read_to_string(format!("/proc/{}/status", tid)).ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Tgid:") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
 }
 
 pub(crate) async fn register_child_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) {
@@ -572,38 +562,65 @@ pub(crate) async fn rollback_fork_count(resource: &Arc<Mutex<ResourceState>>) {
 
 /// Handle execve/execveat notifications for memory accounting.
 ///
-/// exec destroys the address space and the kernel assigns a fresh
-/// randomized brk base, so the recorded brk position belongs to the old
-/// image. Dropping it lets the first post-exec brk re-seed; carrying it
-/// across charges the new image's first brk the ASLR distance between the
-/// two heaps — hundreds of MB of phantom memory when the new base lands
-/// above the old one (SIGKILLing innocent workloads at startup), or a
-/// bogus shrink when it lands below.
+/// exec tears down the whole address space: every anonymous mapping and
+/// the entire heap go away at once, without the munmap/brk events the
+/// accounting normally learns from. So the old image's charge is credited
+/// back and the brk base dropped, leaving the new image to be accounted
+/// from zero.
 ///
-/// The old image's already-accounted growth stays in `mem_used`:
-/// conservative, and consistent with pre-exec anonymous mmaps, which exec
-/// also destroys without munmap events. The notification arrives before
-/// the kernel runs the syscall, so a failed exec resets needlessly; the
-/// next brk then re-seeds at the current position, which only forgives
-/// growth.
-pub(crate) async fn handle_exec_brk_reset(
+/// Keeping the brk base across exec was the sharper of the two bugs: the
+/// kernel assigns the new image a fresh randomized base, so its first brk
+/// was charged the ASLR distance between the two heaps — hundreds of MB of
+/// phantom memory when the new base landed above the old one (SIGKILLing
+/// innocent workloads during startup), or a bogus shrink when it landed
+/// below.
+///
+/// The notification arrives before the kernel runs the syscall, so a
+/// failed exec releases the charge early; the address space then
+/// re-accumulates from its next mmap/brk, which under-counts the surviving
+/// image until it does. Erring that way keeps a failed exec from leaving a
+/// permanent phantom charge behind.
+pub(crate) async fn handle_exec_memory_reset(
     notif: &SeccompNotif,
     ctx: &Arc<SupervisorCtx>,
 ) -> NotifAction {
-    // An exec from a non-leader thread continues under the group leader's
-    // pid, so clear the leader's entry too.
-    let tid = notif.pid as i32;
-    let mut pids = vec![tid];
-    match read_tgid_of_tid(tid) {
-        Some(tgid) if tgid != tid => pids.push(tgid),
-        _ => {}
-    }
-    for pid in pids {
-        if let Some(entry) = ctx.processes.entry_for(pid) {
-            entry.1.lock().await.brk_base = None;
-        }
-    }
+    // exec from a non-leader thread continues under the leader's pid and
+    // the leader's entry is where the charge lives, so route through
+    // addr_space_state rather than the calling tid's own entry.
+    let Some(space) = ctx.processes.addr_space_state(notif.pid as i32) else {
+        return NotifAction::Continue;
+    };
+    let mut per = space.lock().await;
+    let mut st = ctx.resource.lock().await;
+    release_charge(&mut st, &mut per);
+    per.brk_base = None;
     NotifAction::Continue
+}
+
+/// Credit an address space's entire outstanding charge back to the global
+/// total and zero it. Callers hold the per-process lock, then the
+/// resource lock (the ordering used throughout this module).
+pub(crate) fn release_charge(st: &mut ResourceState, per: &mut PerProcessState) {
+    st.mem_used = st.mem_used.saturating_sub(per.mem_charged);
+    per.mem_charged = 0;
+}
+
+/// Add `bytes` to the global total and to the address space's charge.
+fn charge(st: &mut ResourceState, per: Option<&mut PerProcessState>, bytes: u64) {
+    st.mem_used = st.mem_used.saturating_add(bytes);
+    st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
+    if let Some(per) = per {
+        per.mem_charged = per.mem_charged.saturating_add(bytes);
+    }
+}
+
+/// Subtract `bytes` from the global total and from the address space's
+/// charge, saturating at zero on both.
+fn credit(st: &mut ResourceState, per: Option<&mut PerProcessState>, bytes: u64) {
+    st.mem_used = st.mem_used.saturating_sub(bytes);
+    if let Some(per) = per {
+        per.mem_charged = per.mem_charged.saturating_sub(bytes);
+    }
 }
 
 /// Handle memory-related notifications (mmap, munmap, brk, mremap, shmget).
@@ -629,59 +646,61 @@ pub(crate) async fn handle_memory(
             .unwrap_or(policy.max_memory_bytes)
     };
 
+    // brk is a query when new_brk is 0; nothing to account, and it must not
+    // seed a base.
+    if nr == libc::SYS_brk && args[0] == 0 {
+        return NotifAction::Continue;
+    }
+
+    // Charges are attributed to the calling task's address space (the
+    // ProcessIndex entry of its thread-group leader) so exec and exit can
+    // credit the whole address space back. An untracked task still counts
+    // against the global total; it just has nothing to credit later.
+    // Lock order: per-process first, then the global resource state.
+    let space = ctx.processes.addr_space_state(notif.pid as i32);
+    let mut per = match space {
+        Some(ref s) => Some(s.lock().await),
+        None => None,
+    };
     let mut st = ctx.resource.lock().await;
 
     let kill = NotifAction::Kill { sig: libc::SIGKILL, pgid: notif.pid as i32 };
+    let would_exceed = |st: &ResourceState, bytes: u64| st.mem_used.saturating_add(bytes) > limit;
 
     if nr == libc::SYS_mmap {
         // args[1] = len, args[3] = flags
         let len = args[1];
         let flags = args[3];
         if (flags & MAP_ANONYMOUS) != 0 {
-            if st.mem_used.saturating_add(len) > limit {
+            if would_exceed(&st, len) {
                 return kill;
             }
-            st.mem_used += len;
-            st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
+            charge(&mut st, per.as_deref_mut(), len);
         }
     } else if nr == libc::SYS_munmap {
         // args[1] = len
-        let len = args[1];
-        st.mem_used = st.mem_used.saturating_sub(len);
+        credit(&mut st, per.as_deref_mut(), args[1]);
     } else if nr == libc::SYS_brk {
         // args[0] = new_brk
         let new_brk = args[0];
-
-        if new_brk == 0 {
-            // Query: return Continue, kernel handles it.
+        let Some(per) = per.as_deref_mut() else {
+            // No address-space entry to hold a base, so the delta from the
+            // previous break is unknowable. Accounting skips this task's
+            // heap rather than guessing.
             return NotifAction::Continue;
-        }
-
-        // Per-process brk base is in PerProcessState. Drop the global
-        // ResourceState lock first to avoid lock ordering issues with
-        // the per-process lock acquired below (per-process first,
-        // then global, when both are needed).
-        drop(st);
-        let entry = match ctx.processes.entry_for(notif.pid as i32) {
-            Some(e) => e,
-            None => return NotifAction::Continue,
         };
-        let mut perproc = entry.1.lock().await;
-        let mut st = ctx.resource.lock().await;
 
-        let base = *perproc.brk_base.get_or_insert(new_brk);
+        let base = *per.brk_base.get_or_insert(new_brk);
         if new_brk > base {
             let delta = new_brk - base;
-            if st.mem_used.saturating_add(delta) > limit {
+            if would_exceed(&st, delta) {
                 return kill;
             }
-            st.mem_used += delta;
-            st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
-            perproc.brk_base = Some(new_brk);
+            charge(&mut st, Some(per), delta);
+            per.brk_base = Some(new_brk);
         } else if new_brk < base {
-            let delta = base - new_brk;
-            st.mem_used = st.mem_used.saturating_sub(delta);
-            perproc.brk_base = Some(new_brk);
+            credit(&mut st, Some(per), base - new_brk);
+            per.brk_base = Some(new_brk);
         }
     } else if nr == libc::SYS_mremap {
         // args[1] = old_len, args[2] = new_len
@@ -690,23 +709,20 @@ pub(crate) async fn handle_memory(
 
         if new_len > old_len {
             let growth = new_len - old_len;
-            if st.mem_used.saturating_add(growth) > limit {
+            if would_exceed(&st, growth) {
                 return kill;
             }
-            st.mem_used += growth;
-            st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
+            charge(&mut st, per.as_deref_mut(), growth);
         } else if new_len < old_len {
-            let shrink = old_len - new_len;
-            st.mem_used = st.mem_used.saturating_sub(shrink);
+            credit(&mut st, per.as_deref_mut(), old_len - new_len);
         }
     } else if nr == libc::SYS_shmget {
         // shmget(key, size, shmflg) — args[1] = size
         let size = args[1];
-        if size > 0 && st.mem_used.saturating_add(size) > limit {
+        if size > 0 && would_exceed(&st, size) {
             return kill;
         }
-        st.mem_used += size;
-        st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
+        charge(&mut st, per.as_deref_mut(), size);
     }
 
     NotifAction::Continue
