@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import statistics
 import sys
@@ -189,6 +190,37 @@ class TestMaxMemoryFileMappingLaundering:
         assert b"LAUNDERED" not in result.stdout, (
             "held 200 MiB under a 128 MiB limit by laundering the counter "
             "with file mappings"
+        )
+
+
+class TestMaxMemoryKillsTheViolator:
+    def test_grandchild_over_the_limit_is_killed(self):
+        """The process that exceeds the limit must be the one that dies.
+
+        The kill signalled the process *group* named by the violator's
+        pid. That is only a real group for the top-level child, so a
+        grandchild's allocation was never stopped: it got ENOMEM back
+        and the run reported success. Worse, a same-user process group
+        elsewhere on the host whose id collided with that pid would have
+        been signalled instead.
+        """
+        prog = (
+            "import subprocess, sys\n"
+            "r = subprocess.run([sys.executable, '-c',\n"
+            "    \"b = bytearray(400*1024*1024); \"\n"
+            "    \"b[::4096] = b'\\\\x01' * (len(b) // 4096)\"],\n"
+            "    capture_output=True)\n"
+            "print('grandchild', r.returncode, flush=True)\n"
+            "print('PARENT-ALIVE', flush=True)\n"
+        )
+        result = _policy(
+            fs_writable=["/tmp"], max_memory="128M", max_processes=32
+        ).run([sys.executable, "-c", prog], timeout=60)
+
+        out = result.stdout.decode()
+        assert "PARENT-ALIVE" in out, out
+        assert f"grandchild {-signal.SIGKILL}" in out, (
+            f"violator was not killed: {out!r}"
         )
 
 

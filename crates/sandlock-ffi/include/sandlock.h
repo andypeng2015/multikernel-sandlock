@@ -104,7 +104,7 @@ enum sandlock_exception
 #endif // __cplusplus
  {
   /**
-   * Treat the failure as `NotifAction::Kill { sig: SIGKILL, pgid: child_pgid }`.
+   * Treat the failure as `NotifAction::KillGroup { sig: SIGKILL, pgid: child_pgid }`.
    * Default; "fail-closed" — the safe option.
    */
   SANDLOCK_EXCEPTION_KILL = 0,

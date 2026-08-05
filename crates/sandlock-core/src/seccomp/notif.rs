@@ -118,9 +118,13 @@ pub enum NotifAction {
     ReturnValue(i64),
     /// Don't respond — used for checkpoint/freeze.
     Hold,
-    /// Kill the child process group (OOM-kill semantics).
-    /// Fields: signal, process group leader pid.
-    Kill { sig: i32, pgid: i32 },
+    /// Signal an entire process group. `pgid` must be a real process
+    /// group id — passing a bare pid signals whatever unrelated group
+    /// happens to carry that number, or nothing at all.
+    KillGroup { sig: i32, pgid: i32 },
+    /// Signal one process, named by any pid in it. `SIGKILL` here ends
+    /// the whole thread group, as it does for any task.
+    KillTask { sig: i32, pid: i32 },
     /// Defer the response: run the carried future on a worker task and
     /// send its terminal action later, keyed by `notif.id`.  Non-`Continue`,
     /// so it short-circuits the handler chain — a deferring handler makes a
@@ -1469,10 +1473,14 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
             debug_assert!(false, "Defer reached send_response; should be intercepted earlier");
             respond_errno(fd, id, libc::EIO)
         }
-        NotifAction::Kill { sig, pgid } => {
+        NotifAction::KillGroup { sig, pgid } => {
             // Kill the entire process group, then return ENOMEM so the
             // seccomp notification is resolved (avoids a kernel warning).
             unsafe { libc::killpg(pgid, sig) };
+            respond_errno(fd, id, ENOMEM)
+        }
+        NotifAction::KillTask { sig, pid } => {
+            unsafe { libc::kill(pid, sig) };
             respond_errno(fd, id, ENOMEM)
         }
     }
@@ -2803,7 +2811,7 @@ mod tests {
         let _ = format!("{:?}", NotifAction::InjectFdSend { srcfd: test_fd, newfd_flags: 0 });
         let _ = format!("{:?}", NotifAction::ReturnValue(42));
         let _ = format!("{:?}", NotifAction::Hold);
-        let _ = format!("{:?}", NotifAction::Kill { sig: 9, pgid: 1 });
+        let _ = format!("{:?}", NotifAction::KillGroup { sig: 9, pgid: 1 });
         let _ = format!("{:?}", NotifAction::defer(async { NotifAction::Continue }));
     }
 
