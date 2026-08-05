@@ -153,6 +153,45 @@ class TestMaxMemoryReleasedOnExit:
             )
 
 
+class TestMaxMemoryFileMappingLaundering:
+    def test_file_map_unmap_cannot_launder_the_budget(self, tmp_dir):
+        """Unmapping a file must not refund memory it never charged.
+
+        Only anonymous mappings are charged, but every unmap used to be
+        credited, so mapping and unmapping a large file zeroed the
+        counter. Repeating that let a workload hold arbitrarily more
+        anonymous memory than the limit: 200 MiB under a 128 MiB cap.
+        """
+        big = tmp_dir / "big.bin"
+        with open(big, "wb") as f:
+            f.truncate(100 * 1024 * 1024)
+
+        prog = (
+            "import mmap, sys\n"
+            "held = bytearray(100 * 1024 * 1024)\n"
+            "held[::4096] = b'\\x01' * (len(held) // 4096)\n"
+            "print('anon-ok', flush=True)\n"
+            f"f = open({str(big)!r}, 'r+b')\n"
+            "for _ in range(6):\n"
+            "    m = mmap.mmap(f.fileno(), 100 * 1024 * 1024, prot=mmap.PROT_READ)\n"
+            "    m.close()\n"
+            "more = bytearray(100 * 1024 * 1024)\n"
+            "more[::4096] = b'\\x01' * (len(more) // 4096)\n"
+            "print('LAUNDERED', flush=True)\n"
+        )
+        result = _policy(
+            fs_readable=[*_PYTHON_READABLE, str(tmp_dir)],
+            fs_writable=["/tmp", str(tmp_dir)],
+            max_memory="128M",
+        ).run([sys.executable, "-c", prog], timeout=60)
+
+        assert b"anon-ok" in result.stdout, result.stdout
+        assert b"LAUNDERED" not in result.stdout, (
+            "held 200 MiB under a 128 MiB limit by laundering the counter "
+            "with file mappings"
+        )
+
+
 class TestNetAllowDenyAll:
     """An empty `net_allow` denies all outbound — including when fs grants are
     present, which turn on the named-`AF_UNIX` connect gate (`has_unix_fs_gate`)

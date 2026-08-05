@@ -614,12 +614,49 @@ fn charge(st: &mut ResourceState, per: Option<&mut PerProcessState>, bytes: u64)
     }
 }
 
-/// Subtract `bytes` from the global total and from the address space's
-/// charge, saturating at zero on both.
+/// Return `bytes` to the global total, capped at what this address space
+/// actually owes so one process's frees can never consume another's
+/// charge (the global total stays the sum of the per-space charges).
 fn credit(st: &mut ResourceState, per: Option<&mut PerProcessState>, bytes: u64) {
-    st.mem_used = st.mem_used.saturating_sub(bytes);
-    if let Some(per) = per {
-        per.mem_charged = per.mem_charged.saturating_sub(bytes);
+    match per {
+        Some(per) => {
+            let refund = bytes.min(per.mem_charged);
+            per.mem_charged -= refund;
+            st.mem_used = st.mem_used.saturating_sub(refund);
+        }
+        None => st.mem_used = st.mem_used.saturating_sub(bytes),
+    }
+}
+
+/// Private anonymous bytes in `pid`'s address space: field 6 of
+/// `/proc/<pid>/statm` (`data_vm + stack_vm`). An O(1) read of the
+/// `mm_struct` counters; `/proc/<pid>/maps` would answer the same
+/// question by formatting every VMA (~274us against ~10us here).
+fn read_private_anon_bytes(pid: i32) -> Option<u64> {
+    let statm = std::fs::read_to_string(format!("/proc/{}/statm", pid)).ok()?;
+    let pages: u64 = statm.split_whitespace().nth(5)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    Some(pages.saturating_mul(page_size as u64))
+}
+
+/// Raise a laundered ledger back to the measured footprint: only
+/// anonymous mappings are charged but every unmap is credited, so
+/// mapping and unmapping a file refunds memory that was never charged.
+///
+/// A floor, not an assignment: `mmap` charges `PROT_NONE` reservations
+/// that `data_vm` excludes until an `mprotect` this handler never sees
+/// makes them writable, so the ledger must be allowed to sit higher.
+fn reconcile_floor(st: &mut ResourceState, per: Option<&mut PerProcessState>, pid: i32) {
+    let Some(per) = per else { return };
+    let Some(measured) = read_private_anon_bytes(pid) else { return };
+    if measured > per.mem_charged {
+        let correction = measured - per.mem_charged;
+        per.mem_charged = measured;
+        st.mem_used = st.mem_used.saturating_add(correction);
+        st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
     }
 }
 
@@ -667,6 +704,12 @@ pub(crate) async fn handle_memory(
     let kill = NotifAction::Kill { sig: libc::SIGKILL, pgid: notif.pid as i32 };
     let would_exceed = |st: &ResourceState, bytes: u64| st.mem_used.saturating_add(bytes) > limit;
 
+    // Allocations are judged against the ledger, so correct it first; a
+    // credit may have pushed it below what is really mapped.
+    if nr != libc::SYS_munmap {
+        reconcile_floor(&mut st, per.as_deref_mut(), notif.pid as i32);
+    }
+
     if nr == libc::SYS_mmap {
         // args[1] = len, args[3] = flags
         let len = args[1];
@@ -678,7 +721,9 @@ pub(crate) async fn handle_memory(
             charge(&mut st, per.as_deref_mut(), len);
         }
     } else if nr == libc::SYS_munmap {
-        // args[1] = len
+        // args[1] = len. Whether the range was anonymous isn't knowable
+        // from the arguments; `reconcile_floor` undoes an over-refund
+        // before the next allocation is judged.
         credit(&mut st, per.as_deref_mut(), args[1]);
     } else if nr == libc::SYS_brk {
         // args[0] = new_brk
@@ -726,6 +771,111 @@ pub(crate) async fn handle_memory(
     }
 
     NotifAction::Continue
+}
+
+#[cfg(test)]
+mod memory_range_tests {
+    use super::*;
+
+    /// The measured footprint follows anonymous memory and ignores file
+    /// mappings, which is what makes it a trustworthy floor: a workload
+    /// can't lower it by mapping and unmapping a file.
+    #[test]
+    fn measured_footprint_tracks_anonymous_not_file_mappings() {
+        let pid = std::process::id() as i32;
+        let len = 64 << 20;
+        let before = read_private_anon_bytes(pid).expect("read own statm");
+
+        let file = tempfile::tempfile().expect("temp file");
+        file.set_len(len as u64).expect("size temp file");
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED, "file mmap failed");
+        let with_file = read_private_anon_bytes(pid).unwrap();
+
+        let anon = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(anon, libc::MAP_FAILED, "anon mmap failed");
+        let with_anon = read_private_anon_bytes(pid).unwrap();
+
+        unsafe {
+            libc::munmap(mapped, len);
+            libc::munmap(anon, len);
+        }
+
+        // Sibling tests share this process and allocate as they run, so
+        // the readings are compared with slack rather than exactly.
+        let len = len as u64;
+        assert!(
+            with_file < before + len / 2,
+            "file mapping moved the measure: {before} -> {with_file}"
+        );
+        assert!(
+            with_anon >= with_file + len,
+            "anonymous mapping did not move the measure: {with_file} -> {with_anon}"
+        );
+    }
+
+    /// A ledger pushed below reality (by crediting an unmap of memory it
+    /// never charged) is restored before the next allocation is judged.
+    #[test]
+    fn reconcile_raises_a_laundered_ledger_to_the_measured_footprint() {
+        let pid = std::process::id() as i32;
+        let measured = read_private_anon_bytes(pid).expect("read own statm");
+        assert!(measured > 0, "test process must have private anon memory");
+
+        let mut st = ResourceState::new(0, 0);
+        let mut per = PerProcessState::default(); // laundered to zero
+        reconcile_floor(&mut st, Some(&mut per), pid);
+        // Sibling tests allocate in this process as they run, so the
+        // restored value is only guaranteed to be at least the earlier
+        // reading; the two counters must agree exactly.
+        assert!(per.mem_charged >= measured, "ledger not restored");
+        assert_eq!(st.mem_used, per.mem_charged);
+
+        // A ledger above the measure is left alone: mmap charges PROT_NONE
+        // reservations that the kernel's measure excludes. A gigabyte of
+        // headroom keeps this clear of any sibling's allocations.
+        let inflated = per.mem_charged + (1 << 30);
+        per.mem_charged = inflated;
+        st.mem_used = inflated;
+        reconcile_floor(&mut st, Some(&mut per), pid);
+        assert_eq!(per.mem_charged, inflated);
+        assert_eq!(st.mem_used, inflated);
+    }
+
+    /// An address space can never hand back more than it owes, so one
+    /// process's frees cannot consume another's charge.
+    #[test]
+    fn credit_is_capped_by_what_the_address_space_owes() {
+        let mut st = ResourceState::new(0, 0);
+        st.mem_used = 100;
+        let mut per = PerProcessState {
+            mem_charged: 30,
+            ..Default::default()
+        };
+
+        credit(&mut st, Some(&mut per), 80);
+
+        assert_eq!(per.mem_charged, 0);
+        assert_eq!(st.mem_used, 70, "only this space's 30 may be returned");
+    }
 }
 
 #[cfg(test)]
