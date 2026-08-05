@@ -570,6 +570,42 @@ pub(crate) async fn rollback_fork_count(resource: &Arc<Mutex<ResourceState>>) {
     rs.proc_count = rs.proc_count.saturating_sub(1);
 }
 
+/// Handle execve/execveat notifications for memory accounting.
+///
+/// exec destroys the address space and the kernel assigns a fresh
+/// randomized brk base, so the recorded brk position belongs to the old
+/// image. Dropping it lets the first post-exec brk re-seed; carrying it
+/// across charges the new image's first brk the ASLR distance between the
+/// two heaps — hundreds of MB of phantom memory when the new base lands
+/// above the old one (SIGKILLing innocent workloads at startup), or a
+/// bogus shrink when it lands below.
+///
+/// The old image's already-accounted growth stays in `mem_used`:
+/// conservative, and consistent with pre-exec anonymous mmaps, which exec
+/// also destroys without munmap events. The notification arrives before
+/// the kernel runs the syscall, so a failed exec resets needlessly; the
+/// next brk then re-seeds at the current position, which only forgives
+/// growth.
+pub(crate) async fn handle_exec_brk_reset(
+    notif: &SeccompNotif,
+    ctx: &Arc<SupervisorCtx>,
+) -> NotifAction {
+    // An exec from a non-leader thread continues under the group leader's
+    // pid, so clear the leader's entry too.
+    let tid = notif.pid as i32;
+    let mut pids = vec![tid];
+    match read_tgid_of_tid(tid) {
+        Some(tgid) if tgid != tid => pids.push(tgid),
+        _ => {}
+    }
+    for pid in pids {
+        if let Some(entry) = ctx.processes.entry_for(pid) {
+            entry.1.lock().await.brk_base = None;
+        }
+    }
+    NotifAction::Continue
+}
+
 /// Handle memory-related notifications (mmap, munmap, brk, mremap, shmget).
 ///
 /// Tracks anonymous memory usage and enforces the configured memory limit.

@@ -321,6 +321,20 @@ pub(crate) fn build_dispatch_table(
                 }
             });
         }
+
+        // exec invalidates the per-image brk accounting base; see
+        // handle_exec_brk_reset. Registered first for these nrs (always
+        // Continue), so later chroot/COW exec handlers still run.
+        for &nr in &[libc::SYS_execve, libc::SYS_execveat] {
+            let __sup = Arc::clone(ctx);
+            table.register(nr, move |cx: &HandlerCtx| {
+                let notif = cx.notif;
+                let sup = Arc::clone(&__sup);
+                async move {
+                    crate::resource::handle_exec_brk_reset(&notif, &sup).await
+                }
+            });
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1145,6 +1159,28 @@ mod handler_tests {
             child_pidfd: None,
             notif_fd: -1,
         })
+    }
+
+    /// An execve notification drops the per-process brk accounting base,
+    /// so the post-exec image's first brk re-seeds instead of being
+    /// charged the ASLR distance from the old image's heap.
+    #[tokio::test]
+    async fn exec_notification_resets_brk_base() {
+        let ctx = fake_supervisor_ctx();
+        let pid = std::process::id() as i32;
+        ctx.processes.register(pid).expect("register own pid");
+        {
+            let entry = ctx.processes.entry_for(pid).unwrap();
+            entry.1.lock().await.brk_base = Some(0xdead_b000);
+        }
+
+        let mut notif = fake_notif(libc::SYS_execve as i32);
+        notif.pid = pid as u32;
+        let action = crate::resource::handle_exec_brk_reset(&notif, &ctx).await;
+
+        assert!(matches!(action, NotifAction::Continue));
+        let entry = ctx.processes.entry_for(pid).unwrap();
+        assert_eq!(entry.1.lock().await.brk_base, None);
     }
 
     /// All registered handlers run, in registration order, when each

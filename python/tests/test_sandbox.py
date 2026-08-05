@@ -90,6 +90,34 @@ class TestSandboxRun:
         assert not result.success
 
 
+class TestMaxMemoryExecReseed:
+    def test_limit_not_charged_for_exec_heap_distance(self):
+        """Regression: random KILLED-at-startup under an ample memory limit.
+
+        When the parent's glibc main arena has no free slack at fork time
+        (forced here by the hoard), the sandboxed child extends the
+        inherited heap via brk before execve. The supervisor used to keep
+        that pre-exec brk position as its accounting base across exec, so
+        the new image's first brk was charged the ASLR distance between the
+        two heaps: hundreds of MB of phantom memory, SIGKILLing the child
+        during interpreter startup (reason KILLED, empty stdout). With the
+        base reset on exec, a few-MB workload must always survive a 64 MiB
+        limit.
+        """
+        hoard = [bytes(4096) for _ in range(3000)]
+        try:
+            for i in range(8):
+                r = _policy(fs_writable=["/tmp"], max_memory="64M").run(
+                    [sys.executable, "-c", "print('HELLO')"], timeout=15
+                )
+                assert r.success and b"HELLO" in r.stdout, (
+                    f"iter {i}: reason={r.reason} signal={r.signal} "
+                    f"stdout={r.stdout!r}"
+                )
+        finally:
+            del hoard
+
+
 class TestNetAllowDenyAll:
     """An empty `net_allow` denies all outbound — including when fs grants are
     present, which turn on the named-`AF_UNIX` connect gate (`has_unix_fs_gate`)
