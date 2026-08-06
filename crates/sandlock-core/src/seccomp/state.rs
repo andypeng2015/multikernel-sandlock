@@ -85,6 +85,19 @@ pub struct PidKey {
     pub start_time: u64,
 }
 
+/// Read the thread-group leader pid (TGID) containing `tid` from
+/// `/proc/<tid>/status`. `None` when the task is gone or /proc is
+/// unreadable; callers decide what that means for them.
+pub(crate) fn read_tgid_of_tid(tid: i32) -> Option<i32> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", tid)).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
 /// Read the process start time (field 22 of /proc/<pid>/stat) for `pid`.
 /// Returns None if the process is gone or /proc is not readable.
 pub(crate) fn read_pid_start_time(pid: i32) -> Option<u64> {
@@ -112,6 +125,13 @@ pub struct PerProcessState {
     pub virtual_cwd: Option<String>,
     /// Recorded brk base for memory accounting. None until first brk.
     pub brk_base: Option<u64>,
+    /// Anonymous memory (bytes) charged to this address space and not
+    /// yet credited back. Only the thread-group leader's entry carries a
+    /// charge: threads share one address space, so all accounting for a
+    /// task is routed to its leader via [`ProcessIndex::addr_space_state`].
+    /// Credited back to the global total when the address space goes away
+    /// (exec replaces it, or the process exits).
+    pub mem_charged: u64,
     /// COW directory dirent cache. Keyed by child's fd; value is
     /// (host target path, sorted dirent bytes left to return).
     /// Entries are invalidated when the fd is reused for a different
@@ -157,6 +177,11 @@ pub struct ProcessIndex {
 #[derive(Clone)]
 struct ProcessEntry {
     key: PidKey,
+    /// Thread-group leader of this task; equals `key.pid` for a
+    /// single-threaded process. Read once at registration and kept
+    /// outside the async mutex so address-space lookups need only the
+    /// index's read lock.
+    tgid: i32,
     state: Arc<AsyncMutex<PerProcessState>>,
 }
 
@@ -177,6 +202,10 @@ impl ProcessIndex {
         let key = PidKey { pid, start_time };
         let entry = ProcessEntry {
             key,
+            // Unreadable /proc means the task is its own address space
+            // as far as accounting is concerned: better local than
+            // misrouted.
+            tgid: read_tgid_of_tid(pid).unwrap_or(pid),
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
         };
         self.inner.write().ok()?.insert(pid, entry);
@@ -199,6 +228,24 @@ impl ProcessIndex {
             .ok()?
             .get(&pid)
             .map(|e| (e.key, Arc::clone(&e.state)))
+    }
+
+    /// Per-address-space state for `pid`: the thread-group leader's
+    /// entry when `pid` is a thread, otherwise its own. Memory
+    /// accounting keys off this because threads share one address
+    /// space — charging each thread separately would let every thread's
+    /// first brk go free and would credit a live heap back when one
+    /// thread exits. Falls back to the task's own entry when the leader
+    /// is untracked.
+    pub fn addr_space_state(&self, pid: i32) -> Option<Arc<AsyncMutex<PerProcessState>>> {
+        let guard = self.inner.read().ok()?;
+        let entry = guard.get(&pid)?;
+        if entry.tgid != pid {
+            if let Some(leader) = guard.get(&entry.tgid) {
+                return Some(Arc::clone(&leader.state));
+            }
+        }
+        Some(Arc::clone(&entry.state))
     }
 
     /// Cheap tracked-process test — used by /proc virtualization to
@@ -623,6 +670,7 @@ mod tests {
             let stale_key = PidKey { pid: self_pid, start_time: 0 };
             let stale = ProcessEntry {
                 key: stale_key,
+                tgid: self_pid,
                 state: Arc::new(AsyncMutex::new(PerProcessState::default())),
             };
             idx.inner.write().unwrap().insert(self_pid, stale);
@@ -681,6 +729,7 @@ mod tests {
         let stale_key = PidKey { pid: self_pid, start_time: 0 };
         let stale = ProcessEntry {
             key: stale_key,
+            tgid: self_pid,
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
         };
         idx.inner.write().unwrap().insert(self_pid, stale);

@@ -70,6 +70,12 @@ const MEMORY_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_munmap,
     libc::SYS_brk,
     libc::SYS_mremap,
+    // exec destroys the address space and the kernel picks a fresh
+    // randomized brk base, so brk accounting must observe it to drop the
+    // old image's base; otherwise the new image's first brk is charged the
+    // ASLR distance between the two heaps.
+    libc::SYS_execve,
+    libc::SYS_execveat,
 ];
 
 const NETWORK_POLICY_SYSCALLS: &[i64] = &[

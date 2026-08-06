@@ -118,9 +118,13 @@ pub enum NotifAction {
     ReturnValue(i64),
     /// Don't respond — used for checkpoint/freeze.
     Hold,
-    /// Kill the child process group (OOM-kill semantics).
-    /// Fields: signal, process group leader pid.
-    Kill { sig: i32, pgid: i32 },
+    /// Signal an entire process group. `pgid` must be a real process
+    /// group id — passing a bare pid signals whatever unrelated group
+    /// happens to carry that number, or nothing at all.
+    KillGroup { sig: i32, pgid: i32 },
+    /// Signal one process, named by any pid in it. `SIGKILL` here ends
+    /// the whole thread group, as it does for any task.
+    KillTask { sig: i32, pid: i32 },
     /// Defer the response: run the carried future on a worker task and
     /// send its terminal action later, keyed by `notif.id`.  Non-`Continue`,
     /// so it short-circuits the handler chain — a deferring handler makes a
@@ -1469,10 +1473,14 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
             debug_assert!(false, "Defer reached send_response; should be intercepted earlier");
             respond_errno(fd, id, libc::EIO)
         }
-        NotifAction::Kill { sig, pgid } => {
+        NotifAction::KillGroup { sig, pgid } => {
             // Kill the entire process group, then return ENOMEM so the
             // seccomp notification is resolved (avoids a kernel warning).
             unsafe { libc::killpg(pgid, sig) };
+            respond_errno(fd, id, ENOMEM)
+        }
+        NotifAction::KillTask { sig, pid } => {
+            unsafe { libc::kill(pid, sig) };
             respond_errno(fd, id, ENOMEM)
         }
     }
@@ -2515,7 +2523,22 @@ pub(crate) fn spawn_pid_watcher(
 /// `ProcessIndex`), this is a single unregister — the entry's `Arc`
 /// drops here, and remaining clones held by in-flight handlers will
 /// drop with their tasks, freeing `PerProcessState` automatically.
+///
+/// The exiting task's memory charge is credited back first: exit tears
+/// down the address space without the munmap/brk events the accounting
+/// learns from, so a process that dies holding memory (SIGKILL, a crash,
+/// `_exit`) would otherwise leave its charge in the sandbox-wide total
+/// forever, and enough such deaths would exhaust the budget and start
+/// killing innocent workloads. Only a thread-group leader's entry carries
+/// a charge, so crediting whatever this entry holds is self-limiting.
 pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::state::PidKey) {
+    if let Some((entry_key, state)) = ctx.processes.entry_for(key.pid) {
+        if entry_key == key {
+            let mut per = state.lock().await;
+            let mut st = ctx.resource.lock().await;
+            crate::resource::release_charge(&mut st, &mut per);
+        }
+    }
     ctx.processes.unregister(key);
 }
 
@@ -2788,7 +2811,7 @@ mod tests {
         let _ = format!("{:?}", NotifAction::InjectFdSend { srcfd: test_fd, newfd_flags: 0 });
         let _ = format!("{:?}", NotifAction::ReturnValue(42));
         let _ = format!("{:?}", NotifAction::Hold);
-        let _ = format!("{:?}", NotifAction::Kill { sig: 9, pgid: 1 });
+        let _ = format!("{:?}", NotifAction::KillGroup { sig: 9, pgid: 1 });
         let _ = format!("{:?}", NotifAction::defer(async { NotifAction::Continue }));
     }
 
