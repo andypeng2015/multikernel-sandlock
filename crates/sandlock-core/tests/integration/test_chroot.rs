@@ -336,6 +336,113 @@ async fn test_chroot_relative_open_follows_fchdir() {
     cleanup_rootfs(&rootfs);
 }
 
+/// openat2 must be mediated like every other open spelling. It was trapped
+/// for the deny check but never routed to the chroot handler, so an absolute
+/// path reached the kernel as written and resolved against the host root
+/// instead of the rootfs.
+#[tokio::test]
+async fn test_chroot_openat2_resolves_inside_the_rootfs() {
+    let rootfs = build_test_rootfs("openat2-absolute");
+    fs::write(rootfs.join("etc/marker.txt"), "from-rootfs\n").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_read("/etc").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "openat2", "/etc/marker.txt"])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "openat2 of a rootfs path should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stdout_str().unwrap_or("").contains("from-rootfs"),
+                "openat2 should have read the rootfs file, got: {}",
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// The same for a relative openat2 after a chdir: it resolves against the
+/// supervisor's notion of the cwd, like every other relative path does.
+#[tokio::test]
+async fn test_chroot_openat2_relative_follows_chdir() {
+    let rootfs = build_test_rootfs("openat2-relative");
+    fs::write(rootfs.join("tmp/marker.txt"), "from-tmp\n").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "sh", "-c", "chdir /tmp && openat2 marker.txt"])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "relative openat2 after chdir should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stdout_str().unwrap_or("").contains("from-tmp"),
+                "openat2 should have read /tmp/marker.txt, got: {}",
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// A RESOLVE_NO_SYMLINKS openat2 must still refuse a symlink once the
+/// supervisor performs the open on its behalf. The child asked the kernel to
+/// refuse it; servicing the open must not quietly grant what it declined.
+#[tokio::test]
+async fn test_chroot_openat2_honors_resolve_no_symlinks() {
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
+    let rootfs = build_test_rootfs("openat2-nosymlinks");
+    fs::write(rootfs.join("etc/marker.txt"), "from-rootfs\n").unwrap();
+    std::os::unix::fs::symlink("marker.txt", rootfs.join("etc/link.txt")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_read("/etc").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "openat2",
+            "/etc/link.txt",
+            &RESOLVE_NO_SYMLINKS.to_string(),
+        ])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                !r.success(),
+                "openat2 through a symlink with RESOLVE_NO_SYMLINKS should fail, stdout: {}",
+                r.stdout_str().unwrap_or("")
+            );
+            assert!(
+                r.stderr_str().unwrap_or("").contains("openat2"),
+                "expected the helper's openat2 error, got: {}",
+                r.stderr_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// chdir into a same-path mount (/proc) from a READ-ONLY path buffer must
 /// succeed. Regression for the busybox-`top` EFAULT: rewriting the child's
 /// path argument to /proc/self/fd/N faults when the path lives in read-only

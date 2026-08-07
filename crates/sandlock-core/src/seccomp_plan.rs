@@ -182,6 +182,10 @@ fn cow_path_syscalls() -> Vec<i64> {
 fn chroot_path_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_openat,
+        // openat2 resolves paths like openat and must be mediated the same
+        // way: left to the kernel, an absolute path resolves against the
+        // host root rather than the rootfs.
+        arch::SYS_OPENAT2,
         libc::SYS_execve,
         libc::SYS_execveat,
         libc::SYS_unlinkat,

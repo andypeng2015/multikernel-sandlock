@@ -492,20 +492,21 @@ fn deny_open_verdict(
 }
 
 /// open/openat/openat2 argument layout, normalized across the spellings.
-struct OpenArgs {
-    dirfd: i64,
-    path_ptr: u64,
-    flags: u64,
-    mode: u64,
+pub(crate) struct OpenArgs {
+    pub(crate) dirfd: i64,
+    pub(crate) path_ptr: u64,
+    pub(crate) flags: u64,
+    #[allow(dead_code)]
+    pub(crate) mode: u64,
     /// `openat2` `resolve` flags (`RESOLVE_*`); 0 for `open`/`openat`.
-    resolve: u64,
+    pub(crate) resolve: u64,
 }
 
 /// Decode the open arguments. `openat2` carries flags/mode/resolve inside a
 /// `struct open_how` in child memory, so its decode reads child memory and
 /// can fail; `None` means "could not decode" and the caller soft-falls-through
 /// (the kernel's own re-read fails the same way).
-fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<OpenArgs> {
+pub(crate) fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<OpenArgs> {
     let a = &notif.data.args;
     let nr = notif.data.nr as i64;
     if nr == libc::SYS_openat {

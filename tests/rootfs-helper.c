@@ -662,6 +662,41 @@ static int cmd_chdir(int argc, char **argv) {
     return 0;
 }
 
+/* ── openat2 (the newest open spelling, via raw syscall) ──────── */
+/*
+ * openat2(2) carries flags, mode and resolve in a struct open_how in user
+ * memory instead of in registers, so a supervisor that reads open arguments
+ * positionally misreads its third argument as flags when it is really a
+ * pointer. Opens <path> read-only and dumps it, so a test can tell which
+ * file the path actually resolved to. musl has no wrapper for it.
+ */
+#ifndef __NR_openat2
+#define __NR_openat2 437
+#endif
+struct helper_open_how {
+    unsigned long long flags;
+    unsigned long long mode;
+    unsigned long long resolve;
+};
+
+static int cmd_openat2(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "openat2: missing operand\n"); return 1; }
+    /* Second operand, when present, is a RESOLVE_* mask (decimal). */
+    struct helper_open_how how = { .flags = O_RDONLY, .mode = 0, .resolve = 0 };
+    if (argc >= 2) how.resolve = strtoull(argv[1], NULL, 0);
+    long fd = syscall(__NR_openat2, AT_FDCWD, argv[0], &how, sizeof(how));
+    if (fd < 0) {
+        fprintf(stderr, "openat2: %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    char buf[4096];
+    ssize_t n;
+    while ((n = read((int)fd, buf, sizeof(buf))) > 0)
+        write(STDOUT_FILENO, buf, n);
+    close((int)fd);
+    return 0;
+}
+
 /* ── fchdir (change directory through an already-open dirfd) ──── */
 /*
  * fchdir() carries no path for the supervisor to inspect, so a supervisor
@@ -769,6 +804,7 @@ static int cmd_write_fd_link(int argc, char **argv) {
 static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
     if (strcmp(cmd, "fchdir") == 0)         return cmd_fchdir(argc, argv);
+    if (strcmp(cmd, "openat2") == 0)        return cmd_openat2(argc, argv);
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
     if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);

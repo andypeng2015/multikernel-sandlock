@@ -823,8 +823,12 @@ fn register_chroot_handlers(
     }
 
     // openat — fallthrough if Continue
-    table.register(libc::SYS_openat, chroot_handler_fallthrough!(policy,
-        crate::chroot::dispatch::handle_chroot_open));
+    // openat, openat2 — fallthrough if Continue. Both carry (dirfd, path) in
+    // the same slots; the handler decodes the rest per spelling.
+    for &nr in &[libc::SYS_openat, arch::SYS_OPENAT2] {
+        table.register(nr, chroot_handler_fallthrough!(policy,
+            crate::chroot::dispatch::handle_chroot_open));
+    }
 
     // open (legacy) — fallthrough if Continue
     if let Some(open) = arch::sys_open() {

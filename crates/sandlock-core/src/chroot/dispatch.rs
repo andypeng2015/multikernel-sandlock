@@ -56,8 +56,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::chroot::resolve::{confine, resolve_existing_in_root, resolve_in_root};
-use crate::sys::fs::openat2_in_root;
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, NotifPolicy};
+use crate::sys::fs::{openat2_in_root, openat2_in_root_with_resolve};
+use crate::seccomp::notif::{decode_open_args, read_child_mem, write_child_mem, NotifAction, NotifPolicy};
 use crate::seccomp::state::{ChrootState, CowState, ProcessIndex};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
 
@@ -269,6 +269,58 @@ fn set_virtual_cwd(notif: &SeccompNotif, ctx: &ChrootCtx<'_>, cwd: PathBuf) {
     }
 }
 
+/// `RESOLVE_NO_MAGICLINKS`: refuse traversal through a /proc magic link.
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+/// `RESOLVE_NO_SYMLINKS`: refuse traversal through any symlink.
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
+/// The subset of an `openat2` caller's `RESOLVE_*` request the supervisor can
+/// reproduce when it services the open itself.
+///
+/// NO_SYMLINKS and NO_MAGICLINKS constrain the shape of the path, so they
+/// hold whatever directory the walk starts from. RESOLVE_BENEATH, IN_ROOT and
+/// NO_XDEV are all relative to the child's own starting dirfd, and the
+/// supervisor walks from the sandbox root instead, so replaying them there
+/// would refuse paths the child never asked to refuse. They are dropped, and
+/// the sandbox's own RESOLVE_IN_ROOT is what bounds the walk in their place.
+fn honorable_resolve_flags(resolve: u64) -> u64 {
+    resolve & (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)
+}
+
+/// Refuse an open whose `RESOLVE_*` request the path as written violates.
+///
+/// Resolution for the policy check deliberately follows symlinks to find the
+/// file the child would reach, which would quietly satisfy a NO_SYMLINKS
+/// request the kernel was asked to refuse. Re-walk the original path under
+/// the child's flags first and hand back the kernel's own ELOOP. Any other
+/// failure (a missing O_CREAT target, most of all) belongs to the normal path
+/// below, which knows how to create and how to phrase the error.
+fn enforce_resolve_flags(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    rel_path: &str,
+    ctx: &ChrootCtx<'_>,
+    resolve: u64,
+) -> Option<NotifAction> {
+    if resolve == 0 {
+        return None;
+    }
+    let full_path = build_virtual_path(notif, dirfd, rel_path, ctx)?;
+    let confined = confine(&full_path);
+    let (root, sub) = match ctx.mount_target(&confined) {
+        Some((mt, sub)) => (mt.to_path_buf(), sub),
+        None => (ctx.root.to_path_buf(), full_path),
+    };
+    match openat2_in_root_with_resolve(&root, &sub, libc::O_PATH | libc::O_CLOEXEC, 0, resolve) {
+        Ok(fd) => {
+            unsafe { libc::close(fd) };
+            None
+        }
+        Err(libc::ELOOP) => Some(NotifAction::Errno(libc::ELOOP)),
+        Err(_) => None,
+    }
+}
+
 /// Build the full virtual path from dirfd + relative path.
 fn build_virtual_path(
     notif: &SeccompNotif,
@@ -420,14 +472,23 @@ pub(crate) async fn handle_chroot_open(
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
-    let dirfd = notif.data.args[0] as i64;
-    let path_ptr = notif.data.args[1];
-    let flags = notif.data.args[2];
+    // Every open spelling lands here, and they do not share an argument
+    // layout: openat2 keeps flags, mode and resolve in a struct open_how in
+    // child memory, where args[2] is the pointer to it rather than the flags.
+    let (dirfd, path_ptr, flags, resolve) = match decode_open_args(notif, notif_fd) {
+        Some(a) => (a.dirfd, a.path_ptr, a.flags, a.resolve),
+        None => return NotifAction::Continue,
+    };
 
     let rel_path = match read_path(notif, path_ptr, notif_fd) {
         Some(p) => p,
         None => return NotifAction::Continue,
     };
+
+    let honored = honorable_resolve_flags(resolve);
+    if let Some(refusal) = enforce_resolve_flags(notif, dirfd, &rel_path, ctx, honored) {
+        return refusal;
+    }
 
     // Resolve to get the virtual path for access control.
     let (host_path, virtual_path) = match resolve_chroot_path(notif, dirfd, &rel_path, ctx) {
@@ -513,7 +574,7 @@ pub(crate) async fn handle_chroot_open(
     } else {
         0
     };
-    match open_in_namespace(ctx, notif.pid, &virtual_path, flags as i32, mode) {
+    match open_in_namespace(ctx, notif.pid, &virtual_path, flags as i32, mode, honored) {
         Ok(srcfd) => NotifAction::InjectFdSend { srcfd, newfd_flags },
         Err(errno) => NotifAction::Errno(errno),
     }
@@ -549,6 +610,7 @@ fn open_in_namespace(
     virtual_path: &Path,
     flags: i32,
     mode: u32,
+    resolve: u64,
 ) -> Result<OwnedFd, i32> {
     let vp_str = virtual_path.to_string_lossy();
 
@@ -562,7 +624,7 @@ fn open_in_namespace(
         Some((mt, sub)) => (mt.to_path_buf(), sub),
         None => (ctx.root.to_path_buf(), vp_str.to_string()),
     };
-    match openat2_in_root(&root, &sub, flags, mode) {
+    match openat2_in_root_with_resolve(&root, &sub, flags, mode, resolve) {
         // Category 1.
         Ok(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
         // Category 2, reached through symlinks.
@@ -1929,15 +1991,9 @@ pub(crate) async fn handle_chroot_legacy_open(
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
-    // open(path, flags, mode) → openat(AT_FDCWD, path, flags, mode)
-    let synth = notif_with_args(notif, [
-        libc::AT_FDCWD as u64,
-        notif.data.args[0], // path
-        notif.data.args[1], // flags
-        notif.data.args[2], // mode
-        0, 0,
-    ]);
-    handle_chroot_open(&synth, chroot_state, cow_state, notif_fd, ctx).await
+    // open(path, flags, mode) needs no reshaping: decode_open_args reads the
+    // legacy layout from the syscall number and supplies the implied AT_FDCWD.
+    handle_chroot_open(notif, chroot_state, cow_state, notif_fd, ctx).await
 }
 
 /// SYS_stat(path, statbuf) → handle_chroot_stat via newfstatat(AT_FDCWD, path, statbuf, 0)
