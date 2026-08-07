@@ -1574,6 +1574,17 @@ pub(crate) async fn handle_chroot_readlink(
     let path = canon_proc_self(&path, notif.pid);
     let own_proc = format!("/proc/{}", notif.pid);
 
+    // Reading a /proc/<pid> link reads another process's state, so it takes
+    // the same per-PID gate the /proc open path applies. Without it a child
+    // could not open /proc/<host pid>/cwd but could still readlink it, and
+    // the supervisor answering on its behalf sees the whole host process
+    // table.
+    if let Some(pid) = crate::procfs::extract_proc_pid(&path) {
+        if !ctx.processes.contains(pid) {
+            return NotifAction::Errno(libc::EACCES);
+        }
+    }
+
     // Special case: the caller's own /proc/<pid>/root -> "/"
     if path == format!("{}/root", own_proc) {
         return write_target(b"/");

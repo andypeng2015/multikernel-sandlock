@@ -56,7 +56,7 @@ pub(crate) fn is_sensitive_proc(path: &str) -> bool {
 ///
 /// Returns `None` for non-numeric components like `/proc/self/...`,
 /// `/proc/cpuinfo`, etc.  Those are handled elsewhere or are safe.
-fn extract_proc_pid(path: &str) -> Option<i32> {
+pub(crate) fn extract_proc_pid(path: &str) -> Option<i32> {
     let rest = path.strip_prefix("/proc/")?;
     // Take the next path component (up to '/' or end of string).
     let component = rest.split('/').next()?;

@@ -575,6 +575,42 @@ async fn test_chroot_lstat_of_proc_self_cwd_is_a_link() {
     cleanup_rootfs(&rootfs);
 }
 
+/// Reading a magic link is a read of another process's state, so it needs the
+/// same per-PID gate the /proc open path applies. Opening /proc/1/cwd was
+/// already refused; readlinking it went straight to the supervisor's own view
+/// of the host's process table.
+#[tokio::test]
+async fn test_chroot_readlink_of_a_foreign_pid_is_refused() {
+    let rootfs = build_test_rootfs("readlink-foreign-pid");
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "readlink", "/proc/1/cwd"])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                !r.success(),
+                "readlink of a non-sandbox pid should fail, stdout: {}",
+                r.stdout_str().unwrap_or("")
+            );
+            assert!(
+                !r.stdout_str().unwrap_or("").contains('/'),
+                "readlink of a non-sandbox pid returned a path: {}",
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// An fd whose file the sandbox cannot name must not be described with the
 /// host path behind it. /proc/<pid>/fd/N is a magic link, so the "target"
 /// readlink hands back is a real host path the kernel synthesized, not link
