@@ -843,11 +843,15 @@ fn register_chroot_handlers(
     }
 
     // Modern write syscalls
-    for &nr in &[
+    let mut write_nrs = vec![
         libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_renameat2,
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
         libc::SYS_fchownat, libc::SYS_truncate,
-    ] {
+    ];
+    // renameat only exists where the ABI kept it, and libc's rename() lands
+    // there on the arches without a plain rename(2).
+    write_nrs.extend(arch::sys_renameat());
+    for nr in write_nrs {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_write));
     }

@@ -235,6 +235,11 @@ fn chroot_path_syscalls() -> Vec<i64> {
             arch::sys_rmdir(),
             arch::sys_mkdir(),
             arch::sys_rename(),
+            // Where the ABI has no plain rename(2), libc's rename() compiles
+            // to renameat, so leaving it out left rename unmediated on
+            // aarch64: an absolute path went to the kernel and resolved
+            // against the host root instead of the rootfs.
+            arch::sys_renameat(),
             arch::sys_symlink(),
             arch::sys_link(),
             arch::sys_chmod(),

@@ -1165,7 +1165,10 @@ pub(crate) async fn handle_chroot_write(
         return exec_on_host(|p| unsafe { libc::mkdir(p, mode) }, &host_path);
     }
 
-    if nr == libc::SYS_renameat2 {
+    // renameat carries the same (olddirfd, oldpath, newdirfd, newpath) slots
+    // as renameat2 and differs only by the flags argument, which this handler
+    // does not read.
+    if nr == libc::SYS_renameat2 || Some(nr) == crate::arch::sys_renameat() {
         let old_path = match read_path(notif, notif.data.args[1], notif_fd) {
             Some(p) => p,
             None => return NotifAction::Continue,
@@ -1404,31 +1407,35 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
     let flags = notif.data.args[3];
     let follow = (flags & libc::AT_SYMLINK_NOFOLLOW as u64) == 0;
 
-    let meta = if follow {
-        std::fs::metadata(path)
-    } else {
-        std::fs::symlink_metadata(path)
+    // Let libc lay the struct out. Hand-packing it in field order is an
+    // x86_64 assumption: aarch64 and riscv64 put st_mode and st_nlink before
+    // st_uid in 32-bit slots where x86_64 has a 64-bit st_nlink first, so the
+    // child read st_nlink's low half as its mode. st_size happens to land at
+    // the same offset on all three, which is why only a test that looks at
+    // the mode ever noticed.
+    let c_path = match path_cstr(path, libc::ENOENT) {
+        Ok(c) => c,
+        Err(a) => return a,
     };
-    let meta = match meta {
-        Ok(m) => m,
-        Err(_) => return NotifAction::Errno(libc::ENOENT),
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        if follow {
+            libc::stat(c_path.as_ptr(), &mut st)
+        } else {
+            libc::lstat(c_path.as_ptr(), &mut st)
+        }
     };
+    if rc < 0 {
+        return NotifAction::Errno(last_errno(libc::ENOENT));
+    }
 
-    use std::os::unix::fs::MetadataExt;
-    let mut buf = vec![0u8; std::mem::size_of::<libc::stat>()];
-    let mut off = 0;
-    macro_rules! pack_u64 { ($v:expr) => { buf[off..off+8].copy_from_slice(&($v as u64).to_ne_bytes()); off += 8; }; }
-    macro_rules! pack_u32 { ($v:expr) => { buf[off..off+4].copy_from_slice(&($v as u32).to_ne_bytes()); off += 4; }; }
-    pack_u64!(meta.dev()); pack_u64!(meta.ino()); pack_u64!(meta.nlink());
-    pack_u32!(meta.mode()); pack_u32!(meta.uid()); pack_u32!(meta.gid()); pack_u32!(0u32);
-    pack_u64!(meta.rdev()); pack_u64!(meta.size() as u64);
-    pack_u64!(meta.blksize()); pack_u64!(meta.blocks() as u64);
-    pack_u64!(meta.atime() as u64); pack_u64!(meta.atime_nsec() as u64);
-    pack_u64!(meta.mtime() as u64); pack_u64!(meta.mtime_nsec() as u64);
-    pack_u64!(meta.ctime() as u64); pack_u64!(meta.ctime_nsec() as u64);
-    let _ = off;
-
-    if write_child_mem(notif_fd, notif.id, notif.pid, statbuf_addr, &buf).is_err() {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            &st as *const libc::stat as *const u8,
+            std::mem::size_of::<libc::stat>(),
+        )
+    };
+    if write_child_mem(notif_fd, notif.id, notif.pid, statbuf_addr, bytes).is_err() {
         return NotifAction::Continue;
     }
     NotifAction::ReturnValue(0)
