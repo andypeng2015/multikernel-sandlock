@@ -55,7 +55,9 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::chroot::resolve::{confine, resolve_existing_in_root, resolve_in_root};
+use crate::chroot::resolve::{
+    confine, resolve_existing_in_root, resolve_in_root, resolve_in_root_nofollow,
+};
 use crate::sys::fs::{openat2_in_root, openat2_in_root_with_resolve};
 use crate::seccomp::notif::{decode_open_args, read_child_mem, write_child_mem, NotifAction, NotifPolicy};
 use crate::seccomp::state::{ChrootState, CowState, ProcessIndex};
@@ -167,28 +169,33 @@ impl ChrootCtx<'_> {
         Some((mount_hp, sub_str))
     }
 
-    /// Resolve a virtual path against mounts for paths that may not exist yet (O_CREAT).
-    /// Returns (host_path, virtual_path).
-    fn resolve_mount(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+    /// Resolve a virtual path against mounts, using `resolver` for the part
+    /// below the mount point. Returns (host_path, virtual_path); the virtual
+    /// path is the confined form of what the child asked for, since that is
+    /// what the policy check reads.
+    fn resolve_mount_with(
+        &self,
+        virtual_path: &str,
+        resolver: fn(&Path, &str) -> Option<(PathBuf, PathBuf)>,
+    ) -> Option<(PathBuf, PathBuf)> {
         let confined = confine(virtual_path);
         let (mount_target, sub_path) = self.mount_target(&confined)?;
-        if let Some(result) = resolve_in_root(mount_target, &sub_path) {
-            let vp = confined;
-            return Some((result.0, vp));
-        }
-        None
+        resolver(mount_target, &sub_path).map(|(host, _)| (host, confined))
     }
 
-    /// Resolve a virtual path against mounts for paths that must exist.
-    /// Returns (host_path, virtual_path).
+    /// Resolve against mounts for paths that may not exist yet (O_CREAT).
+    fn resolve_mount(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+        self.resolve_mount_with(virtual_path, resolve_in_root)
+    }
+
+    /// Resolve against mounts for paths that must exist.
     fn resolve_mount_existing(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
-        let confined = confine(virtual_path);
-        let (mount_target, sub_path) = self.mount_target(&confined)?;
-        if let Some(result) = resolve_existing_in_root(mount_target, &sub_path) {
-            let vp = confined;
-            return Some((result.0, vp));
-        }
-        None
+        self.resolve_mount_with(virtual_path, resolve_existing_in_root)
+    }
+
+    /// Resolve against mounts without following a final symlink.
+    fn resolve_mount_nofollow(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+        self.resolve_mount_with(virtual_path, resolve_in_root_nofollow)
     }
 
     /// Inverse: given a host path, return the virtual path.
@@ -419,6 +426,24 @@ fn resolve_chroot_path(
     resolve_in_root(ctx.root, &full_path)
 }
 
+/// Resolve a child path without following a final symlink.
+///
+/// For the no-follow family: lstat describes the link, unlink removes it,
+/// rename moves it, lchown owns it. Following the last component would point
+/// every one of them at the target instead.
+fn resolve_chroot_path_nofollow(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    path: &str,
+    ctx: &ChrootCtx<'_>,
+) -> Option<(PathBuf, PathBuf)> {
+    let full_path = build_virtual_path(notif, dirfd, path, ctx)?;
+    if let Some(result) = ctx.resolve_mount_nofollow(&full_path) {
+        return Some(result);
+    }
+    resolve_in_root_nofollow(ctx.root, &full_path)
+}
+
 /// Resolve a child path that must already exist within the chroot.
 ///
 /// Unlike [`resolve_chroot_path`], this does NOT fall back to parent
@@ -483,6 +508,23 @@ fn read_and_resolve(
     let dirfd = notif.data.args[dirfd_idx] as i64;
     let (host_path, virtual_path) =
         resolve_chroot_path(notif, dirfd, &path, ctx).ok_or(NotifAction::Errno(libc::EACCES))?;
+    Ok((path, host_path, virtual_path))
+}
+
+/// Like [`read_and_resolve`] but stops at a final symlink, for the callers
+/// that must act on the link rather than on what it points at.
+fn read_and_resolve_nofollow(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+    dirfd_idx: usize,
+    path_idx: usize,
+) -> Result<(String, PathBuf, PathBuf), NotifAction> {
+    let path = read_path(notif, notif.data.args[path_idx], notif_fd)
+        .ok_or(NotifAction::Continue)?;
+    let dirfd = notif.data.args[dirfd_idx] as i64;
+    let (host_path, virtual_path) = resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
+        .ok_or(NotifAction::Errno(libc::EACCES))?;
     Ok((path, host_path, virtual_path))
 }
 
@@ -1072,7 +1114,8 @@ pub(crate) async fn handle_chroot_write(
     let nr = notif.data.nr as i64;
 
     if nr == libc::SYS_unlinkat {
-        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
+        // unlink(2) removes the link, never what it points at.
+        let (_, host_path, vp) = match read_and_resolve_nofollow(notif, notif_fd, ctx, 0, 1) {
             Ok(r) => r,
             Err(a) => return a,
         };
@@ -1131,11 +1174,13 @@ pub(crate) async fn handle_chroot_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let (old_host, old_vp) = match resolve_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx) {
+        // rename(2) moves the names themselves: a symlink on either side is
+        // renamed, not chased.
+        let (old_host, old_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx) {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
-        let (new_host, new_vp) = match resolve_chroot_path(notif, notif.data.args[2] as i64, &new_path, ctx) {
+        let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
@@ -1215,11 +1260,20 @@ pub(crate) async fn handle_chroot_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let (old_host, _) = match resolve_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx) {
+        // link(2) hardlinks the source name itself; only AT_SYMLINK_FOLLOW
+        // asks for the target. The destination is a name being created, so it
+        // never follows either.
+        let follow_old = (notif.data.args[4] & libc::AT_SYMLINK_FOLLOW as u64) != 0;
+        let old_resolved = if follow_old {
+            resolve_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx)
+        } else {
+            resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx)
+        };
+        let (old_host, _) = match old_resolved {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
-        let (new_host, new_vp) = match resolve_chroot_path(notif, notif.data.args[2] as i64, &new_path, ctx) {
+        let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
@@ -1274,7 +1328,13 @@ pub(crate) async fn handle_chroot_write(
     }
 
     if nr == libc::SYS_fchownat {
-        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
+        let nofollow = (notif.data.args[4] & libc::AT_SYMLINK_NOFOLLOW as u64) != 0;
+        let resolved = if nofollow {
+            read_and_resolve_nofollow(notif, notif_fd, ctx, 0, 1)
+        } else {
+            read_and_resolve(notif, notif_fd, ctx, 0, 1)
+        };
+        let (_, host_path, vp) = match resolved {
             Ok(r) => r,
             Err(a) => return a,
         };
@@ -1295,7 +1355,12 @@ pub(crate) async fn handle_chroot_write(
                 }
             }
         }
-        return exec_on_host(|p| unsafe { libc::chown(p, uid, gid) }, &host_path);
+        return exec_on_host(
+            |p| unsafe {
+                if nofollow { libc::lchown(p, uid, gid) } else { libc::chown(p, uid, gid) }
+            },
+            &host_path,
+        );
     }
 
     if nr == libc::SYS_truncate {
@@ -1386,7 +1451,12 @@ pub(crate) async fn handle_chroot_stat(
         return NotifAction::Continue;
     }
 
-    let (_, host_path, vp) = match read_and_resolve_existing(notif, notif_fd, ctx, 0, 1) {
+    let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW as u64) != 0 {
+        read_and_resolve_nofollow(notif, notif_fd, ctx, 0, 1)
+    } else {
+        read_and_resolve_existing(notif, notif_fd, ctx, 0, 1)
+    };
+    let (_, host_path, vp) = match resolved {
         Ok(r) => r,
         Err(a) => return a,
     };
@@ -1435,7 +1505,12 @@ pub(crate) async fn handle_chroot_statx(
         _ => return NotifAction::Continue,
     };
 
-    let (host_path, vp) = match resolve_chroot_path_existing(notif, dirfd, &path, ctx) {
+    let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW) != 0 {
+        resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
+    } else {
+        resolve_chroot_path_existing(notif, dirfd, &path, ctx)
+    };
+    let (host_path, vp) = match resolved {
         Some(r) => r,
         None => return NotifAction::Errno(libc::ENOENT),
     };
@@ -1561,45 +1636,12 @@ pub(crate) async fn handle_chroot_readlink(
         return NotifAction::Continue;
     }
 
-    // Resolve the path WITHOUT following the final symlink.  readlink
-    // must read the link itself, not its target.  We resolve the parent
-    // directory (following intermediate symlinks) and append the filename.
-    let full_path = if Path::new(&path).is_absolute() {
-        path.clone()
-    } else {
-        let base = match dirfd as i32 {
-            libc::AT_FDCWD => virtual_cwd_of(notif, ctx),
-            _ => std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd))
-                .ok()
-                .and_then(|host| ctx.host_to_virtual(&host)),
-        };
-        let base_virtual = match base {
-            Some(p) => p,
-            None => return NotifAction::Errno(libc::EACCES),
-        };
-        base_virtual.join(&path).to_string_lossy().to_string()
+    // readlink must read the link itself, never what it points at, which is
+    // exactly what the no-follow resolver gives.
+    let (host_path, _) = match resolve_chroot_path_nofollow(notif, dirfd, &path, ctx) {
+        Some(r) => r,
+        None => return NotifAction::Errno(libc::EACCES),
     };
-    let confined = crate::chroot::resolve::confine(&full_path);
-    let file_name = match confined.file_name() {
-        Some(f) => f.to_os_string(),
-        None => return NotifAction::Errno(libc::EINVAL),
-    };
-    let parent = confined.parent().unwrap_or(Path::new("/"));
-
-    // Check mount first for parent resolution
-    let parent_str = parent.to_str().unwrap_or("/");
-    let parent_host = if let Some((mt, sub)) = ctx.mount_target(parent) {
-        match resolve_in_root(mt, &sub) {
-            Some((hp, _)) => hp,
-            None => return NotifAction::Errno(libc::EACCES),
-        }
-    } else {
-        match resolve_in_root(ctx.root, parent_str) {
-            Some((hp, _)) => hp,
-            None => return NotifAction::Errno(libc::EACCES),
-        }
-    };
-    let host_path = parent_host.join(&file_name);
 
     // COW
     {
@@ -1744,7 +1786,11 @@ pub(crate) async fn handle_chroot_xattr(
         _ => return NotifAction::Continue,
     };
     let (host_path, vp) =
-        match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
+        match if follow {
+            resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx)
+        } else {
+            resolve_chroot_path_nofollow(notif, libc::AT_FDCWD as i64, &path, ctx)
+        } {
             Some(r) => r,
             None => return NotifAction::Errno(libc::ENOENT),
         };
@@ -2032,7 +2078,12 @@ pub(crate) async fn handle_chroot_utimensat(
         None => return NotifAction::Continue,
     };
 
-    let (host_path, vp) = match resolve_chroot_path(notif, dirfd, &path, ctx) {
+    let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW) != 0 {
+        resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
+    } else {
+        resolve_chroot_path(notif, dirfd, &path, ctx)
+    };
+    let (host_path, vp) = match resolved {
         Some(r) => r,
         None => return NotifAction::Errno(libc::EACCES),
     };

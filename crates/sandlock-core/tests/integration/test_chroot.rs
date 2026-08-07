@@ -451,6 +451,130 @@ async fn test_chroot_proc_self_cwd_never_leaks_a_host_path() {
     cleanup_rootfs(&rootfs);
 }
 
+/// Removing a symlink must remove the link, not what it points at. The
+/// chroot resolver follows the final component to find the file a path names,
+/// which is right for open and wrong for unlink: it deleted the target and
+/// left the dangling link behind.
+#[tokio::test]
+async fn test_chroot_unlink_removes_the_symlink_not_its_target() {
+    let rootfs = build_test_rootfs("unlink-symlink");
+    fs::write(rootfs.join("tmp/target.txt"), "target-body\n").unwrap();
+    std::os::unix::fs::symlink("target.txt", rootfs.join("tmp/link.txt")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy.clone().run(&["rootfs-helper", "rm", "/tmp/link.txt"]).await {
+        Ok(r) => {
+            assert!(r.success(), "rm should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(
+                rootfs.join("tmp/target.txt").exists(),
+                "rm of a symlink deleted its target"
+            );
+            assert!(
+                fs::symlink_metadata(rootfs.join("tmp/link.txt")).is_err(),
+                "rm of a symlink left the link in place"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// lstat must describe the link itself. Resolution for the policy check
+/// follows the final component, so the no-follow spellings were being handed
+/// an already-resolved path and reported the target's type and size.
+#[tokio::test]
+async fn test_chroot_lstat_describes_the_symlink() {
+    let rootfs = build_test_rootfs("lstat-symlink");
+    fs::write(rootfs.join("tmp/target.txt"), "target-body\n").unwrap();
+    std::os::unix::fs::symlink("target.txt", rootfs.join("tmp/link.txt")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "legacy-lstat", "/tmp/link.txt"])
+        .await
+    {
+        Ok(r) => {
+            let stdout = r.stdout_str().unwrap_or("").to_string();
+            assert!(
+                stdout.contains("type=link"),
+                "lstat should describe the link itself, got: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// Renaming a symlink moves the link. Following the final component first
+/// would rename whatever it points at, leaving the old name dangling.
+#[tokio::test]
+async fn test_chroot_rename_moves_the_symlink_not_its_target() {
+    let rootfs = build_test_rootfs("rename-symlink");
+    fs::write(rootfs.join("tmp/target.txt"), "target-body\n").unwrap();
+    std::os::unix::fs::symlink("target.txt", rootfs.join("tmp/link.txt")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "mv", "/tmp/link.txt", "/tmp/moved.txt"])
+        .await
+    {
+        Ok(r) => {
+            assert!(r.success(), "mv should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(
+                rootfs.join("tmp/target.txt").exists(),
+                "rename of a symlink moved its target"
+            );
+            let moved = fs::symlink_metadata(rootfs.join("tmp/moved.txt"));
+            assert!(
+                moved.map(|m| m.file_type().is_symlink()).unwrap_or(false),
+                "the moved entry should still be a symlink"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// The /proc magic links are symlinks, and lstat has to say so even though
+/// paths *through* them are rewritten to the directory they stand for.
+#[tokio::test]
+async fn test_chroot_lstat_of_proc_self_cwd_is_a_link() {
+    let rootfs = build_test_rootfs("lstat-proc-cwd");
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "legacy-lstat", "/proc/self/cwd"])
+        .await
+    {
+        Ok(r) => {
+            let stdout = r.stdout_str().unwrap_or("").to_string();
+            assert!(
+                stdout.contains("type=link"),
+                "lstat of /proc/self/cwd should report a symlink, got: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// An fd whose file the sandbox cannot name must not be described with the
 /// host path behind it. /proc/<pid>/fd/N is a magic link, so the "target"
 /// readlink hands back is a real host path the kernel synthesized, not link

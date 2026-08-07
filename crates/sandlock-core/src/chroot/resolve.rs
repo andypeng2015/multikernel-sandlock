@@ -80,11 +80,32 @@ pub fn resolve_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf,
         return Some(result);
     }
 
-    // Full path doesn't exist — resolve parent directory and append the
-    // missing filename.  This is needed for O_CREAT targets where the
-    // final component will be created.
+    // Full path doesn't exist — resolve the parent and append the missing
+    // filename.  This is needed for O_CREAT targets where the final
+    // component will be created.
+    resolve_in_root_nofollow(chroot_root, child_path)
+}
+
+/// Resolve a virtual path *without* following a final symlink.
+///
+/// The parent is resolved by the kernel (following intermediate symlinks,
+/// confined to `chroot_root`) and the final component is appended verbatim,
+/// so the caller acts on the last component itself.
+///
+/// This is what the no-follow family needs. `lstat` must describe the link,
+/// `unlink` and `rename` must remove and move the link, and `lchown` must own
+/// it: resolving through the final component would silently redirect every
+/// one of them onto the target. It is also how an `O_CREAT` target resolves,
+/// since a name that does not exist yet cannot be walked to.
+pub fn resolve_in_root_nofollow(
+    chroot_root: &Path,
+    child_path: &str,
+) -> Option<(PathBuf, PathBuf)> {
     let confined = confine(child_path);
-    let file_name = confined.file_name()?;
+    // "/" has no final component to leave unresolved.
+    let Some(file_name) = confined.file_name() else {
+        return resolve_existing_in_root(chroot_root, child_path);
+    };
     let parent = confined.parent().unwrap_or(Path::new("/"));
 
     match openat2_in_root(
