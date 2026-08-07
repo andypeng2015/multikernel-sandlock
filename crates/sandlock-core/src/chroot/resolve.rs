@@ -54,7 +54,14 @@ pub fn host_to_virtual(
         .max_by_key(|(_, source)| source.as_os_str().len())
         .map(|(virtual_base, source)| {
             // strip_prefix cannot fail: the filter above already matched it.
-            virtual_base.join(host_path.strip_prefix(source).expect("prefix matched"))
+            let rest = host_path.strip_prefix(source).expect("prefix matched");
+            // join("") appends a separator, so the mount point itself would
+            // render as "/proc/" and reach the child that way through getcwd.
+            if rest.as_os_str().is_empty() {
+                virtual_base.to_path_buf()
+            } else {
+                virtual_base.join(rest)
+            }
         })
 }
 
@@ -261,6 +268,17 @@ mod tests {
             to_virtual_path(Path::new("/rootfs"), Path::new("/other/path")),
             None
         );
+    }
+
+    #[test]
+    fn host_to_virtual_at_a_mount_point_renders_without_a_trailing_slash() {
+        // The rendered bytes matter, not just Path equality (which ignores a
+        // trailing separator): getcwd copies this string into the child, and a
+        // child sitting exactly on a mount point saw "/proc/".
+        let mounts = vec![(PathBuf::from("/proc"), PathBuf::from("/proc"))];
+        let virtual_path = host_to_virtual(Path::new("/rootfs"), &mounts, Path::new("/proc"))
+            .expect("a mount point maps to its own virtual path");
+        assert_eq!(virtual_path.to_string_lossy(), "/proc");
     }
 
     #[test]
