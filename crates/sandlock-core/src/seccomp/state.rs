@@ -263,22 +263,40 @@ impl ProcessIndex {
         Arc::new(std::sync::Mutex::new(parent_cwd))
     }
 
+    /// The cwd cell to read or write for `pid`.
+    ///
+    /// A task without an entry of its own falls back to its
+    /// thread-group leader: `pidfd_open` on a non-leader tid needs
+    /// `PIDFD_THREAD` (Linux 6.9), so `register_pid_if_new` can leave a
+    /// thread unregistered. Since threads share one `fs_struct`, the
+    /// leader's cell is the correct answer for them, not an
+    /// approximation. Only that miss pays for the extra /proc read.
+    fn cwd_cell(&self, pid: i32) -> Option<SharedCwd> {
+        if let Ok(guard) = self.inner.read() {
+            if let Some(entry) = guard.get(&pid) {
+                return Some(Arc::clone(&entry.cwd));
+            }
+        }
+        let tgid = read_tgid_of_tid(pid)?;
+        if tgid == pid {
+            return None;
+        }
+        let guard = self.inner.read().ok()?;
+        guard.get(&tgid).map(|e| Arc::clone(&e.cwd))
+    }
+
     /// The cwd this task believes it is in, or None when the task is
     /// untracked or has never moved.
     pub fn virtual_cwd(&self, pid: i32) -> Option<PathBuf> {
-        let guard = self.inner.read().ok()?;
-        let cwd = guard.get(&pid)?.cwd.lock().ok()?.clone();
+        let cell = self.cwd_cell(pid)?;
+        let cwd = cell.lock().ok()?.clone();
         cwd
     }
 
     /// Record where this task now believes it is. Silently does nothing
     /// for an untracked pid: the fallback is the kernel's own cwd.
     pub fn set_virtual_cwd(&self, pid: i32, cwd: PathBuf) {
-        let cell = match self.inner.read() {
-            Ok(guard) => guard.get(&pid).map(|e| Arc::clone(&e.cwd)),
-            Err(_) => None,
-        };
-        if let Some(cell) = cell {
+        if let Some(cell) = self.cwd_cell(pid) {
             if let Ok(mut slot) = cell.lock() {
                 *slot = Some(cwd);
             }
@@ -755,6 +773,35 @@ mod tests {
         idx.register(tid).expect("thread registers");
 
         idx.set_virtual_cwd(tid, PathBuf::from("/workspace"));
+        assert_eq!(idx.virtual_cwd(leader), Some(PathBuf::from("/workspace")));
+
+        let _ = stop_tx.send(());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn an_unregistered_thread_uses_its_leader_cwd() {
+        // pidfd_open on a non-leader tid needs PIDFD_THREAD (Linux 6.9), so
+        // register_pid_if_new can leave a thread without an entry of its own.
+        // It still shares the leader's fs_struct, so its chdir must land in
+        // the leader's cell rather than vanish.
+        let leader = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        idx.register(leader).expect("leader registers");
+
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            tid_tx.send(tid).unwrap();
+            let _ = stop_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        // Deliberately not registered.
+        assert!(!idx.contains(tid));
+
+        idx.set_virtual_cwd(tid, PathBuf::from("/workspace"));
+        assert_eq!(idx.virtual_cwd(tid), Some(PathBuf::from("/workspace")));
         assert_eq!(idx.virtual_cwd(leader), Some(PathBuf::from("/workspace")));
 
         let _ = stop_tx.send(());

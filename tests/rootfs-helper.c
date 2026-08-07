@@ -662,6 +662,32 @@ static int cmd_chdir(int argc, char **argv) {
     return 0;
 }
 
+/* ── fchdir (change directory through an already-open dirfd) ──── */
+/*
+ * fchdir() carries no path for the supervisor to inspect, so a supervisor
+ * that tracks the cwd itself has to notice this spelling too or its notion
+ * goes stale and later relative paths resolve somewhere else. Prints the
+ * resulting cwd like `chdir` does.
+ */
+static int cmd_fchdir(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "fchdir: missing operand\n"); return 1; }
+    int fd = open(argv[0], O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        fprintf(stderr, "fchdir: open %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    if (fchdir(fd) != 0) {
+        fprintf(stderr, "fchdir: %s: %s\n", argv[0], strerror(errno));
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) { perror("fchdir: getcwd"); return 1; }
+    printf("OK %s\n", buf);
+    return 0;
+}
+
 /* ── chdir-self (chdir into a /proc/self path, confirm it is OUR dir) ─ */
 /*
  * chdir(argv[0]) (e.g. "/proc/self"), then getcwd() and check its final
@@ -742,6 +768,7 @@ static int cmd_write_fd_link(int argc, char **argv) {
 
 static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
+    if (strcmp(cmd, "fchdir") == 0)         return cmd_fchdir(argc, argv);
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
     if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);

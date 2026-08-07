@@ -49,8 +49,8 @@ use tokio::sync::Mutex;
 
 use crate::chroot::resolve::{confine, resolve_existing_in_root, resolve_in_root};
 use crate::sys::fs::openat2_in_root;
-use crate::seccomp::notif::{read_child_mem, write_child_mem, write_child_mem_force, NotifAction};
-use crate::seccomp::state::{ChrootState, CowState};
+use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, NotifPolicy};
+use crate::seccomp::state::{ChrootState, CowState, ProcessIndex};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
 
 // ============================================================
@@ -66,6 +66,27 @@ pub(crate) struct ChrootCtx<'a> {
     pub mounts: &'a [(PathBuf, PathBuf)],
     /// Virtual paths of read-only mounts: reads allowed, writes denied.
     pub mount_ro: &'a [PathBuf],
+    /// Per-process supervisor state, for handlers that track the caller's
+    /// filesystem context rather than just resolving one path.
+    pub processes: &'a Arc<ProcessIndex>,
+}
+
+impl<'a> ChrootCtx<'a> {
+    /// Borrow the chroot half of a notification policy.
+    ///
+    /// Only ever called from handlers registered when `chroot_root` is set,
+    /// which is what makes the unwrap sound.
+    pub(crate) fn new(policy: &'a NotifPolicy, processes: &'a Arc<ProcessIndex>) -> Self {
+        ChrootCtx {
+            root: policy.chroot_root.as_ref().expect("chroot handlers are only registered with a chroot root"),
+            readable: &policy.chroot_readable,
+            writable: &policy.chroot_writable,
+            denied: &policy.chroot_denied,
+            mounts: &policy.chroot_mounts,
+            mount_ro: &policy.chroot_mount_ro,
+            processes,
+        }
+    }
 }
 
 impl ChrootCtx<'_> {
@@ -217,6 +238,29 @@ fn canon_proc_self(virtual_path: &str, pid: u32) -> String {
     virtual_path.to_string()
 }
 
+/// The virtual cwd of the calling task.
+///
+/// The supervisor's own notion wins: since chdir is serviced without moving
+/// the child's real cwd, `/proc/<pid>/cwd` still points wherever exec left
+/// it. That kernel value is the right answer only for a task that has never
+/// moved, which is exactly when nothing is tracked.
+fn virtual_cwd_of(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> Option<PathBuf> {
+    if let Ok(pid) = i32::try_from(notif.pid) {
+        if let Some(cwd) = ctx.processes.virtual_cwd(pid) {
+            return Some(cwd);
+        }
+    }
+    let host_cwd = std::fs::read_link(format!("/proc/{}/cwd", notif.pid)).ok()?;
+    ctx.host_to_virtual(&host_cwd)
+}
+
+/// Record the calling task's new virtual cwd.
+fn set_virtual_cwd(notif: &SeccompNotif, ctx: &ChrootCtx<'_>, cwd: PathBuf) {
+    if let Ok(pid) = i32::try_from(notif.pid) {
+        ctx.processes.set_virtual_cwd(pid, cwd);
+    }
+}
+
 /// Build the full virtual path from dirfd + relative path.
 fn build_virtual_path(
     notif: &SeccompNotif,
@@ -228,12 +272,12 @@ fn build_virtual_path(
         path.to_string()
     } else {
         let dirfd32 = dirfd as i32;
-        let base_host = if dirfd32 == libc::AT_FDCWD {
-            std::fs::read_link(format!("/proc/{}/cwd", notif.pid)).ok()?
+        let base_virtual = if dirfd32 == libc::AT_FDCWD {
+            virtual_cwd_of(notif, ctx)?
         } else {
-            std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)).ok()?
+            let base_host = std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)).ok()?;
+            ctx.host_to_virtual(&base_host)?
         };
-        let base_virtual = ctx.host_to_virtual(&base_host)?;
         let combined = base_virtual.join(path);
         combined.to_string_lossy().to_string()
     };
@@ -745,19 +789,13 @@ pub(crate) async fn handle_chroot_exec(
     let full_path = if Path::new(&rel_path).is_absolute() {
         rel_path
     } else {
-        let dirfd32 = dirfd as i32;
-        let base_host = if dirfd32 == libc::AT_FDCWD {
-            match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
-                Ok(p) => p,
-                Err(_) => return NotifAction::Errno(libc::EACCES),
-            }
-        } else {
-            match std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)) {
-                Ok(p) => p,
-                Err(_) => return NotifAction::Errno(libc::EACCES),
-            }
+        let base = match dirfd as i32 {
+            libc::AT_FDCWD => virtual_cwd_of(notif, ctx),
+            _ => std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd))
+                .ok()
+                .and_then(|host| ctx.host_to_virtual(&host)),
         };
-        match ctx.host_to_virtual(&base_host) {
+        match base {
             Some(base) => base.join(&rel_path).to_string_lossy().to_string(),
             None => return NotifAction::Errno(libc::EACCES),
         }
@@ -1357,19 +1395,13 @@ pub(crate) async fn handle_chroot_readlink(
     let full_path = if Path::new(&path).is_absolute() {
         path.clone()
     } else {
-        let dirfd32 = dirfd as i32;
-        let base_host = if dirfd32 == libc::AT_FDCWD {
-            match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
-                Ok(p) => p,
-                Err(_) => return NotifAction::Errno(libc::EACCES),
-            }
-        } else {
-            match std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)) {
-                Ok(p) => p,
-                Err(_) => return NotifAction::Errno(libc::EACCES),
-            }
+        let base = match dirfd as i32 {
+            libc::AT_FDCWD => virtual_cwd_of(notif, ctx),
+            _ => std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd))
+                .ok()
+                .and_then(|host| ctx.host_to_virtual(&host)),
         };
-        let base_virtual = match ctx.host_to_virtual(&base_host) {
+        let base_virtual = match base {
             Some(p) => p,
             None => return NotifAction::Errno(libc::EACCES),
         };
@@ -1650,41 +1682,19 @@ pub(crate) async fn handle_chroot_chdir(
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
-    let path_ptr = notif.data.args[0];
-    let path = match read_path(notif, path_ptr, notif_fd) {
+    let path = match read_path(notif, notif.data.args[0], notif_fd) {
         Some(p) => p,
-        None => return NotifAction::Continue,
+        None => return NotifAction::Errno(libc::EFAULT),
     };
-    // Bytes the child mapped for the path argument (string + NUL): the upper
-    // bound for an in-place rewrite that must not overflow into adjacent memory.
-    let orig_path_buf_len = path.len() + 1;
 
-    // Build the full virtual path from AT_FDCWD + path.
-    let was_absolute = Path::new(&path).is_absolute();
-    let virtual_path = if was_absolute {
-        path
-    } else {
-        match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
-            Ok(cwd) => match ctx.host_to_virtual(&cwd) {
-                Some(base) => base.join(&path).to_string_lossy().to_string(),
-                None => return NotifAction::Errno(libc::EACCES),
-            },
-            Err(_) => return NotifAction::Errno(libc::EACCES),
-        }
+    let full_path = match build_virtual_path(notif, libc::AT_FDCWD as i64, &path, ctx) {
+        Some(p) => p,
+        None => return NotifAction::Errno(libc::EACCES),
     };
-    // Canonicalize /proc/self and /proc/thread-self to the child's own PID,
-    // exactly as the open path does (build_virtual_path). The on-behalf
-    // openat2 below runs in the supervisor task, so the kernel would resolve a
-    // literal "self" against the supervisor and point the child's cwd at a
-    // non-sandbox process's /proc/<pid> dir. Rewriting to the numeric child PID
-    // makes "self" resolve to the real caller and keeps every /proc spelling
-    // subject to the same numeric per-PID filter. For a same-path /proc mount
-    // this also lets the native-chdir fast path below fire: the resolved fd's
-    // host path then equals full_path, so the kernel re-runs the original
-    // "/proc/self" in the child's context (where it resolves correctly).
-    let full_path = canon_proc_self(&virtual_path, notif.pid);
 
-    // Open directly via openat2(RESOLVE_IN_ROOT), routing to mount target if applicable.
+    // Resolve on-behalf: this is what decides whether the directory exists,
+    // is reachable inside the root, and is a directory at all, and it gives
+    // the errno the child gets when it is not.
     let confined = confine(&full_path);
     let (chdir_root, chdir_path) = if let Some((mt, sub)) = ctx.mount_target(&confined) {
         (mt.to_path_buf(), sub)
@@ -1700,78 +1710,53 @@ pub(crate) async fn handle_chroot_chdir(
         Ok(fd) => fd,
         Err(errno) => return NotifAction::Errno(errno),
     };
-
-    // Native-chdir fast path. The child runs in the host filesystem (sandlock
-    // does not chroot(2); it confines via on-behalf openat2 + Landlock), so an
-    // absolute chdir resolves against the real host root. When the on-behalf
-    // resolved directory's real host path is identical to the path the child
-    // asked for (the common case for same-path mounts like /proc and /sys), a
-    // raw chdir reaches the exact same directory. Let the kernel run the
-    // original syscall unchanged instead of rewriting the argument to the
-    // longer /proc/self/fd/N: that rewrite goes through process_vm_writev,
-    // which fails with EFAULT when the child passed a read-only string literal
-    // (e.g. busybox `top`'s chdir("/proc")), killing the process. Confinement
-    // is preserved: every subsequent open/stat/getdents is independently
-    // re-resolved on-behalf, and the equality check only holds when no symlink
-    // redirection occurred during the confined open.
-    if was_absolute
-        && std::fs::read_link(format!("/proc/self/fd/{}", src_fd))
-            .ok()
-            .as_deref()
-            == Some(Path::new(&full_path))
-    {
-        unsafe { libc::close(src_fd) };
-        return NotifAction::Continue;
-    }
-
-    // Inject fd into child and rewrite path to /proc/self/fd/N.
-    let addfd = SeccompNotifAddfd {
-        id: notif.id,
-        flags: 0,
-        srcfd: src_fd as u32,
-        newfd: 0,
-        newfd_flags: libc::O_CLOEXEC as u32,
-    };
-    let child_fd = unsafe {
-        libc::ioctl(
-            notif_fd,
-            SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
-            &addfd as *const _,
-        )
-    };
+    // Record where the kernel actually landed, not what the child asked for:
+    // symlinks and .. are already collapsed in the resolved fd.
+    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", src_fd)).ok();
     unsafe { libc::close(src_fd) };
+    let virtual_cwd = resolved
+        .as_deref()
+        .and_then(|host| ctx.host_to_virtual(host))
+        .unwrap_or(confined);
 
-    if child_fd < 0 {
-        return NotifAction::Errno(libc::EIO);
-    }
+    // The child's own cwd never moves. chdir cannot be run on-behalf (only
+    // the kernel can update the calling task's fs_struct) and the argument
+    // registers are not writable from seccomp-notify, so the handler used to
+    // rewrite the child's path buffer in place to /proc/self/fd/N and let the
+    // kernel run that. It could not: 16 bytes do not fit the buffer behind a
+    // path as short as "/tmp" or "/", which is issue #178. Tracking the cwd
+    // here instead serves every spelling, and it drops both a TOCTOU window
+    // (the kernel re-read the path we wrote) and a force-write through
+    // /proc/<pid>/mem that permanently corrupted a .rodata path literal.
+    set_virtual_cwd(notif, ctx, virtual_cwd);
+    NotifAction::ReturnValue(0)
+}
 
-    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
-    // chdir leaves the process running, so the rewrite must not overflow the
-    // child's path buffer into adjacent memory. Only force-write when the
-    // redirect fits; otherwise the original (short) buffer can't be redirected.
-    // src_fd is already closed (above); the injected child fd is O_CLOEXEC and
-    // is reclaimed on the child's next exec/exit.
-    if orig_path_buf_len < fd_path.len() {
-        return NotifAction::Errno(libc::ENAMETOOLONG);
-    }
-    // Force-write past read-only page protections (a .rodata chdir literal that
-    // process_vm_writev can't overwrite).
-    if write_child_mem_force(notif_fd, notif.id, notif.pid, path_ptr, fd_path.as_bytes()).is_err() {
-        return NotifAction::Errno(libc::EFAULT);
-    }
+// ============================================================
+// fchdir handler
+// ============================================================
 
-    // KNOWN TOCTOU LIMITATION (issue #27, same class as case 2):
-    //
-    // We've written "/proc/self/fd/N" into the child's path_ptr and
-    // returned Continue.  The kernel will re-read path_ptr to perform
-    // the actual chdir.  A multi-threaded child can race this read
-    // and substitute a different path.
-    //
-    // chdir cannot be on-behalf'd: the kernel must update the calling
-    // task's fs_struct (per-task cwd), which the supervisor cannot do
-    // for the child.  The race window is bounded by Landlock — a
-    // racing path is still subject to landlock_restrict_self.  The
-    // planned mitigation is opt-in CLONE_THREAD deny.
+/// Observe an fchdir so the tracked cwd cannot go stale.
+///
+/// The child's real cwd does move here, since the fd is already open and the
+/// kernel needs no path from us. But the supervisor's notion is what resolves
+/// every later relative path, so it has to follow along.
+pub(crate) async fn handle_chroot_fchdir(
+    notif: &SeccompNotif,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
+    _cow_state: &Arc<Mutex<CowState>>,
+    _notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let fd = notif.data.args[0] as i32;
+    let target = std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, fd)).ok();
+    // Only follow a target that is really a directory: anything else fails
+    // the kernel's fchdir, and recording it would desync the tracked cwd.
+    if let Some(host) = target.filter(|t| t.is_dir()) {
+        if let Some(virtual_cwd) = ctx.host_to_virtual(&host) {
+            set_virtual_cwd(notif, ctx, virtual_cwd);
+        }
+    }
     NotifAction::Continue
 }
 
@@ -1789,12 +1774,7 @@ pub(crate) async fn handle_chroot_getcwd(
     let buf_addr = notif.data.args[0];
     let buf_size = (notif.data.args[1] & 0xFFFFFFFF) as usize;
 
-    let cwd = match std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
-        Ok(c) => c,
-        Err(_) => return NotifAction::Continue,
-    };
-
-    let virtual_cwd = ctx.host_to_virtual(&cwd).unwrap_or_else(|| PathBuf::from("/"));
+    let virtual_cwd = virtual_cwd_of(notif, ctx).unwrap_or_else(|| PathBuf::from("/"));
     let cwd_str = virtual_cwd.to_string_lossy();
     let cwd_bytes = cwd_str.as_bytes();
 
@@ -2203,13 +2183,15 @@ mod self_rewrite_tests {
 
 #[cfg(test)]
 mod mount_ro_tests {
-    use super::ChrootCtx;
+    use super::{ChrootCtx, ProcessIndex};
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     fn ctx<'a>(
         mounts: &'a [(PathBuf, PathBuf)],
         mount_ro: &'a [PathBuf],
         writable: &'a [PathBuf],
+        processes: &'a Arc<ProcessIndex>,
     ) -> ChrootCtx<'a> {
         ChrootCtx {
             root: Path::new("/rootfs"),
@@ -2218,6 +2200,7 @@ mod mount_ro_tests {
             denied: &[],
             mounts,
             mount_ro,
+            processes,
         }
     }
 
@@ -2228,7 +2211,8 @@ mod mount_ro_tests {
         // Even with a writable rootfs ("/" granted), the read-only /proc mount
         // must still deny writes — this is the host-escape guard.
         let writable = vec![PathBuf::from("/")];
-        let c = ctx(&mounts, &ro, &writable);
+        let processes = Arc::new(ProcessIndex::new());
+        let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/proc/version")));
         assert!(!c.can_write(Path::new("/proc/sys/kernel/core_pattern")));
         assert!(!c.can_write(Path::new("/proc/self/oom_score_adj")));
@@ -2239,7 +2223,8 @@ mod mount_ro_tests {
         let mounts = vec![(PathBuf::from("/data"), PathBuf::from("/host/data"))];
         let ro: Vec<PathBuf> = vec![];
         let writable = vec![PathBuf::from("/data")];
-        let c = ctx(&mounts, &ro, &writable);
+        let processes = Arc::new(ProcessIndex::new());
+        let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/data/file")));
         assert!(c.can_write(Path::new("/data/file")));
     }

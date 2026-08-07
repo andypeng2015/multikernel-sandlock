@@ -199,6 +199,10 @@ fn chroot_path_syscalls() -> Vec<i64> {
         libc::SYS_readlinkat,
         libc::SYS_getdents64,
         libc::SYS_chdir,
+        // fchdir carries no path, but it still moves the cwd that every
+        // later relative path resolves against, so the supervisor has to
+        // see it to keep its own notion in step.
+        libc::SYS_fchdir,
         libc::SYS_getcwd,
         libc::SYS_statfs,
         libc::SYS_utimensat,

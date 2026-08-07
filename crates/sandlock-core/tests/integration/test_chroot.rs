@@ -205,6 +205,137 @@ async fn test_chroot_getcwd() {
     cleanup_rootfs(&rootfs);
 }
 
+/// A short absolute path must be reachable (issue #178). The old handler
+/// redirected the child through "/proc/self/fd/N", 16 bytes that cannot fit
+/// the buffer behind a path as short as "/tmp", so every short mount point
+/// failed with ENAMETOOLONG while ls and open on the same path worked.
+#[tokio::test]
+async fn test_chroot_chdir_short_path() {
+    let rootfs = build_test_rootfs("chdir-short");
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy.clone().run(&["rootfs-helper", "chdir", "/tmp"]).await {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "chdir(/tmp) should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert_eq!(r.stdout_str().unwrap_or("").trim(), "OK /tmp");
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// The virtual root is the shortest path there is, and no redirect can ever
+/// fit its two-byte buffer. `cd /` has to work without one.
+#[tokio::test]
+async fn test_chroot_chdir_virtual_root() {
+    let rootfs = build_test_rootfs("chdir-root");
+
+    let policy = minimal_exec_policy(&rootfs).build().unwrap();
+
+    match policy.clone().run(&["rootfs-helper", "chdir", "/"]).await {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "chdir(/) should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert_eq!(r.stdout_str().unwrap_or("").trim(), "OK /");
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// A relative path opened after a chdir must resolve against the directory
+/// the child moved to. The supervisor resolves the path itself, so this is
+/// what proves its notion of the cwd actually followed the chdir.
+#[tokio::test]
+async fn test_chroot_relative_open_follows_chdir() {
+    let rootfs = build_test_rootfs("chdir-relative");
+    fs::write(rootfs.join("tmp/marker.txt"), "marker-body\n").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "sh", "-c", "chdir /tmp && cat marker.txt"])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "relative cat after chdir should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stdout_str().unwrap_or("").contains("marker-body"),
+                "relative open should have read /tmp/marker.txt, got: {}",
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// fchdir carries a dirfd instead of a path, so a supervisor tracking the cwd
+/// has to observe this spelling too. Chained after a chdir, which is where the
+/// supervisor's own notion takes over: miss the fchdir and that notion goes
+/// stale, sending the following relative open back to the chdir's directory.
+#[tokio::test]
+async fn test_chroot_relative_open_follows_fchdir() {
+    let rootfs = build_test_rootfs("fchdir-relative");
+    fs::write(rootfs.join("tmp/marker.txt"), "from-tmp\n").unwrap();
+    fs::write(rootfs.join("etc/marker.txt"), "from-etc\n").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/etc")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "chdir /tmp && fchdir /etc && cat marker.txt",
+        ])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "relative cat after fchdir should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            let stdout = r.stdout_str().unwrap_or("").to_string();
+            assert!(
+                stdout.contains("from-etc"),
+                "relative open should have read /etc/marker.txt, got: {}",
+                stdout
+            );
+            assert!(
+                !stdout.contains("from-tmp"),
+                "relative open resolved against the earlier chdir, got: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// chdir into a same-path mount (/proc) from a READ-ONLY path buffer must
 /// succeed. Regression for the busybox-`top` EFAULT: rewriting the child's
 /// path argument to /proc/self/fd/N faults when the path lives in read-only
