@@ -27,17 +27,25 @@
 //!    EFAULT/-style error to the child. No security decision was made
 //!    on contents we couldn't read, so this is safe.
 //!
-//! 4. **Path-rewrite-then-Continue** (handle_chroot_exec, handle_chroot_chdir):
-//!    the supervisor rewrites `path_ptr` to `/proc/self/fd/N` and returns
-//!    `Continue` because the kernel must execute the syscall (execve
-//!    replaces the address space; chdir requires the kernel's per-task
-//!    fs_struct update). The TOCTOU window is real here — a racing
-//!    sibling thread can substitute a different path string between our
-//!    write and the kernel's read. The bound is Landlock: a racing path
-//!    is still subject to `landlock_restrict_self`. See per-site comments
-//!    in `handle_chroot_exec` and `handle_chroot_chdir`. The planned
-//!    mitigation is opt-in `CLONE_THREAD` deny in the BPF filter, which
-//!    eliminates the racer entirely.
+//! 4. **Path-rewrite-then-Continue** (handle_chroot_exec): the supervisor
+//!    rewrites `path_ptr` to `/proc/self/fd/N` and returns `Continue`
+//!    because the kernel must run the syscall itself — execve replaces
+//!    the address space. The TOCTOU window is real here: a racing sibling
+//!    thread can substitute a different path string between our write and
+//!    the kernel's read. The bound is Landlock, since a racing path is
+//!    still subject to `landlock_restrict_self`.
+//!
+//! A `Continue` on a *healthy* path syscall would be a bug in this module,
+//! not merely a race: the kernel resolves the path it is given against the
+//! real root and the real cwd, so an absolute path would escape the virtual
+//! root and a relative one would resolve against wherever exec left the
+//! child. Since `handle_chroot_chdir` services chdir by recording the cwd
+//! rather than moving the child's own (see there for why), that real cwd is
+//! frozen for the process's whole life and diverges from the sandbox's view
+//! the moment anything chdirs. Every `Continue` above is therefore either
+//! fd-based, where no path is resolved at all (AT_EMPTY_PATH stat, getdents,
+//! fchdir), or reached only after a fault that makes the kernel fail the
+//! same syscall the same way. A new handler must keep to one of those two.
 
 use std::ffi::CString;
 use std::io::{Read, Seek, SeekFrom, Write};
