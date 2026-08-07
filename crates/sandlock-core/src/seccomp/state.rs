@@ -4,6 +4,7 @@
 // `ProcessIndex`; cleanup on exit is just dropping the entry's `Arc`.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -98,6 +99,17 @@ pub(crate) fn read_tgid_of_tid(tid: i32) -> Option<i32> {
     None
 }
 
+/// Read the parent pid (field 4 of `/proc/<pid>/stat`) for `pid`.
+/// `None` when the task is gone or /proc is unreadable.
+pub(crate) fn read_ppid(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // Skip past "pid (comm)": comm may contain spaces and parens, but the
+    // last ") " in the line ends it. The first token after it is the state,
+    // and the parent pid follows.
+    let rest = stat.rsplit_once(") ")?.1;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// Read the process start time (field 22 of /proc/<pid>/stat) for `pid`.
 /// Returns None if the process is gone or /proc is not readable.
 pub(crate) fn read_pid_start_time(pid: i32) -> Option<u64> {
@@ -174,6 +186,17 @@ pub struct ProcessIndex {
     inner: std::sync::RwLock<HashMap<i32, ProcessEntry>>,
 }
 
+/// A task's current directory as the sandbox believes it to be: the
+/// path `getcwd` should report, in whatever namespace the child sees
+/// (the virtual path under chroot, the real path otherwise).
+///
+/// `None` means the task has never moved, so the kernel's own cwd is
+/// still authoritative. Shared behind an `Arc` the way the kernel
+/// shares `fs_struct`, so a chdir in one thread is seen by its
+/// siblings. Kept outside `PerProcessState` (and behind a std mutex)
+/// because path resolution reads it from synchronous helpers.
+pub type SharedCwd = Arc<std::sync::Mutex<Option<PathBuf>>>;
+
 #[derive(Clone)]
 struct ProcessEntry {
     key: PidKey,
@@ -183,6 +206,7 @@ struct ProcessEntry {
     /// index's read lock.
     tgid: i32,
     state: Arc<AsyncMutex<PerProcessState>>,
+    cwd: SharedCwd,
 }
 
 impl ProcessIndex {
@@ -200,16 +224,65 @@ impl ProcessIndex {
     pub fn register(&self, pid: i32) -> Option<PidKey> {
         let start_time = read_pid_start_time(pid)?;
         let key = PidKey { pid, start_time };
+        // Unreadable /proc means the task is its own address space as far
+        // as accounting is concerned: better local than misrouted.
+        let tgid = read_tgid_of_tid(pid).unwrap_or(pid);
         let entry = ProcessEntry {
             key,
-            // Unreadable /proc means the task is its own address space
-            // as far as accounting is concerned: better local than
-            // misrouted.
-            tgid: read_tgid_of_tid(pid).unwrap_or(pid),
+            tgid,
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
+            cwd: self.inherited_cwd(pid, tgid),
         };
         self.inner.write().ok()?.insert(pid, entry);
         Some(key)
+    }
+
+    /// The cwd cell a task starts life with.
+    ///
+    /// A thread joins its leader's cell, because the kernel hands
+    /// pthreads a shared `fs_struct` and one thread's chdir moves its
+    /// siblings. Anything else copies the parent's current value, which
+    /// is what `fork(2)` does. Thread-group membership stands in for
+    /// `CLONE_FS` here, the same approximation `addr_space_state` makes
+    /// for `CLONE_VM`: a bare `clone(CLONE_FS)` without `CLONE_THREAD`
+    /// gets a private copy instead of sharing. An untracked parent
+    /// leaves the child at None, which falls back to the kernel's cwd.
+    fn inherited_cwd(&self, pid: i32, tgid: i32) -> SharedCwd {
+        let ppid = if tgid == pid { read_ppid(pid) } else { None };
+        let Ok(guard) = self.inner.read() else {
+            return SharedCwd::default();
+        };
+        if tgid != pid {
+            if let Some(leader) = guard.get(&tgid) {
+                return Arc::clone(&leader.cwd);
+            }
+        }
+        let parent_cwd = ppid
+            .and_then(|p| guard.get(&p))
+            .and_then(|e| e.cwd.lock().ok().and_then(|c| c.clone()));
+        Arc::new(std::sync::Mutex::new(parent_cwd))
+    }
+
+    /// The cwd this task believes it is in, or None when the task is
+    /// untracked or has never moved.
+    pub fn virtual_cwd(&self, pid: i32) -> Option<PathBuf> {
+        let guard = self.inner.read().ok()?;
+        let cwd = guard.get(&pid)?.cwd.lock().ok()?.clone();
+        cwd
+    }
+
+    /// Record where this task now believes it is. Silently does nothing
+    /// for an untracked pid: the fallback is the kernel's own cwd.
+    pub fn set_virtual_cwd(&self, pid: i32, cwd: PathBuf) {
+        let cell = match self.inner.read() {
+            Ok(guard) => guard.get(&pid).map(|e| Arc::clone(&e.cwd)),
+            Err(_) => None,
+        };
+        if let Some(cell) = cell {
+            if let Ok(mut slot) = cell.lock() {
+                *slot = Some(cwd);
+            }
+        }
     }
 
     /// Look up the canonical PidKey for a notification's raw pid.
@@ -662,6 +735,62 @@ mod tests {
     }
 
     #[test]
+    fn threads_of_one_process_share_one_cwd() {
+        // The kernel gives pthreads a shared fs_struct, so a chdir in one
+        // thread moves its siblings. Registering a tid must join the leader's
+        // cwd rather than start a private one.
+        let leader = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        idx.register(leader).expect("leader registers");
+
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            tid_tx.send(tid).unwrap();
+            // Stay alive: register() reads /proc/<tid>/stat.
+            let _ = stop_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        idx.register(tid).expect("thread registers");
+
+        idx.set_virtual_cwd(tid, PathBuf::from("/workspace"));
+        assert_eq!(idx.virtual_cwd(leader), Some(PathBuf::from("/workspace")));
+
+        let _ = stop_tx.send(());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_child_copies_the_parent_cwd_instead_of_sharing_it() {
+        // fork(2) copies fs_struct: the child starts where the parent stood,
+        // and its later chdir must not move the parent.
+        let parent = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        idx.register(parent).expect("parent registers");
+        idx.set_virtual_cwd(parent, PathBuf::from("/workspace"));
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // Async-signal-safe only: sleep, then leave without unwinding.
+            let ts = libc::timespec { tv_sec: 30, tv_nsec: 0 };
+            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+            unsafe { libc::_exit(0) };
+        }
+
+        idx.register(child).expect("child registers");
+        assert_eq!(idx.virtual_cwd(child), Some(PathBuf::from("/workspace")));
+
+        idx.set_virtual_cwd(child, PathBuf::from("/tmp"));
+        assert_eq!(idx.virtual_cwd(parent), Some(PathBuf::from("/workspace")));
+
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
+    }
+
+    #[test]
     fn process_index_register_overwrites_stale_entry_for_recycled_pid() {
         let self_pid = unsafe { libc::getpid() };
         let idx = ProcessIndex::new();
@@ -672,6 +801,7 @@ mod tests {
                 key: stale_key,
                 tgid: self_pid,
                 state: Arc::new(AsyncMutex::new(PerProcessState::default())),
+                cwd: SharedCwd::default(),
             };
             idx.inner.write().unwrap().insert(self_pid, stale);
         }
@@ -731,6 +861,7 @@ mod tests {
             key: stale_key,
             tgid: self_pid,
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
+            cwd: SharedCwd::default(),
         };
         idx.inner.write().unwrap().insert(self_pid, stale);
 

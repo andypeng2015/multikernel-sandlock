@@ -1580,18 +1580,6 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
     }
 }
 
-/// Read the parent PID from /proc/{pid}/stat.
-fn read_ppid(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    // Format: "pid (comm) state ppid ..."
-    // Find the closing ')' then split the rest
-    let close_paren = stat.rfind(')')?;
-    let rest = &stat[close_paren + 2..]; // skip ") "
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    // fields[0] = state, fields[1] = ppid
-    fields.get(1)?.parse().ok()
-}
-
 /// Read a NUL-terminated path from child memory (up to PATH_MAX bytes).
 fn read_path_for_event(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String> {
     if addr == 0 { return None; }
@@ -1895,7 +1883,10 @@ async fn emit_policy_event(
     let denied = matches!(action, NotifAction::Errno(_));
     let name = syscall_name(nr);
     let category = syscall_category(nr);
-    let parent_pid = read_ppid(notif.pid);
+    let parent_pid = i32::try_from(notif.pid)
+        .ok()
+        .and_then(crate::seccomp::state::read_ppid)
+        .and_then(|p| u32::try_from(p).ok());
 
     // Extract metadata based on syscall type.
     //
