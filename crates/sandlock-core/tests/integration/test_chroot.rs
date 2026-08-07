@@ -451,6 +451,52 @@ async fn test_chroot_proc_self_cwd_never_leaks_a_host_path() {
     cleanup_rootfs(&rootfs);
 }
 
+/// An fd whose file the sandbox cannot name must not be described with the
+/// host path behind it. /proc/<pid>/fd/N is a magic link, so the "target"
+/// readlink hands back is a real host path the kernel synthesized, not link
+/// text: an inherited stdio fd, or here a supervisor-opened /dev/null with
+/// no /dev mount to map it into, would spell out where it lives on the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_chroot_fd_link_does_not_leak_a_host_path() {
+    use sandlock_core::StdioMode;
+    use std::fs::File;
+    use std::io::Read;
+
+    let rootfs = build_test_rootfs("fd-link-leak");
+
+    let mut sb = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .build()
+        .unwrap();
+
+    match sb
+        .popen(
+            &["rootfs-helper", "readlink", "/proc/self/fd/0"],
+            StdioMode::Null,
+            StdioMode::Piped,
+            StdioMode::Piped,
+        )
+        .await
+    {
+        Ok(mut child) => {
+            let mut out = String::new();
+            if let Some(stdout) = child.take_stdout() {
+                let _ = File::from(stdout).read_to_string(&mut out);
+            }
+            let _ = child.wait().await;
+            let link = out.trim().to_string();
+            assert!(
+                !link.starts_with('/'),
+                "fd link named a path the sandbox cannot reach: {}",
+                link
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// openat2 must be mediated like every other open spelling. It was trapped
 /// for the deny check but never routed to the chroot handler, so an absolute
 /// path reached the kernel as written and resolved against the host root

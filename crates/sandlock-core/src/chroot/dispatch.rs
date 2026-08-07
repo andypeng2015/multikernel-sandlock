@@ -337,6 +337,27 @@ fn proc_cwd_link_pid(virtual_path: &str) -> Option<(i32, &str)> {
     }
 }
 
+/// The `(pid, fd)` a `/proc/<pid>/fd/<n>` path names, if any. Anything
+/// deeper (`/proc/<pid>/fd/3/x`) is a path *through* the link, not the link.
+fn proc_fd_link(virtual_path: &str) -> Option<(i32, i32)> {
+    let rest = virtual_path.strip_prefix("/proc/")?;
+    let (pid, rest) = rest.split_once('/')?;
+    let fd = rest.strip_prefix("fd/")?;
+    Some((pid.parse().ok()?, fd.parse().ok()?))
+}
+
+/// Name an open file the sandbox has no path for.
+///
+/// Modelled on the kernel's own `pipe:[inode]` spelling for fds that are not
+/// reachable by name. A caller that reads an fd link to tell one stream from
+/// another still gets a stable answer, without being handed a host path the
+/// sandbox exists to keep out of reach.
+fn unnameable_fd_name(link: &str) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let ino = std::fs::metadata(link).map(|m| m.ino()).unwrap_or(0);
+    format!("file:[{}]", ino)
+}
+
 /// Rewrite a `/proc/<pid>/cwd` prefix to the cwd the sandbox believes that
 /// task is in.
 ///
@@ -1499,6 +1520,27 @@ pub(crate) async fn handle_chroot_readlink(
                 .unwrap_or_else(|| PathBuf::from("/"));
             return write_target(cwd.to_string_lossy().as_bytes());
         }
+    }
+
+    // Special case: /proc/<pid>/fd/N is a magic link, so what the kernel
+    // returns is a real host path it synthesized rather than link text that
+    // the generic tail below could pass through untouched.
+    if let Some((pid, fd)) = proc_fd_link(&path) {
+        let link = format!("/proc/{}/fd/{}", pid, fd);
+        let target = match std::fs::read_link(&link) {
+            Ok(t) => t,
+            Err(_) => return NotifAction::Errno(libc::EBADF),
+        };
+        // pipe:[…], socket:[…], anon_inode:… — the kernel's own synthetic
+        // names for fds with no path. Nothing to map, nothing to hide.
+        if !target.is_absolute() {
+            return write_target(target.to_string_lossy().as_bytes());
+        }
+        let named = match ctx.host_to_virtual(&target) {
+            Some(virtual_target) => virtual_target.to_string_lossy().into_owned(),
+            None => unnameable_fd_name(&link),
+        };
+        return write_target(named.as_bytes());
     }
 
     // Special case: /proc/<pid>/exe -> return the virtual path recorded during exec
