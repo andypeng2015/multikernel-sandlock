@@ -336,6 +336,121 @@ async fn test_chroot_relative_open_follows_fchdir() {
     cleanup_rootfs(&rootfs);
 }
 
+/// /proc/self/cwd is the kernel's own view of the cwd, and the kernel's view
+/// is the one the supervisor stopped moving. It has to be answered from the
+/// tracked cwd or it reports wherever exec left the child.
+#[tokio::test]
+async fn test_chroot_proc_self_cwd_link_follows_chdir() {
+    let rootfs = build_test_rootfs("proc-self-cwd-link");
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "sh", "-c", "chdir /tmp && readlink /proc/self/cwd"])
+        .await
+    {
+        Ok(r) => {
+            // Exact match on the readlink line (the chdir prints its own):
+            // the test rootfs itself lives under a host path containing
+            // "/tmp", so a substring check would pass on a leak.
+            let stdout = r.stdout_str().unwrap_or("").to_string();
+            assert_eq!(
+                stdout.lines().last().unwrap_or("").trim(),
+                "/tmp",
+                "readlink /proc/self/cwd should report the sandbox cwd, full stdout: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// Opening *through* /proc/self/cwd has to land in the same directory the
+/// link reports, so the magic link needs rewriting on the resolution path
+/// too, not just when it is read.
+#[tokio::test]
+async fn test_chroot_open_through_proc_self_cwd() {
+    let rootfs = build_test_rootfs("proc-self-cwd-open");
+    fs::write(rootfs.join("tmp/marker.txt"), "from-tmp\n").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "chdir /tmp && cat /proc/self/cwd/marker.txt",
+        ])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "open through /proc/self/cwd should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stdout_str().unwrap_or("").contains("from-tmp"),
+                "should have read /tmp/marker.txt, got: {}",
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// A cwd the sandbox cannot name must never be answered with the host path
+/// it happens to sit at. Without a `cwd` the child starts wherever sandlock
+/// was launched, which is outside the virtual root entirely.
+#[tokio::test]
+async fn test_chroot_proc_self_cwd_never_leaks_a_host_path() {
+    let rootfs = build_test_rootfs("proc-self-cwd-leak");
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "readlink", "/proc/self/cwd"])
+        .await
+    {
+        Ok(r) => {
+            let stdout = r.stdout_str().unwrap_or("").trim().to_string();
+            assert!(
+                !stdout.contains(rootfs.to_str().unwrap()),
+                "cwd link leaked the rootfs's host path: {}",
+                stdout
+            );
+            let launch_dir = std::env::current_dir().unwrap();
+            assert!(
+                !stdout.contains(launch_dir.to_str().unwrap()),
+                "cwd link leaked the launch directory: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// openat2 must be mediated like every other open spelling. It was trapped
 /// for the deny check but never routed to the chroot handler, so an absolute
 /// path reached the kernel as written and resolved against the host root

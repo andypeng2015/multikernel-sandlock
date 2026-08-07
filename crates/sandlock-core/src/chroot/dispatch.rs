@@ -321,6 +321,41 @@ fn enforce_resolve_flags(
     }
 }
 
+/// The pid whose cwd a `/proc/<pid>/cwd[/...]` path names, if any.
+///
+/// Callers must canonicalize `/proc/self` first; this only matches the
+/// numeric spelling.
+fn proc_cwd_link_pid(virtual_path: &str) -> Option<(i32, &str)> {
+    let rest = virtual_path.strip_prefix("/proc/")?;
+    let (pid, rest) = rest.split_once('/')?;
+    let pid: i32 = pid.parse().ok()?;
+    let tail = rest.strip_prefix("cwd")?;
+    if tail.is_empty() || tail.starts_with('/') {
+        Some((pid, tail))
+    } else {
+        None
+    }
+}
+
+/// Rewrite a `/proc/<pid>/cwd` prefix to the cwd the sandbox believes that
+/// task is in.
+///
+/// The kernel's magic link points at the task's real cwd, which the
+/// supervisor deliberately stopped moving when it took over chdir, so
+/// resolving through the link would land wherever exec left the child (and
+/// under the host root at that, since the launch directory is usually
+/// outside the virtual root entirely). Left alone for an untracked pid,
+/// where the kernel's link is still the only answer there is.
+fn canon_proc_cwd(virtual_path: &str, ctx: &ChrootCtx<'_>) -> String {
+    let Some((pid, tail)) = proc_cwd_link_pid(virtual_path) else {
+        return virtual_path.to_string();
+    };
+    match ctx.processes.virtual_cwd(pid) {
+        Some(cwd) => format!("{}{}", cwd.to_string_lossy(), tail),
+        None => virtual_path.to_string(),
+    }
+}
+
 /// Build the full virtual path from dirfd + relative path.
 fn build_virtual_path(
     notif: &SeccompNotif,
@@ -341,7 +376,7 @@ fn build_virtual_path(
         let combined = base_virtual.join(path);
         combined.to_string_lossy().to_string()
     };
-    Some(canon_proc_self(&vpath, notif.pid))
+    Some(canon_proc_cwd(&canon_proc_self(&vpath, notif.pid), ctx))
 }
 
 /// Resolve a child path to (host_path, virtual_path) within the chroot.
@@ -1436,14 +1471,39 @@ pub(crate) async fn handle_chroot_readlink(
         NotifAction::ReturnValue(len as i64)
     };
 
-    // Special case: /proc/self/root -> "/"
-    if path == "/proc/self/root" {
+    // "self" here would be the SUPERVISOR: it services /proc through an
+    // on-behalf openat2, so the magic links below resolve in its own
+    // process unless the caller's pid is substituted first, exactly as
+    // build_virtual_path does for every other handler.
+    let path = canon_proc_self(&path, notif.pid);
+    let own_proc = format!("/proc/{}", notif.pid);
+
+    // Special case: the caller's own /proc/<pid>/root -> "/"
+    if path == format!("{}/root", own_proc) {
         return write_target(b"/");
     }
 
-    // Special case: /proc/self/exe -> return the virtual path recorded during exec
+    // Special case: /proc/<pid>/cwd is a magic link to the task's real cwd,
+    // which the supervisor no longer moves. Answer from what it tracks, and
+    // never fall back to the host path the link actually points at.
+    if let Some((pid, tail)) = proc_cwd_link_pid(&path) {
+        if tail.is_empty() {
+            let cwd = ctx
+                .processes
+                .virtual_cwd(pid)
+                .or_else(|| {
+                    std::fs::read_link(format!("/proc/{}/cwd", pid))
+                        .ok()
+                        .and_then(|host| ctx.host_to_virtual(&host))
+                })
+                .unwrap_or_else(|| PathBuf::from("/"));
+            return write_target(cwd.to_string_lossy().as_bytes());
+        }
+    }
+
+    // Special case: /proc/<pid>/exe -> return the virtual path recorded during exec
     // (needed because memfd-backed binaries would show "/memfd:sandlock-exec" otherwise).
-    if path == "/proc/self/exe" {
+    if path == format!("{}/exe", own_proc) {
         let cs = chroot_state.lock().await;
         if let Some(ref exe) = cs.chroot_exe {
             let s = exe.to_string_lossy();
