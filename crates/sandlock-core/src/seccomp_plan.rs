@@ -182,6 +182,10 @@ fn cow_path_syscalls() -> Vec<i64> {
 fn chroot_path_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_openat,
+        // openat2 resolves paths like openat and must be mediated the same
+        // way: left to the kernel, an absolute path resolves against the
+        // host root rather than the rootfs.
+        arch::SYS_OPENAT2,
         libc::SYS_execve,
         libc::SYS_execveat,
         libc::SYS_unlinkat,
@@ -199,6 +203,10 @@ fn chroot_path_syscalls() -> Vec<i64> {
         libc::SYS_readlinkat,
         libc::SYS_getdents64,
         libc::SYS_chdir,
+        // fchdir carries no path, but it still moves the cwd that every
+        // later relative path resolves against, so the supervisor has to
+        // see it to keep its own notion in step.
+        libc::SYS_fchdir,
         libc::SYS_getcwd,
         libc::SYS_statfs,
         libc::SYS_utimensat,
@@ -227,6 +235,11 @@ fn chroot_path_syscalls() -> Vec<i64> {
             arch::sys_rmdir(),
             arch::sys_mkdir(),
             arch::sys_rename(),
+            // Where the ABI has no plain rename(2), libc's rename() compiles
+            // to renameat, so leaving it out left rename unmediated on
+            // aarch64: an absolute path went to the kernel and resolved
+            // against the host root instead of the rootfs.
+            arch::sys_renameat(),
             arch::sys_symlink(),
             arch::sys_link(),
             arch::sys_chmod(),

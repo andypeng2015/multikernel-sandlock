@@ -492,20 +492,21 @@ fn deny_open_verdict(
 }
 
 /// open/openat/openat2 argument layout, normalized across the spellings.
-struct OpenArgs {
-    dirfd: i64,
-    path_ptr: u64,
-    flags: u64,
-    mode: u64,
+pub(crate) struct OpenArgs {
+    pub(crate) dirfd: i64,
+    pub(crate) path_ptr: u64,
+    pub(crate) flags: u64,
+    #[allow(dead_code)]
+    pub(crate) mode: u64,
     /// `openat2` `resolve` flags (`RESOLVE_*`); 0 for `open`/`openat`.
-    resolve: u64,
+    pub(crate) resolve: u64,
 }
 
 /// Decode the open arguments. `openat2` carries flags/mode/resolve inside a
 /// `struct open_how` in child memory, so its decode reads child memory and
 /// can fail; `None` means "could not decode" and the caller soft-falls-through
 /// (the kernel's own re-read fails the same way).
-fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<OpenArgs> {
+pub(crate) fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<OpenArgs> {
     let a = &notif.data.args;
     let nr = notif.data.nr as i64;
     if nr == libc::SYS_openat {
@@ -1580,18 +1581,6 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
     }
 }
 
-/// Read the parent PID from /proc/{pid}/stat.
-fn read_ppid(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    // Format: "pid (comm) state ppid ..."
-    // Find the closing ')' then split the rest
-    let close_paren = stat.rfind(')')?;
-    let rest = &stat[close_paren + 2..]; // skip ") "
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    // fields[0] = state, fields[1] = ppid
-    fields.get(1)?.parse().ok()
-}
-
 /// Read a NUL-terminated path from child memory (up to PATH_MAX bytes).
 fn read_path_for_event(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String> {
     if addr == 0 { return None; }
@@ -1895,7 +1884,10 @@ async fn emit_policy_event(
     let denied = matches!(action, NotifAction::Errno(_));
     let name = syscall_name(nr);
     let category = syscall_category(nr);
-    let parent_pid = read_ppid(notif.pid);
+    let parent_pid = i32::try_from(notif.pid)
+        .ok()
+        .and_then(crate::seccomp::state::read_ppid)
+        .and_then(|p| u32::try_from(p).ok());
 
     // Extract metadata based on syscall type.
     //

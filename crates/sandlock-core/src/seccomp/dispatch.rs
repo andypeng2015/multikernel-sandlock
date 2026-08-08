@@ -403,6 +403,7 @@ pub(crate) fn build_dispatch_table(
                         if let Some(action) = crate::random::handle_random_open(
                             &notif, rng, notif_fd,
                             policy.chroot_root.as_deref(), &policy.chroot_mounts,
+                            &sup.processes,
                         ) {
                             return action;
                         }
@@ -451,15 +452,18 @@ pub(crate) fn build_dispatch_table(
         for nr in open_family_syscalls() {
             let etc_hosts = etc_hosts.clone();
             let policy_hosts = Arc::clone(policy);
+            let processes_for_open = Arc::clone(&ctx.processes);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let notif_fd = cx.notif_fd;
                 let etc_hosts = etc_hosts.clone();
                 let policy = Arc::clone(&policy_hosts);
+                let processes = Arc::clone(&processes_for_open);
                 async move {
                     if let Some(action) = crate::procfs::handle_etc_hosts_open(
                         &notif, &etc_hosts, notif_fd,
                         policy.chroot_root.as_deref(), &policy.chroot_mounts,
+                        &processes,
                     ) {
                         action
                     } else {
@@ -483,16 +487,19 @@ pub(crate) fn build_dispatch_table(
                 let ca_pem = std::sync::Arc::clone(&ca_pem);
                 let inject_paths = std::sync::Arc::clone(&inject_paths);
                 let policy_ca = Arc::clone(policy);
+                let processes_for_open = Arc::clone(&ctx.processes);
                 table.register(nr, move |cx: &HandlerCtx| {
                     let notif = cx.notif;
                     let notif_fd = cx.notif_fd;
                     let ca_pem = std::sync::Arc::clone(&ca_pem);
                     let inject_paths = std::sync::Arc::clone(&inject_paths);
                     let policy = Arc::clone(&policy_ca);
+                    let processes = Arc::clone(&processes_for_open);
                     async move {
                         crate::ca_inject::handle_ca_inject_open(
                             &notif, &inject_paths, &ca_pem, notif_fd,
                             policy.chroot_root.as_deref(), &policy.chroot_mounts,
+                            &processes,
                         )
                         .unwrap_or(NotifAction::Continue)
                     }
@@ -600,15 +607,18 @@ pub(crate) fn build_dispatch_table(
         for nr in open_family_syscalls() {
             let hostname = hostname_for_open.clone();
             let policy_hostname = Arc::clone(policy);
+            let processes_for_open = Arc::clone(&ctx.processes);
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let notif_fd = cx.notif_fd;
                 let hostname = hostname.clone();
                 let policy = Arc::clone(&policy_hostname);
+                let processes = Arc::clone(&processes_for_open);
                 async move {
                     if let Some(action) = crate::procfs::handle_hostname_open(
                         &notif, &hostname, notif_fd,
                         policy.chroot_root.as_deref(), &policy.chroot_mounts,
+                        &processes,
                     ) {
                         action
                     } else {
@@ -773,21 +783,16 @@ fn register_chroot_handlers(
             let policy = Arc::clone($policy);
             let chroot_state = Arc::clone(&ctx.chroot);
             let cow_state = Arc::clone(&ctx.cow);
+            let processes = Arc::clone(&ctx.processes);
             move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let chroot_state = Arc::clone(&chroot_state);
                 let cow_state = Arc::clone(&cow_state);
+                let processes = Arc::clone(&processes);
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
                 async move {
-                    let chroot_ctx = ChrootCtx {
-                        root: policy.chroot_root.as_ref().unwrap(),
-                        readable: &policy.chroot_readable,
-                        writable: &policy.chroot_writable,
-                        denied: &policy.chroot_denied,
-                        mounts: &policy.chroot_mounts,
-                        mount_ro: &policy.chroot_mount_ro,
-                    };
+                    let chroot_ctx = ChrootCtx::new(&policy, &processes);
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
             }
@@ -801,21 +806,16 @@ fn register_chroot_handlers(
             let policy = Arc::clone($policy);
             let chroot_state = Arc::clone(&ctx.chroot);
             let cow_state = Arc::clone(&ctx.cow);
+            let processes = Arc::clone(&ctx.processes);
             move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let chroot_state = Arc::clone(&chroot_state);
                 let cow_state = Arc::clone(&cow_state);
+                let processes = Arc::clone(&processes);
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
                 async move {
-                    let chroot_ctx = ChrootCtx {
-                        root: policy.chroot_root.as_ref().unwrap(),
-                        readable: &policy.chroot_readable,
-                        writable: &policy.chroot_writable,
-                        denied: &policy.chroot_denied,
-                        mounts: &policy.chroot_mounts,
-                        mount_ro: &policy.chroot_mount_ro,
-                    };
+                    let chroot_ctx = ChrootCtx::new(&policy, &processes);
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
             }
@@ -823,8 +823,12 @@ fn register_chroot_handlers(
     }
 
     // openat — fallthrough if Continue
-    table.register(libc::SYS_openat, chroot_handler_fallthrough!(policy,
-        crate::chroot::dispatch::handle_chroot_open));
+    // openat, openat2 — fallthrough if Continue. Both carry (dirfd, path) in
+    // the same slots; the handler decodes the rest per spelling.
+    for &nr in &[libc::SYS_openat, arch::SYS_OPENAT2] {
+        table.register(nr, chroot_handler_fallthrough!(policy,
+            crate::chroot::dispatch::handle_chroot_open));
+    }
 
     // open (legacy) — fallthrough if Continue
     if let Some(open) = arch::sys_open() {
@@ -839,11 +843,15 @@ fn register_chroot_handlers(
     }
 
     // Modern write syscalls
-    for &nr in &[
+    let mut write_nrs = vec![
         libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_renameat2,
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
         libc::SYS_fchownat, libc::SYS_truncate,
-    ] {
+    ];
+    // renameat only exists where the ABI kept it, and libc's rename() lands
+    // there on the arches without a plain rename(2).
+    write_nrs.extend(arch::sys_renameat());
+    for nr in write_nrs {
         table.register(nr, chroot_handler!(policy,
             crate::chroot::dispatch::handle_chroot_write));
     }
@@ -888,14 +896,7 @@ fn register_chroot_handlers(
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_chown);
             async move {
-                let chroot_ctx = ChrootCtx {
-                    root: policy.chroot_root.as_ref().unwrap(),
-                    readable: &policy.chroot_readable,
-                    writable: &policy.chroot_writable,
-                    denied: &policy.chroot_denied,
-                    mounts: &policy.chroot_mounts,
-                    mount_ro: &policy.chroot_mount_ro,
-                };
+                let chroot_ctx = ChrootCtx::new(&policy, &sup.processes);
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, false).await
             }
         });
@@ -911,14 +912,7 @@ fn register_chroot_handlers(
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_lchown);
             async move {
-                let chroot_ctx = ChrootCtx {
-                    root: policy.chroot_root.as_ref().unwrap(),
-                    readable: &policy.chroot_readable,
-                    writable: &policy.chroot_writable,
-                    denied: &policy.chroot_denied,
-                    mounts: &policy.chroot_mounts,
-                    mount_ro: &policy.chroot_mount_ro,
-                };
+                let chroot_ctx = ChrootCtx::new(&policy, &sup.processes);
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, true).await
             }
         });
@@ -970,9 +964,11 @@ fn register_chroot_handlers(
             crate::chroot::dispatch::handle_chroot_getdents));
     }
 
-    // chdir, getcwd, statfs, utimensat
+    // chdir, fchdir, getcwd, statfs, utimensat
     table.register(libc::SYS_chdir as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_chdir));
+    table.register(libc::SYS_fchdir as i64, chroot_handler!(policy,
+        crate::chroot::dispatch::handle_chroot_fchdir));
     table.register(libc::SYS_getcwd as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_getcwd));
     table.register(libc::SYS_statfs as i64, chroot_handler!(policy,

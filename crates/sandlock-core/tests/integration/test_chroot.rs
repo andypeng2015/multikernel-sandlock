@@ -205,6 +205,565 @@ async fn test_chroot_getcwd() {
     cleanup_rootfs(&rootfs);
 }
 
+/// A short absolute path must be reachable (issue #178). The old handler
+/// redirected the child through "/proc/self/fd/N", 16 bytes that cannot fit
+/// the buffer behind a path as short as "/tmp", so every short mount point
+/// failed with ENAMETOOLONG while ls and open on the same path worked.
+#[tokio::test]
+async fn test_chroot_chdir_short_path() {
+    let rootfs = build_test_rootfs("chdir-short");
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy.clone().run(&["rootfs-helper", "chdir", "/tmp"]).await {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "chdir(/tmp) should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert_eq!(r.stdout_str().unwrap_or("").trim(), "OK /tmp");
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// The virtual root is the shortest path there is, and no redirect can ever
+/// fit its two-byte buffer. `cd /` has to work without one.
+#[tokio::test]
+async fn test_chroot_chdir_virtual_root() {
+    let rootfs = build_test_rootfs("chdir-root");
+
+    let policy = minimal_exec_policy(&rootfs).build().unwrap();
+
+    match policy.clone().run(&["rootfs-helper", "chdir", "/"]).await {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "chdir(/) should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert_eq!(r.stdout_str().unwrap_or("").trim(), "OK /");
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// A relative path opened after a chdir must resolve against the directory
+/// the child moved to. The supervisor resolves the path itself, so this is
+/// what proves its notion of the cwd actually followed the chdir.
+#[tokio::test]
+async fn test_chroot_relative_open_follows_chdir() {
+    let rootfs = build_test_rootfs("chdir-relative");
+    fs::write(rootfs.join("tmp/marker.txt"), "marker-body\n").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "sh", "-c", "chdir /tmp && cat marker.txt"])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "relative cat after chdir should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stdout_str().unwrap_or("").contains("marker-body"),
+                "relative open should have read /tmp/marker.txt, got: {}",
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// fchdir carries a dirfd instead of a path, so a supervisor tracking the cwd
+/// has to observe this spelling too. Chained after a chdir, which is where the
+/// supervisor's own notion takes over: miss the fchdir and that notion goes
+/// stale, sending the following relative open back to the chdir's directory.
+#[tokio::test]
+async fn test_chroot_relative_open_follows_fchdir() {
+    let rootfs = build_test_rootfs("fchdir-relative");
+    fs::write(rootfs.join("tmp/marker.txt"), "from-tmp\n").unwrap();
+    fs::write(rootfs.join("etc/marker.txt"), "from-etc\n").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/etc")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "chdir /tmp && fchdir /etc && cat marker.txt",
+        ])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "relative cat after fchdir should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            let stdout = r.stdout_str().unwrap_or("").to_string();
+            assert!(
+                stdout.contains("from-etc"),
+                "relative open should have read /etc/marker.txt, got: {}",
+                stdout
+            );
+            assert!(
+                !stdout.contains("from-tmp"),
+                "relative open resolved against the earlier chdir, got: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// /proc/self/cwd is the kernel's own view of the cwd, and the kernel's view
+/// is the one the supervisor stopped moving. It has to be answered from the
+/// tracked cwd or it reports wherever exec left the child.
+#[tokio::test]
+async fn test_chroot_proc_self_cwd_link_follows_chdir() {
+    let rootfs = build_test_rootfs("proc-self-cwd-link");
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "sh", "-c", "chdir /tmp && readlink /proc/self/cwd"])
+        .await
+    {
+        Ok(r) => {
+            // Exact match on the readlink line (the chdir prints its own):
+            // the test rootfs itself lives under a host path containing
+            // "/tmp", so a substring check would pass on a leak.
+            let stdout = r.stdout_str().unwrap_or("").to_string();
+            assert_eq!(
+                stdout.lines().last().unwrap_or("").trim(),
+                "/tmp",
+                "readlink /proc/self/cwd should report the sandbox cwd, full stdout: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// Opening *through* /proc/self/cwd has to land in the same directory the
+/// link reports, so the magic link needs rewriting on the resolution path
+/// too, not just when it is read.
+#[tokio::test]
+async fn test_chroot_open_through_proc_self_cwd() {
+    let rootfs = build_test_rootfs("proc-self-cwd-open");
+    fs::write(rootfs.join("tmp/marker.txt"), "from-tmp\n").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "chdir /tmp && cat /proc/self/cwd/marker.txt",
+        ])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "open through /proc/self/cwd should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stdout_str().unwrap_or("").contains("from-tmp"),
+                "should have read /tmp/marker.txt, got: {}",
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// A cwd the sandbox cannot name must never be answered with the host path
+/// it happens to sit at. Without a `cwd` the child starts wherever sandlock
+/// was launched, which is outside the virtual root entirely.
+#[tokio::test]
+async fn test_chroot_proc_self_cwd_never_leaks_a_host_path() {
+    let rootfs = build_test_rootfs("proc-self-cwd-leak");
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "readlink", "/proc/self/cwd"])
+        .await
+    {
+        Ok(r) => {
+            let stdout = r.stdout_str().unwrap_or("").trim().to_string();
+            assert!(
+                !stdout.contains(rootfs.to_str().unwrap()),
+                "cwd link leaked the rootfs's host path: {}",
+                stdout
+            );
+            let launch_dir = std::env::current_dir().unwrap();
+            assert!(
+                !stdout.contains(launch_dir.to_str().unwrap()),
+                "cwd link leaked the launch directory: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// Removing a symlink must remove the link, not what it points at. The
+/// chroot resolver follows the final component to find the file a path names,
+/// which is right for open and wrong for unlink: it deleted the target and
+/// left the dangling link behind.
+#[tokio::test]
+async fn test_chroot_unlink_removes_the_symlink_not_its_target() {
+    let rootfs = build_test_rootfs("unlink-symlink");
+    fs::write(rootfs.join("tmp/target.txt"), "target-body\n").unwrap();
+    std::os::unix::fs::symlink("target.txt", rootfs.join("tmp/link.txt")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy.clone().run(&["rootfs-helper", "rm", "/tmp/link.txt"]).await {
+        Ok(r) => {
+            assert!(r.success(), "rm should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(
+                rootfs.join("tmp/target.txt").exists(),
+                "rm of a symlink deleted its target"
+            );
+            assert!(
+                fs::symlink_metadata(rootfs.join("tmp/link.txt")).is_err(),
+                "rm of a symlink left the link in place"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// lstat must describe the link itself. Resolution for the policy check
+/// follows the final component, so the no-follow spellings were being handed
+/// an already-resolved path and reported the target's type and size.
+#[tokio::test]
+async fn test_chroot_lstat_describes_the_symlink() {
+    let rootfs = build_test_rootfs("lstat-symlink");
+    fs::write(rootfs.join("tmp/target.txt"), "target-body\n").unwrap();
+    std::os::unix::fs::symlink("target.txt", rootfs.join("tmp/link.txt")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "legacy-lstat", "/tmp/link.txt"])
+        .await
+    {
+        Ok(r) => {
+            let stdout = r.stdout_str().unwrap_or("").to_string();
+            assert!(
+                stdout.contains("type=link"),
+                "lstat should describe the link itself, got: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// Renaming a symlink moves the link. Following the final component first
+/// would rename whatever it points at, leaving the old name dangling.
+#[tokio::test]
+async fn test_chroot_rename_moves_the_symlink_not_its_target() {
+    let rootfs = build_test_rootfs("rename-symlink");
+    fs::write(rootfs.join("tmp/target.txt"), "target-body\n").unwrap();
+    std::os::unix::fs::symlink("target.txt", rootfs.join("tmp/link.txt")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "mv", "/tmp/link.txt", "/tmp/moved.txt"])
+        .await
+    {
+        Ok(r) => {
+            assert!(r.success(), "mv should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(
+                rootfs.join("tmp/target.txt").exists(),
+                "rename of a symlink moved its target"
+            );
+            let moved = fs::symlink_metadata(rootfs.join("tmp/moved.txt"));
+            assert!(
+                moved.map(|m| m.file_type().is_symlink()).unwrap_or(false),
+                "the moved entry should still be a symlink"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// The /proc magic links are symlinks, and lstat has to say so even though
+/// paths *through* them are rewritten to the directory they stand for.
+#[tokio::test]
+async fn test_chroot_lstat_of_proc_self_cwd_is_a_link() {
+    let rootfs = build_test_rootfs("lstat-proc-cwd");
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "legacy-lstat", "/proc/self/cwd"])
+        .await
+    {
+        Ok(r) => {
+            let stdout = r.stdout_str().unwrap_or("").to_string();
+            assert!(
+                stdout.contains("type=link"),
+                "lstat of /proc/self/cwd should report a symlink, got: {}",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// Reading a magic link is a read of another process's state, so it needs the
+/// same per-PID gate the /proc open path applies. Opening /proc/1/cwd was
+/// already refused; readlinking it went straight to the supervisor's own view
+/// of the host's process table.
+#[tokio::test]
+async fn test_chroot_readlink_of_a_foreign_pid_is_refused() {
+    let rootfs = build_test_rootfs("readlink-foreign-pid");
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .build()
+        .unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "readlink", "/proc/1/cwd"])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                !r.success(),
+                "readlink of a non-sandbox pid should fail, stdout: {}",
+                r.stdout_str().unwrap_or("")
+            );
+            assert!(
+                !r.stdout_str().unwrap_or("").contains('/'),
+                "readlink of a non-sandbox pid returned a path: {}",
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// An fd whose file the sandbox cannot name must not be described with the
+/// host path behind it. /proc/<pid>/fd/N is a magic link, so the "target"
+/// readlink hands back is a real host path the kernel synthesized, not link
+/// text: an inherited stdio fd, or here a supervisor-opened /dev/null with
+/// no /dev mount to map it into, would spell out where it lives on the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_chroot_fd_link_does_not_leak_a_host_path() {
+    use sandlock_core::StdioMode;
+    use std::fs::File;
+    use std::io::Read;
+
+    let rootfs = build_test_rootfs("fd-link-leak");
+
+    let mut sb = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .build()
+        .unwrap();
+
+    match sb
+        .popen(
+            &["rootfs-helper", "readlink", "/proc/self/fd/0"],
+            StdioMode::Null,
+            StdioMode::Piped,
+            StdioMode::Piped,
+        )
+        .await
+    {
+        Ok(mut child) => {
+            let mut out = String::new();
+            if let Some(stdout) = child.take_stdout() {
+                let _ = File::from(stdout).read_to_string(&mut out);
+            }
+            let _ = child.wait().await;
+            let link = out.trim().to_string();
+            assert!(
+                !link.starts_with('/'),
+                "fd link named a path the sandbox cannot reach: {}",
+                link
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// openat2 must be mediated like every other open spelling. It was trapped
+/// for the deny check but never routed to the chroot handler, so an absolute
+/// path reached the kernel as written and resolved against the host root
+/// instead of the rootfs.
+#[tokio::test]
+async fn test_chroot_openat2_resolves_inside_the_rootfs() {
+    let rootfs = build_test_rootfs("openat2-absolute");
+    fs::write(rootfs.join("etc/marker.txt"), "from-rootfs\n").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_read("/etc").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "openat2", "/etc/marker.txt"])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "openat2 of a rootfs path should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stdout_str().unwrap_or("").contains("from-rootfs"),
+                "openat2 should have read the rootfs file, got: {}",
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// The same for a relative openat2 after a chdir: it resolves against the
+/// supervisor's notion of the cwd, like every other relative path does.
+#[tokio::test]
+async fn test_chroot_openat2_relative_follows_chdir() {
+    let rootfs = build_test_rootfs("openat2-relative");
+    fs::write(rootfs.join("tmp/marker.txt"), "from-tmp\n").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_write("/tmp").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&["rootfs-helper", "sh", "-c", "chdir /tmp && openat2 marker.txt"])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "relative openat2 after chdir should succeed, stderr: {}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stdout_str().unwrap_or("").contains("from-tmp"),
+                "openat2 should have read /tmp/marker.txt, got: {}",
+                r.stdout_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// A RESOLVE_NO_SYMLINKS openat2 must still refuse a symlink once the
+/// supervisor performs the open on its behalf. The child asked the kernel to
+/// refuse it; servicing the open must not quietly grant what it declined.
+#[tokio::test]
+async fn test_chroot_openat2_honors_resolve_no_symlinks() {
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
+    let rootfs = build_test_rootfs("openat2-nosymlinks");
+    fs::write(rootfs.join("etc/marker.txt"), "from-rootfs\n").unwrap();
+    std::os::unix::fs::symlink("marker.txt", rootfs.join("etc/link.txt")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs).fs_read("/etc").build().unwrap();
+
+    match policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "openat2",
+            "/etc/link.txt",
+            &RESOLVE_NO_SYMLINKS.to_string(),
+        ])
+        .await
+    {
+        Ok(r) => {
+            assert!(
+                !r.success(),
+                "openat2 through a symlink with RESOLVE_NO_SYMLINKS should fail, stdout: {}",
+                r.stdout_str().unwrap_or("")
+            );
+            assert!(
+                r.stderr_str().unwrap_or("").contains("openat2"),
+                "expected the helper's openat2 error, got: {}",
+                r.stderr_str().unwrap_or("")
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// chdir into a same-path mount (/proc) from a READ-ONLY path buffer must
 /// succeed. Regression for the busybox-`top` EFAULT: rewriting the child's
 /// path argument to /proc/self/fd/N faults when the path lives in read-only
