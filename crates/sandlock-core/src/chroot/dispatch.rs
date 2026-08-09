@@ -1316,13 +1316,20 @@ pub(crate) async fn handle_chroot_write(
         {
             let mut cs = cow_state.lock().await;
             if let Some(cow) = cs.branch.as_mut() {
-                let s = new_host.to_string_lossy();
-                if cow.matches(&s) {
-                    match cow.handle_link(&old_host.to_string_lossy(), &s) {
-                        Ok(true) => return NotifAction::ReturnValue(0),
-                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                        _ => {}
-                    }
+                let old_s = old_host.to_string_lossy();
+                let new_s = new_host.to_string_lossy();
+                // A hard link cannot be half staged. With one name inside the
+                // branch and the other below it there is nothing to stage:
+                // linking in would create the name in the workdir the branch
+                // promised to leave untouched, and linking out would hand the
+                // child an alias for the lower inode that survives an abort.
+                // EXDEV is what the kernel says about a link that cannot span
+                // the two sides.
+                if cow.matches(&old_s) != cow.matches(&new_s) {
+                    return NotifAction::Errno(libc::EXDEV);
+                }
+                if cow.matches(&new_s) {
+                    return crate::cow::dispatch::link_result(cow.handle_link(&old_s, &new_s));
                 }
             }
         }

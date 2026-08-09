@@ -2020,3 +2020,232 @@ async fn test_chroot_hardlink_follow_cannot_alias_a_denied_path_under_a_mount() 
     cleanup_rootfs(&rootfs);
     let _ = fs::remove_dir_all(&work_dir);
 }
+
+/// A copy-on-write branch stages writes in an upper layer and, under
+/// BranchAction::Abort, throws them away. A hard link cannot be half staged:
+/// with one name inside the workdir and the other below it, there is nothing
+/// to stage, and performing the link for real would create the name in the
+/// pristine workdir instead. EXDEV is the kernel's own word for a link that
+/// cannot span two sides.
+#[tokio::test]
+async fn test_chroot_hardlink_into_a_branch_is_refused() {
+    let rootfs = build_test_rootfs("hardlink-branch-in");
+    let tmp_dir = rootfs.join("tmp");
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_read("/work")
+        .fs_write("/work")
+        .fs_write("/tmp")
+        .workdir(&tmp_dir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "write /work/a.txt LEAKED && ln /work/a.txt /tmp/pulled-in.txt",
+        ])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                !r.success(),
+                "a hard link into the branch should be refused, exit={:?} stderr={}",
+                r.code(),
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stderr_str().unwrap_or("").contains("Invalid cross-device link"),
+                "the refusal should read as a cross-device link, stderr={}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                !tmp_dir.join("pulled-in.txt").exists(),
+                "the branch was aborted, yet the link landed in the workdir itself"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// The other direction, and the damaging one: a name taken out of the workdir
+/// aliases the *lower* inode, so a write through it edits the very file the
+/// branch promised to leave alone, and the edit outlives the abort.
+#[tokio::test]
+async fn test_chroot_hardlink_out_of_a_branch_is_refused() {
+    let rootfs = build_test_rootfs("hardlink-branch-out");
+    let tmp_dir = rootfs.join("tmp");
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+    fs::write(tmp_dir.join("orig.txt"), "ORIGINAL").unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_read("/work")
+        .fs_write("/work")
+        .fs_write("/tmp")
+        .workdir(&tmp_dir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "ln /tmp/orig.txt /work/alias.txt && write /work/alias.txt OVERWRITTEN",
+        ])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                !r.success(),
+                "a hard link out of the branch should be refused, exit={:?} stderr={}",
+                r.code(),
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                !rootfs.join("work/alias.txt").exists(),
+                "the second name was created outside the branch"
+            );
+            assert_eq!(
+                fs::read_to_string(tmp_dir.join("orig.txt")).unwrap().trim(),
+                "ORIGINAL",
+                "the aborted branch still edited the file it was staging over"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// Both names inside the workdir is the case the branch can stage, so it must
+/// keep working, and it must stay in the branch: after an abort neither the
+/// second name nor the copy of the first is left in the workdir.
+#[tokio::test]
+async fn test_chroot_hardlink_within_a_branch_stays_in_the_branch() {
+    let rootfs = build_test_rootfs("hardlink-branch-within");
+    let tmp_dir = rootfs.join("tmp");
+    fs::write(tmp_dir.join("orig.txt"), "ORIGINAL").unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .workdir(&tmp_dir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "ln /tmp/orig.txt /tmp/alias.txt && cat /tmp/alias.txt",
+        ])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "a link between two names inside the workdir should be allowed, \
+                 exit={:?} stderr={}",
+                r.code(),
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stdout_str().unwrap_or("").contains("ORIGINAL"),
+                "the second name should read as the file it links, stdout={}",
+                r.stdout_str().unwrap_or("")
+            );
+            assert!(
+                !tmp_dir.join("alias.txt").exists(),
+                "the aborted branch left its second name in the workdir"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// A file deleted in the branch is a whiteout: the lower entry is still on
+/// disk with its pre-delete bytes. Linking it must answer ENOENT rather than
+/// resurrect it, which is the same rule the read-open path already follows.
+#[tokio::test]
+async fn test_chroot_hardlink_to_a_file_deleted_in_the_branch_is_enoent() {
+    let rootfs = build_test_rootfs("hardlink-branch-whiteout");
+    let tmp_dir = rootfs.join("tmp");
+    fs::write(tmp_dir.join("orig.txt"), "PREDELETE").unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .workdir(&tmp_dir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "rm /tmp/orig.txt && ln /tmp/orig.txt /tmp/alias.txt",
+        ])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                !r.success(),
+                "linking a file the branch deleted should be refused, exit={:?} stderr={}",
+                r.code(),
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stderr_str().unwrap_or("").contains("No such file or directory"),
+                "the deleted file should read as absent, stderr={}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                !tmp_dir.join("alias.txt").exists(),
+                "the pre-delete inode came back under a second name in the workdir"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}

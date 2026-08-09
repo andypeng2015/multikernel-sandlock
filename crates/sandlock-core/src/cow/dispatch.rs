@@ -498,6 +498,28 @@ fn cow_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
     }
 }
 
+/// Map a `handle_link` result to a NotifAction, for both the async dispatcher
+/// here and the chroot one.
+///
+/// Unlike [`cow_result`] this never falls through. A hard link whose
+/// destination the branch owns has to be answered by the branch: letting the
+/// original syscall run would give the child a second name for the *lower*
+/// inode, so a write through it would edit the file the branch promised to
+/// leave alone, and the name itself would outlive an aborted branch.
+pub(crate) fn link_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
+    match r {
+        Ok(true) => NotifAction::ReturnValue(0),
+        // The branch declined: the source is a directory (EPERM is the
+        // kernel's own answer for that) or the upper-layer link failed.
+        Ok(false) => NotifAction::Errno(libc::EPERM),
+        Err(crate::error::BranchError::QuotaExceeded) => NotifAction::Errno(libc::ENOSPC),
+        Err(crate::error::BranchError::Deleted) => NotifAction::Errno(libc::ENOENT),
+        Err(crate::error::BranchError::Denied) => NotifAction::Errno(libc::EPERM),
+        Err(crate::error::BranchError::Exists) => NotifAction::Errno(libc::EEXIST),
+        Err(_) => NotifAction::Errno(libc::EIO),
+    }
+}
+
 /// Map an errno-style handler result (unlink, rename) to a NotifAction.
 fn unlink_result(r: Result<bool, i32>) -> NotifAction {
     match r {
@@ -638,8 +660,17 @@ pub(crate) async fn handle_cow_write(
             cow_result(cow.handle_symlink(target, linkpath))
         }
         CowWriteOp::Link { ref old_path, ref new_path } => {
+            // A hard link cannot be half staged. With one name inside the
+            // branch and the other below it there is nothing to stage: linking
+            // in would create the name in the workdir the branch promised to
+            // leave untouched, and linking out would hand the child an alias
+            // for the lower inode that survives an abort. EXDEV is what the
+            // kernel says about a link that cannot span the two sides.
+            if cow.matches(old_path) != cow.matches(new_path) {
+                return NotifAction::Errno(libc::EXDEV);
+            }
             if !cow.matches(new_path) { return NotifAction::Continue; }
-            cow_result(cow.handle_link(old_path, new_path))
+            link_result(cow.handle_link(old_path, new_path))
         }
         CowWriteOp::Chmod { ref path, mode } => {
             if !cow.matches(path) { return NotifAction::Continue; }
