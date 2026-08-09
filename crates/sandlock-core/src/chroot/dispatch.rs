@@ -1276,11 +1276,19 @@ pub(crate) async fn handle_chroot_write(
             // supervisor runs outside the chroot, so handing that name to the
             // host linkat below would resolve the guest's symlink from the real
             // root and hard-link a host file into the sandbox.
+            //
+            // The virtual path is re-derived from the resolved host path
+            // because a resolution under a mount reports the name the child
+            // asked for, not the name it reached. The gate below has to read
+            // the name of the inode being linked: a symlink inside a mount
+            // would otherwise be judged by the link's own name, and a denied
+            // or read-only target would pass under any allowed spelling.
             resolve_chroot_path_existing(notif, notif.data.args[0] as i64, &old_path, ctx)
+                .and_then(|(host, _)| ctx.host_to_virtual(&host).map(|vp| (host, vp)))
         } else {
             resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx)
         };
-        let (old_host, _) = match old_resolved {
+        let (old_host, old_vp) = match old_resolved {
             Some(r) => r,
             // A followed source that will not resolve is either missing or
             // pointing out of the root, and the sandbox says the same thing
@@ -1293,7 +1301,17 @@ pub(crate) async fn handle_chroot_write(
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
-        if !ctx.can_write(&new_vp) { return NotifAction::Errno(libc::EACCES); }
+        // A hard link is a second name for one inode, so afterwards the
+        // authority over that inode is the union of the policy on both names.
+        // Gating the destination alone lets a guest re-file a readable but
+        // unwritable file (a read-only mount, a denied path) under a writable
+        // prefix and then write to it there. Requiring write on the source too
+        // keeps the weaker name from being upgraded, the same rule rename
+        // already applies to the name it destroys. Off the chroot path
+        // Landlock enforces this already: linking needs REFER on both sides.
+        if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
+            return NotifAction::Errno(libc::EACCES);
+        }
 
         {
             let mut cs = cow_state.lock().await;
