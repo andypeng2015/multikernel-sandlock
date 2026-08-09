@@ -206,6 +206,41 @@ static int cmd_ln_s(int argc, char **argv) {
     return 0;
 }
 
+/* ── ln (hard link) ─────────────────────────────────────────── */
+/* link(2). On architectures that still carry the legacy syscall this
+ * reaches the dispatcher through SYS_link; elsewhere the libc maps it
+ * onto linkat(2). Use the "linkat" command to pin the *at form. */
+static int cmd_ln(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "ln: missing operand\n"); return 1; }
+    if (link(argv[0], argv[1]) < 0) {
+        fprintf(stderr, "ln: %s: %s\n", argv[1], strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
+/* ── linkat (hard link via the *at syscall) ─────────────────── */
+/* linkat target link [follow]. The optional third word sets
+ * AT_SYMLINK_FOLLOW, which is the only way to ask for the inode a
+ * symlink points at: link(2) and plain linkat(2) always take the
+ * source name itself. */
+static int cmd_linkat(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "linkat: missing operand\n"); return 1; }
+    int flags = 0;
+    if (argc >= 3) {
+        if (strcmp(argv[2], "follow") != 0) {
+            fprintf(stderr, "linkat: unknown flag: %s\n", argv[2]);
+            return 1;
+        }
+        flags = AT_SYMLINK_FOLLOW;
+    }
+    if (linkat(AT_FDCWD, argv[0], AT_FDCWD, argv[1], flags) < 0) {
+        fprintf(stderr, "linkat: %s: %s\n", argv[1], strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
 /* ── access ─────────────────────────────────────────────────── */
 static int cmd_access(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "access: missing operand\n"); return 1; }
@@ -821,12 +856,12 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "rm") == 0)             return cmd_rm(argc, argv);
     if (strcmp(cmd, "mv") == 0)             return cmd_mv(argc, argv);
     if (strcmp(cmd, "ln") == 0) {
-        /* ln -s target link */
+        /* ln -s target link (symlink), ln target link (hard link) */
         if (argc >= 1 && strcmp(argv[0], "-s") == 0)
             return cmd_ln_s(argc - 1, argv + 1);
-        fprintf(stderr, "ln: only -s supported\n");
-        return 1;
+        return cmd_ln(argc, argv);
     }
+    if (strcmp(cmd, "linkat") == 0)         return cmd_linkat(argc, argv);
     if (strcmp(cmd, "access") == 0)         return cmd_access(argc, argv);
     if (strcmp(cmd, "getxattr") == 0)       return cmd_getxattr(argc, argv);
     if (strcmp(cmd, "setxattr") == 0)       return cmd_setxattr(argc, argv);
