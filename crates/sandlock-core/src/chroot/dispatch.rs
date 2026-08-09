@@ -1268,12 +1268,25 @@ pub(crate) async fn handle_chroot_write(
         // never follows either.
         let follow_old = (notif.data.args[4] & libc::AT_SYMLINK_FOLLOW as u64) != 0;
         let old_resolved = if follow_old {
-            resolve_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx)
+            // The source has to resolve as a path that already exists, which
+            // is what pins the result inside the root: the O_CREAT-style
+            // fallback in resolve_chroot_path walks the parent and then appends
+            // the last component verbatim, so a symlink whose target does not
+            // exist inside the root comes back as the symlink's own name. The
+            // supervisor runs outside the chroot, so handing that name to the
+            // host linkat below would resolve the guest's symlink from the real
+            // root and hard-link a host file into the sandbox.
+            resolve_chroot_path_existing(notif, notif.data.args[0] as i64, &old_path, ctx)
         } else {
             resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx)
         };
         let (old_host, _) = match old_resolved {
             Some(r) => r,
+            // A followed source that will not resolve is either missing or
+            // pointing out of the root, and the sandbox says the same thing
+            // about both: ENOENT is also what the kernel reports natively for
+            // AT_SYMLINK_FOLLOW on a dangling symlink.
+            None if follow_old => return NotifAction::Errno(libc::ENOENT),
             None => return NotifAction::Errno(libc::EACCES),
         };
         let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
@@ -1298,7 +1311,16 @@ pub(crate) async fn handle_chroot_write(
 
         let c_old = match path_cstr(&old_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
         let c_new = match path_cstr(&new_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
-        let flags = notif.data.args[4] as i32;
+        // Both defined flags describe a source this code has already resolved,
+        // so neither is forwarded. AT_SYMLINK_FOLLOW was consumed by the branch
+        // above; leaving it set would make the host kernel resolve the last
+        // component a second time, unconfined, which is both an escape and a
+        // window for the child to swap that component after the check.
+        // AT_EMPTY_PATH names a dirfd, and the path below is never empty.
+        // Anything else the child passes stays, so the kernel keeps rejecting
+        // unknown flags with EINVAL exactly as it would without the sandbox.
+        let flags =
+            notif.data.args[4] as i32 & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_FOLLOW);
         return if unsafe { libc::linkat(libc::AT_FDCWD, c_old.as_ptr(), libc::AT_FDCWD, c_new.as_ptr(), flags) } < 0 {
             NotifAction::Errno(last_errno(libc::EIO))
         } else {

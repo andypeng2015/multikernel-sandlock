@@ -1510,3 +1510,187 @@ async fn test_max_open_files_chroot_ignores_parent_fd_density() {
 
     cleanup_rootfs(&rootfs);
 }
+
+/// AT_SYMLINK_FOLLOW asks for the inode behind a symlink, and the supervisor
+/// performs the link itself from outside the chroot. If the source is resolved
+/// by walking its parent and appending the last component, a symlink whose
+/// target does not exist inside the root comes back as the symlink itself, and
+/// the host kernel then resolves it a second time against the real root: the
+/// guest picks any host path it likes and gets a hard link to it inside the
+/// sandbox, readable and writable.
+#[tokio::test]
+async fn test_chroot_hardlink_follow_cannot_reach_a_host_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rootfs = build_test_rootfs("hardlink-follow-escape");
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+
+    // Outside the rootfs and outside every grant, but on the same filesystem,
+    // so a hard link to it is physically possible and the refusal below is the
+    // only thing standing in the way.
+    let host_dir = temp_dir("hardlink-follow-host");
+    let host_secret = host_dir.join("host-only.txt");
+    fs::write(&host_secret, "HOST-ONLY").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/work")
+        .fs_write("/work")
+        .build()
+        .unwrap();
+
+    let bait = host_secret.to_string_lossy().to_string();
+    let planted = match policy
+        .clone()
+        .run(&["rootfs-helper", "ln", "-s", &bait, "/work/bait"])
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Chroot test skipped: {}", e);
+            cleanup_rootfs(&rootfs);
+            let _ = fs::remove_dir_all(&host_dir);
+            return;
+        }
+    };
+    // A symlink is just a string, so planting it is allowed; the target is
+    // meaningless inside the root. Without this the refusal below would prove
+    // nothing.
+    assert!(
+        planted.success(),
+        "planting the symlink should be allowed, exit={:?} stderr={}",
+        planted.code(),
+        planted.stderr_str().unwrap_or("")
+    );
+
+    let followed = policy
+        .clone()
+        .run(&["rootfs-helper", "linkat", "/work/bait", "/work/pwn", "follow"])
+        .await
+        .expect("second run should launch once the first did");
+    assert!(
+        !followed.success(),
+        "following a symlink out of the root should be refused, exit={:?} stderr={}",
+        followed.code(),
+        followed.stderr_str().unwrap_or("")
+    );
+    // The sandbox says the same thing about a target that is missing and one
+    // that lives outside the root: from inside, the outside does not exist.
+    assert!(
+        followed
+            .stderr_str()
+            .unwrap_or("")
+            .contains("No such file or directory"),
+        "the refusal should report the target as absent, stderr={}",
+        followed.stderr_str().unwrap_or("")
+    );
+    assert_eq!(
+        fs::metadata(&host_secret).unwrap().nlink(),
+        1,
+        "the host file gained a second name inside the sandbox"
+    );
+
+    let read_back = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/work/pwn"])
+        .await
+        .expect("third run should launch once the first did");
+    assert!(
+        !read_back.stdout_str().unwrap_or("").contains("HOST-ONLY"),
+        "host file contents were read from inside the sandbox: {}",
+        read_back.stdout_str().unwrap_or("")
+    );
+
+    // The write side of the same escape: the destination name is writable by
+    // policy, so this run succeeds either way. What it proves is which inode
+    // that name refers to.
+    let write_back = policy
+        .clone()
+        .run(&["rootfs-helper", "write", "/work/pwn", "OWNED"])
+        .await
+        .expect("fourth run should launch once the first did");
+    assert!(
+        write_back.success(),
+        "writing the destination name should be allowed by policy, exit={:?} stderr={}",
+        write_back.code(),
+        write_back.stderr_str().unwrap_or("")
+    );
+    assert_eq!(
+        fs::read_to_string(&host_secret).unwrap().trim(),
+        "HOST-ONLY",
+        "a write inside the sandbox reached the host file, so the link landed \
+         on the host inode"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&host_dir);
+}
+
+/// The other side of the same branch: a symlink whose target does resolve
+/// inside the root still links the target's inode, not the symlink. Pins that
+/// the confined resolution above did not turn AT_SYMLINK_FOLLOW into a blanket
+/// refusal, and that the flag is honoured rather than quietly dropped.
+#[tokio::test]
+async fn test_chroot_hardlink_follow_links_the_target_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rootfs = build_test_rootfs("hardlink-follow-target");
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/work")
+        .fs_write("/work")
+        .build()
+        .unwrap();
+
+    let setup = match policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "write /work/orig.txt PAYLOAD && ln -s orig.txt /work/link",
+        ])
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Chroot test skipped: {}", e);
+            cleanup_rootfs(&rootfs);
+            return;
+        }
+    };
+    assert!(
+        setup.success(),
+        "creating the file and the symlink should succeed, exit={:?} stderr={}",
+        setup.code(),
+        setup.stderr_str().unwrap_or("")
+    );
+
+    let linked = policy
+        .clone()
+        .run(&["rootfs-helper", "linkat", "/work/link", "/work/alias.txt", "follow"])
+        .await
+        .expect("second run should launch once the first did");
+    assert!(
+        linked.success(),
+        "following a symlink that resolves inside the root should be allowed, \
+         exit={:?} stderr={}",
+        linked.code(),
+        linked.stderr_str().unwrap_or("")
+    );
+
+    let target = rootfs.join("work/orig.txt");
+    let alias = rootfs.join("work/alias.txt");
+    assert!(
+        !fs::symlink_metadata(&alias).unwrap().file_type().is_symlink(),
+        "the flag was dropped: the new name copied the symlink instead of \
+         linking its target"
+    );
+    assert_eq!(
+        fs::metadata(&target).unwrap().ino(),
+        fs::metadata(&alias).unwrap().ino(),
+        "the new name should be a second name for the target's inode"
+    );
+
+    cleanup_rootfs(&rootfs);
+}
