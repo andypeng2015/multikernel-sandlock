@@ -32,6 +32,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::arch;
+use crate::cow::result::link_result;
 use crate::cow::seccomp::SeccompCowBranch;
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, write_child_mem_force, NotifAction};
@@ -495,28 +496,6 @@ fn cow_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
         // entry, which still exists with its pre-delete content.
         Err(crate::error::BranchError::Deleted) => NotifAction::Errno(libc::ENOENT),
         _ => NotifAction::Continue,
-    }
-}
-
-/// Map a `handle_link` result to a NotifAction, for both the async dispatcher
-/// here and the chroot one.
-///
-/// Unlike [`cow_result`] this never falls through. A hard link whose
-/// destination the branch owns has to be answered by the branch: letting the
-/// original syscall run would give the child a second name for the *lower*
-/// inode, so a write through it would edit the file the branch promised to
-/// leave alone, and the name itself would outlive an aborted branch.
-pub(crate) fn link_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
-    match r {
-        Ok(true) => NotifAction::ReturnValue(0),
-        // The branch declined: the source is a directory (EPERM is the
-        // kernel's own answer for that) or the upper-layer link failed.
-        Ok(false) => NotifAction::Errno(libc::EPERM),
-        Err(crate::error::BranchError::QuotaExceeded) => NotifAction::Errno(libc::ENOSPC),
-        Err(crate::error::BranchError::Deleted) => NotifAction::Errno(libc::ENOENT),
-        Err(crate::error::BranchError::Denied) => NotifAction::Errno(libc::EPERM),
-        Err(crate::error::BranchError::Exists) => NotifAction::Errno(libc::EEXIST),
-        Err(_) => NotifAction::Errno(libc::EIO),
     }
 }
 

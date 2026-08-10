@@ -1329,7 +1329,7 @@ pub(crate) async fn handle_chroot_write(
                     return NotifAction::Errno(libc::EXDEV);
                 }
                 if cow.matches(&new_s) {
-                    return crate::cow::dispatch::link_result(cow.handle_link(&old_s, &new_s));
+                    return crate::cow::result::link_result(cow.handle_link(&old_s, &new_s));
                 }
             }
         }
