@@ -1268,37 +1268,84 @@ pub(crate) async fn handle_chroot_write(
         // never follows either.
         let follow_old = (notif.data.args[4] & libc::AT_SYMLINK_FOLLOW as u64) != 0;
         let old_resolved = if follow_old {
-            resolve_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx)
+            // The source has to resolve as a path that already exists, which
+            // is what pins the result inside the root: the O_CREAT-style
+            // fallback in resolve_chroot_path walks the parent and then appends
+            // the last component verbatim, so a symlink whose target does not
+            // exist inside the root comes back as the symlink's own name. The
+            // supervisor runs outside the chroot, so handing that name to the
+            // host linkat below would resolve the guest's symlink from the real
+            // root and hard-link a host file into the sandbox.
+            //
+            // The virtual path is re-derived from the resolved host path
+            // because a resolution under a mount reports the name the child
+            // asked for, not the name it reached. The gate below has to read
+            // the name of the inode being linked: a symlink inside a mount
+            // would otherwise be judged by the link's own name, and a denied
+            // or read-only target would pass under any allowed spelling.
+            resolve_chroot_path_existing(notif, notif.data.args[0] as i64, &old_path, ctx)
+                .and_then(|(host, _)| ctx.host_to_virtual(&host).map(|vp| (host, vp)))
         } else {
             resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx)
         };
-        let (old_host, _) = match old_resolved {
+        let (old_host, old_vp) = match old_resolved {
             Some(r) => r,
+            // A followed source that will not resolve is either missing or
+            // pointing out of the root, and the sandbox says the same thing
+            // about both: ENOENT is also what the kernel reports natively for
+            // AT_SYMLINK_FOLLOW on a dangling symlink.
+            None if follow_old => return NotifAction::Errno(libc::ENOENT),
             None => return NotifAction::Errno(libc::EACCES),
         };
         let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
-        if !ctx.can_write(&new_vp) { return NotifAction::Errno(libc::EACCES); }
+        // A hard link is a second name for one inode, so afterwards the
+        // authority over that inode is the union of the policy on both names.
+        // Gating the destination alone lets a guest re-file a readable but
+        // unwritable file (a read-only mount, a denied path) under a writable
+        // prefix and then write to it there. Requiring write on the source too
+        // keeps the weaker name from being upgraded, the same rule rename
+        // already applies to the name it destroys. Off the chroot path
+        // Landlock enforces this already: linking needs REFER on both sides.
+        if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
+            return NotifAction::Errno(libc::EACCES);
+        }
 
         {
             let mut cs = cow_state.lock().await;
             if let Some(cow) = cs.branch.as_mut() {
-                let s = new_host.to_string_lossy();
-                if cow.matches(&s) {
-                    match cow.handle_link(&old_host.to_string_lossy(), &s) {
-                        Ok(true) => return NotifAction::ReturnValue(0),
-                        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                        _ => {}
-                    }
+                let old_s = old_host.to_string_lossy();
+                let new_s = new_host.to_string_lossy();
+                // A hard link cannot be half staged. With one name inside the
+                // branch and the other below it there is nothing to stage:
+                // linking in would create the name in the workdir the branch
+                // promised to leave untouched, and linking out would hand the
+                // child an alias for the lower inode that survives an abort.
+                // EXDEV is what the kernel says about a link that cannot span
+                // the two sides.
+                if cow.matches(&old_s) != cow.matches(&new_s) {
+                    return NotifAction::Errno(libc::EXDEV);
+                }
+                if cow.matches(&new_s) {
+                    return crate::cow::dispatch::link_result(cow.handle_link(&old_s, &new_s));
                 }
             }
         }
 
         let c_old = match path_cstr(&old_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
         let c_new = match path_cstr(&new_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
-        let flags = notif.data.args[4] as i32;
+        // Both defined flags describe a source this code has already resolved,
+        // so neither is forwarded. AT_SYMLINK_FOLLOW was consumed by the branch
+        // above; leaving it set would make the host kernel resolve the last
+        // component a second time, unconfined, which is both an escape and a
+        // window for the child to swap that component after the check.
+        // AT_EMPTY_PATH names a dirfd, and the path below is never empty.
+        // Anything else the child passes stays, so the kernel keeps rejecting
+        // unknown flags with EINVAL exactly as it would without the sandbox.
+        let flags =
+            notif.data.args[4] as i32 & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_FOLLOW);
         return if unsafe { libc::linkat(libc::AT_FDCWD, c_old.as_ptr(), libc::AT_FDCWD, c_new.as_ptr(), flags) } < 0 {
             NotifAction::Errno(last_errno(libc::EIO))
         } else {

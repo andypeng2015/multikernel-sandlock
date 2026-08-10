@@ -1510,3 +1510,742 @@ async fn test_max_open_files_chroot_ignores_parent_fd_density() {
 
     cleanup_rootfs(&rootfs);
 }
+
+/// AT_SYMLINK_FOLLOW asks for the inode behind a symlink, and the supervisor
+/// performs the link itself from outside the chroot. If the source is resolved
+/// by walking its parent and appending the last component, a symlink whose
+/// target does not exist inside the root comes back as the symlink itself, and
+/// the host kernel then resolves it a second time against the real root: the
+/// guest picks any host path it likes and gets a hard link to it inside the
+/// sandbox, readable and writable.
+#[tokio::test]
+async fn test_chroot_hardlink_follow_cannot_reach_a_host_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rootfs = build_test_rootfs("hardlink-follow-escape");
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+
+    // Outside the rootfs and outside every grant, but on the same filesystem,
+    // so a hard link to it is physically possible and the refusal below is the
+    // only thing standing in the way.
+    let host_dir = temp_dir("hardlink-follow-host");
+    let host_secret = host_dir.join("host-only.txt");
+    fs::write(&host_secret, "HOST-ONLY").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/work")
+        .fs_write("/work")
+        .build()
+        .unwrap();
+
+    let bait = host_secret.to_string_lossy().to_string();
+    let planted = match policy
+        .clone()
+        .run(&["rootfs-helper", "ln", "-s", &bait, "/work/bait"])
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Chroot test skipped: {}", e);
+            cleanup_rootfs(&rootfs);
+            let _ = fs::remove_dir_all(&host_dir);
+            return;
+        }
+    };
+    // A symlink is just a string, so planting it is allowed; the target is
+    // meaningless inside the root. Without this the refusal below would prove
+    // nothing.
+    assert!(
+        planted.success(),
+        "planting the symlink should be allowed, exit={:?} stderr={}",
+        planted.code(),
+        planted.stderr_str().unwrap_or("")
+    );
+
+    let followed = policy
+        .clone()
+        .run(&["rootfs-helper", "linkat", "/work/bait", "/work/pwn", "follow"])
+        .await
+        .expect("second run should launch once the first did");
+    assert!(
+        !followed.success(),
+        "following a symlink out of the root should be refused, exit={:?} stderr={}",
+        followed.code(),
+        followed.stderr_str().unwrap_or("")
+    );
+    // The sandbox says the same thing about a target that is missing and one
+    // that lives outside the root: from inside, the outside does not exist.
+    assert!(
+        followed
+            .stderr_str()
+            .unwrap_or("")
+            .contains("No such file or directory"),
+        "the refusal should report the target as absent, stderr={}",
+        followed.stderr_str().unwrap_or("")
+    );
+    assert_eq!(
+        fs::metadata(&host_secret).unwrap().nlink(),
+        1,
+        "the host file gained a second name inside the sandbox"
+    );
+
+    let read_back = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/work/pwn"])
+        .await
+        .expect("third run should launch once the first did");
+    assert!(
+        !read_back.stdout_str().unwrap_or("").contains("HOST-ONLY"),
+        "host file contents were read from inside the sandbox: {}",
+        read_back.stdout_str().unwrap_or("")
+    );
+
+    // The write side of the same escape: the destination name is writable by
+    // policy, so this run succeeds either way. What it proves is which inode
+    // that name refers to.
+    let write_back = policy
+        .clone()
+        .run(&["rootfs-helper", "write", "/work/pwn", "OWNED"])
+        .await
+        .expect("fourth run should launch once the first did");
+    assert!(
+        write_back.success(),
+        "writing the destination name should be allowed by policy, exit={:?} stderr={}",
+        write_back.code(),
+        write_back.stderr_str().unwrap_or("")
+    );
+    assert_eq!(
+        fs::read_to_string(&host_secret).unwrap().trim(),
+        "HOST-ONLY",
+        "a write inside the sandbox reached the host file, so the link landed \
+         on the host inode"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&host_dir);
+}
+
+/// The other side of the same branch: a symlink whose target does resolve
+/// inside the root still links the target's inode, not the symlink. Pins that
+/// the confined resolution above did not turn AT_SYMLINK_FOLLOW into a blanket
+/// refusal, and that the flag is honoured rather than quietly dropped.
+#[tokio::test]
+async fn test_chroot_hardlink_follow_links_the_target_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rootfs = build_test_rootfs("hardlink-follow-target");
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/work")
+        .fs_write("/work")
+        .build()
+        .unwrap();
+
+    let setup = match policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "write /work/orig.txt PAYLOAD && ln -s orig.txt /work/link",
+        ])
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Chroot test skipped: {}", e);
+            cleanup_rootfs(&rootfs);
+            return;
+        }
+    };
+    assert!(
+        setup.success(),
+        "creating the file and the symlink should succeed, exit={:?} stderr={}",
+        setup.code(),
+        setup.stderr_str().unwrap_or("")
+    );
+
+    let linked = policy
+        .clone()
+        .run(&["rootfs-helper", "linkat", "/work/link", "/work/alias.txt", "follow"])
+        .await
+        .expect("second run should launch once the first did");
+    assert!(
+        linked.success(),
+        "following a symlink that resolves inside the root should be allowed, \
+         exit={:?} stderr={}",
+        linked.code(),
+        linked.stderr_str().unwrap_or("")
+    );
+
+    let target = rootfs.join("work/orig.txt");
+    let alias = rootfs.join("work/alias.txt");
+    assert!(
+        !fs::symlink_metadata(&alias).unwrap().file_type().is_symlink(),
+        "the flag was dropped: the new name copied the symlink instead of \
+         linking its target"
+    );
+    assert_eq!(
+        fs::metadata(&target).unwrap().ino(),
+        fs::metadata(&alias).unwrap().ino(),
+        "the new name should be a second name for the target's inode"
+    );
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// A hard link hands out a second name for an inode, so after link(2) the
+/// authority over that inode is the union of the policy on both names. Under
+/// chroot the supervisor performs the link itself, so nothing downstream can
+/// re-check it: if only the destination is gated, a guest can name a file it
+/// may read but not write under a writable prefix and then write to it there.
+///
+/// Read-only mount flavour: /ro is readable (so the source resolves) but never
+/// writable, /rw is writable.
+#[tokio::test]
+async fn test_chroot_hardlink_cannot_escalate_read_only_mount() {
+    let rootfs = build_test_rootfs("hardlink-ro-mount");
+    fs::create_dir_all(rootfs.join("ro")).unwrap();
+    fs::create_dir_all(rootfs.join("rw")).unwrap();
+
+    // Both host directories sit under the same temp base and therefore on the
+    // same filesystem. A cross-filesystem pair would fail with EXDEV and the
+    // escalation could not be attempted at all, making the test vacuous.
+    let ro_dir = temp_dir("hardlink-ro-src");
+    let rw_dir = temp_dir("hardlink-ro-dst");
+    let secret = ro_dir.join("secret.txt");
+    fs::write(&secret, "SECRET").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/ro")
+        .fs_read("/rw")
+        .fs_write("/rw")
+        .fs_mount_ro("/ro", &ro_dir)
+        .fs_mount("/rw", &rw_dir)
+        .build()
+        .unwrap();
+
+    let direct = match policy
+        .clone()
+        .run(&["rootfs-helper", "write", "/ro/secret.txt", "PWNED"])
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Chroot test skipped: {}", e);
+            cleanup_rootfs(&rootfs);
+            let _ = fs::remove_dir_all(&ro_dir);
+            let _ = fs::remove_dir_all(&rw_dir);
+            return;
+        }
+    };
+    // Baseline: the policy grants no write on the source name. Without this
+    // the link denial below would prove nothing.
+    assert!(
+        !direct.success(),
+        "writing a read-only mount directly should fail, exit={:?}",
+        direct.code()
+    );
+
+    let linked = policy
+        .clone()
+        .run(&["rootfs-helper", "ln", "/ro/secret.txt", "/rw/alias"])
+        .await
+        .expect("second run should launch once the first did");
+    assert!(
+        !linked.success(),
+        "hard-linking a read-only mount into a writable mount should be \
+         refused, exit={:?} stderr={}",
+        linked.code(),
+        linked.stderr_str().unwrap_or("")
+    );
+
+    // The consequence, spelled out: whatever now lives at the destination name
+    // must not be the protected inode. Writing through it is allowed by policy
+    // (/rw is writable), so this run must succeed on its own terms; if it ever
+    // stops doing so, the host-side check below would hold for a reason that
+    // has nothing to do with the escalation.
+    let through_alias = policy
+        .clone()
+        .run(&["rootfs-helper", "write", "/rw/alias", "PWNED"])
+        .await
+        .expect("third run should launch once the first did");
+    assert!(
+        through_alias.success(),
+        "the escalation attempt itself must run, exit={:?} stderr={}",
+        through_alias.code(),
+        through_alias.stderr_str().unwrap_or("")
+    );
+    assert_eq!(
+        fs::read_to_string(&secret).unwrap().trim(),
+        "SECRET",
+        "a write to the destination name reached the read-only mount, so the \
+         link aliased the protected inode"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&ro_dir);
+    let _ = fs::remove_dir_all(&rw_dir);
+}
+
+/// fs_deny flavour of the same escalation: aliasing a denied file needs write
+/// authority on the denied name, which fs_deny withholds, so the chain never
+/// starts. Both the read and the write escalation are checked.
+#[tokio::test]
+async fn test_chroot_hardlink_cannot_alias_denied_path() {
+    let rootfs = build_test_rootfs("hardlink-fs-deny");
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+
+    let work_dir = temp_dir("hardlink-deny-work");
+    let secret = work_dir.join("secret.txt");
+    fs::write(&secret, "SECRET").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/work")
+        .fs_write("/work")
+        .fs_mount("/work", &work_dir)
+        .fs_deny("/work/secret.txt")
+        .build()
+        .unwrap();
+
+    let direct = match policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/work/secret.txt"])
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Chroot test skipped: {}", e);
+            cleanup_rootfs(&rootfs);
+            let _ = fs::remove_dir_all(&work_dir);
+            return;
+        }
+    };
+    // Baseline: fs_deny wins over the surrounding writable mount.
+    assert!(
+        !direct.success(),
+        "fs_deny should block reading the file by its own name, exit={:?} stdout={}",
+        direct.code(),
+        direct.stdout_str().unwrap_or("")
+    );
+
+    let linked = policy
+        .clone()
+        .run(&["rootfs-helper", "ln", "/work/secret.txt", "/work/alias.txt"])
+        .await
+        .expect("second run should launch once the first did");
+    assert!(
+        !linked.success(),
+        "hard-linking a denied path to an allowed name should be refused, \
+         exit={:?} stderr={}",
+        linked.code(),
+        linked.stderr_str().unwrap_or("")
+    );
+
+    let via_alias = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/work/alias.txt"])
+        .await
+        .expect("third run should launch once the first did");
+    assert!(
+        !via_alias.stdout_str().unwrap_or("").contains("SECRET"),
+        "the denied file became readable under a second name: {}",
+        via_alias.stdout_str().unwrap_or("")
+    );
+
+    // /work is writable, so this run must succeed whichever inode the second
+    // name turns out to hold. Asserting that keeps the host-side check below
+    // from passing because the write never happened.
+    let through_alias = policy
+        .clone()
+        .run(&["rootfs-helper", "write", "/work/alias.txt", "PWNED"])
+        .await
+        .expect("fourth run should launch once the first did");
+    assert!(
+        through_alias.success(),
+        "the escalation attempt itself must run, exit={:?} stderr={}",
+        through_alias.code(),
+        through_alias.stderr_str().unwrap_or("")
+    );
+    assert_eq!(
+        fs::read_to_string(&secret).unwrap().trim(),
+        "SECRET",
+        "a write to the second name reached the denied inode"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&work_dir);
+}
+
+/// The other side of the predicate: when the policy grants writes on both
+/// names the link must still go through. Uses linkat(2) directly so the *at
+/// entry point is exercised alongside the legacy link(2) the other tests take.
+#[tokio::test]
+async fn test_chroot_hardlink_allowed_when_both_sides_writable() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rootfs = build_test_rootfs("hardlink-allowed");
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+
+    let work_dir = temp_dir("hardlink-allowed-work");
+    fs::write(work_dir.join("orig.txt"), "payload").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/work")
+        .fs_write("/work")
+        .fs_mount("/work", &work_dir)
+        .build()
+        .unwrap();
+
+    // A probe run carries the skip convention, so a host that cannot launch
+    // the sandbox at all is the only thing it can hide. The run under test
+    // then has to launch, or this test would be the one place where an
+    // over-denying gate could ship unnoticed.
+    if let Err(e) = policy.clone().run(&["rootfs-helper", "true"]).await {
+        eprintln!("Chroot test skipped: {}", e);
+        cleanup_rootfs(&rootfs);
+        let _ = fs::remove_dir_all(&work_dir);
+        return;
+    }
+
+    let linked = policy
+        .clone()
+        .run(&["rootfs-helper", "linkat", "/work/orig.txt", "/work/alias.txt"])
+        .await
+        .expect("second run should launch once the probe did");
+    assert!(
+        linked.success(),
+        "linking within a writable mount should be allowed, exit={:?} stderr={}",
+        linked.code(),
+        linked.stderr_str().unwrap_or("")
+    );
+    let orig = fs::metadata(work_dir.join("orig.txt")).unwrap();
+    let alias = fs::metadata(work_dir.join("alias.txt")).unwrap();
+    assert_eq!(
+        orig.ino(),
+        alias.ino(),
+        "the second name should be a hard link, not a copy"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&work_dir);
+}
+
+/// The gate has to judge the inode the link will name, which under a mount is
+/// not the name the child spelled: the mount resolver reports the requested
+/// path back, so a symlink to a denied file inside the mount would be checked
+/// as the symlink's own (allowed) name. AT_SYMLINK_FOLLOW is the spelling that
+/// reaches that branch, and it needs no knowledge of any host path: a relative
+/// symlink next to the target is enough.
+#[tokio::test]
+async fn test_chroot_hardlink_follow_cannot_alias_a_denied_path_under_a_mount() {
+    let rootfs = build_test_rootfs("hardlink-follow-deny");
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+
+    let work_dir = temp_dir("hardlink-follow-deny-work");
+    let secret = work_dir.join("secret.txt");
+    fs::write(&secret, "SECRET").unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_read("/work")
+        .fs_write("/work")
+        .fs_mount("/work", &work_dir)
+        .fs_deny("/work/secret.txt")
+        .build()
+        .unwrap();
+
+    let planted = match policy
+        .clone()
+        .run(&["rootfs-helper", "ln", "-s", "secret.txt", "/work/s"])
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Chroot test skipped: {}", e);
+            cleanup_rootfs(&rootfs);
+            let _ = fs::remove_dir_all(&work_dir);
+            return;
+        }
+    };
+    // fs_deny covers the file, not the name of a symlink beside it, so
+    // planting the bait is allowed and the refusal below is about the target.
+    assert!(
+        planted.success(),
+        "planting the symlink should be allowed, exit={:?} stderr={}",
+        planted.code(),
+        planted.stderr_str().unwrap_or("")
+    );
+
+    let followed = policy
+        .clone()
+        .run(&["rootfs-helper", "linkat", "/work/s", "/work/alias.txt", "follow"])
+        .await
+        .expect("second run should launch once the first did");
+    assert!(
+        !followed.success(),
+        "following a symlink to a denied file should be refused, exit={:?} stderr={}",
+        followed.code(),
+        followed.stderr_str().unwrap_or("")
+    );
+
+    let via_alias = policy
+        .clone()
+        .run(&["rootfs-helper", "cat", "/work/alias.txt"])
+        .await
+        .expect("third run should launch once the first did");
+    assert!(
+        !via_alias.stdout_str().unwrap_or("").contains("SECRET"),
+        "the denied file became readable under a second name: {}",
+        via_alias.stdout_str().unwrap_or("")
+    );
+
+    let through_alias = policy
+        .clone()
+        .run(&["rootfs-helper", "write", "/work/alias.txt", "PWNED"])
+        .await
+        .expect("fourth run should launch once the first did");
+    assert!(
+        through_alias.success(),
+        "the escalation attempt itself must run, exit={:?} stderr={}",
+        through_alias.code(),
+        through_alias.stderr_str().unwrap_or("")
+    );
+    assert_eq!(
+        fs::read_to_string(&secret).unwrap().trim(),
+        "SECRET",
+        "a write to the second name reached the denied inode"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&work_dir);
+}
+
+/// A copy-on-write branch stages writes in an upper layer and, under
+/// BranchAction::Abort, throws them away. A hard link cannot be half staged:
+/// with one name inside the workdir and the other below it, there is nothing
+/// to stage, and performing the link for real would create the name in the
+/// pristine workdir instead. EXDEV is the kernel's own word for a link that
+/// cannot span two sides.
+#[tokio::test]
+async fn test_chroot_hardlink_into_a_branch_is_refused() {
+    let rootfs = build_test_rootfs("hardlink-branch-in");
+    let tmp_dir = rootfs.join("tmp");
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_read("/work")
+        .fs_write("/work")
+        .fs_write("/tmp")
+        .workdir(&tmp_dir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "write /work/a.txt LEAKED && ln /work/a.txt /tmp/pulled-in.txt",
+        ])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                !r.success(),
+                "a hard link into the branch should be refused, exit={:?} stderr={}",
+                r.code(),
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stderr_str().unwrap_or("").contains("Invalid cross-device link"),
+                "the refusal should read as a cross-device link, stderr={}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                !tmp_dir.join("pulled-in.txt").exists(),
+                "the branch was aborted, yet the link landed in the workdir itself"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// The other direction, and the damaging one: a name taken out of the workdir
+/// aliases the *lower* inode, so a write through it edits the very file the
+/// branch promised to leave alone, and the edit outlives the abort.
+#[tokio::test]
+async fn test_chroot_hardlink_out_of_a_branch_is_refused() {
+    let rootfs = build_test_rootfs("hardlink-branch-out");
+    let tmp_dir = rootfs.join("tmp");
+    fs::create_dir_all(rootfs.join("work")).unwrap();
+    fs::write(tmp_dir.join("orig.txt"), "ORIGINAL").unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_read("/work")
+        .fs_write("/work")
+        .fs_write("/tmp")
+        .workdir(&tmp_dir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "ln /tmp/orig.txt /work/alias.txt && write /work/alias.txt OVERWRITTEN",
+        ])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                !r.success(),
+                "a hard link out of the branch should be refused, exit={:?} stderr={}",
+                r.code(),
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                !rootfs.join("work/alias.txt").exists(),
+                "the second name was created outside the branch"
+            );
+            assert_eq!(
+                fs::read_to_string(tmp_dir.join("orig.txt")).unwrap().trim(),
+                "ORIGINAL",
+                "the aborted branch still edited the file it was staging over"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// Both names inside the workdir is the case the branch can stage, so it must
+/// keep working, and it must stay in the branch: after an abort neither the
+/// second name nor the copy of the first is left in the workdir.
+#[tokio::test]
+async fn test_chroot_hardlink_within_a_branch_stays_in_the_branch() {
+    let rootfs = build_test_rootfs("hardlink-branch-within");
+    let tmp_dir = rootfs.join("tmp");
+    fs::write(tmp_dir.join("orig.txt"), "ORIGINAL").unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .workdir(&tmp_dir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "ln /tmp/orig.txt /tmp/alias.txt && cat /tmp/alias.txt",
+        ])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                r.success(),
+                "a link between two names inside the workdir should be allowed, \
+                 exit={:?} stderr={}",
+                r.code(),
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stdout_str().unwrap_or("").contains("ORIGINAL"),
+                "the second name should read as the file it links, stdout={}",
+                r.stdout_str().unwrap_or("")
+            );
+            assert!(
+                !tmp_dir.join("alias.txt").exists(),
+                "the aborted branch left its second name in the workdir"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
+/// A file deleted in the branch is a whiteout: the lower entry is still on
+/// disk with its pre-delete bytes. Linking it must answer ENOENT rather than
+/// resurrect it, which is the same rule the read-open path already follows.
+#[tokio::test]
+async fn test_chroot_hardlink_to_a_file_deleted_in_the_branch_is_enoent() {
+    let rootfs = build_test_rootfs("hardlink-branch-whiteout");
+    let tmp_dir = rootfs.join("tmp");
+    fs::write(tmp_dir.join("orig.txt"), "PREDELETE").unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .workdir(&tmp_dir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "rm /tmp/orig.txt && ln /tmp/orig.txt /tmp/alias.txt",
+        ])
+        .await;
+    match result {
+        Ok(r) => {
+            assert!(
+                !r.success(),
+                "linking a file the branch deleted should be refused, exit={:?} stderr={}",
+                r.code(),
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                r.stderr_str().unwrap_or("").contains("No such file or directory"),
+                "the deleted file should read as absent, stderr={}",
+                r.stderr_str().unwrap_or("")
+            );
+            assert!(
+                !tmp_dir.join("alias.txt").exists(),
+                "the pre-delete inode came back under a second name in the workdir"
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
