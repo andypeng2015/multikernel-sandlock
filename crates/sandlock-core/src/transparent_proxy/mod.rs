@@ -52,12 +52,13 @@ pub(crate) async fn spawn_transparent_proxy(
     inject: Arc<Vec<crate::credential::InjectRule>>,
     ca_cert_pem: Option<&str>,
     ca_key_pem: Option<&str>,
+    log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
 ) -> std::io::Result<HttpAclProxyHandle> {
     // rustls 0.22 builder() uses the ring provider directly; no provider install needed.
     let orig_dest: OrigDestMap =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let forwarder = Forwarder::new()?;
-    let svc = AclService::new(allow, deny, inject, Arc::clone(&orig_dest), forwarder);
+    let svc = AclService::new(allow, deny, inject, Arc::clone(&orig_dest), forwarder, log_fn);
 
     let signer = match (ca_cert_pem, ca_key_pem) {
         (Some(c), Some(k)) => Some(Arc::new(CertSigner::new(c, k)?)),
@@ -182,7 +183,7 @@ mod tests {
             .expect("resolve_ca ok")
             .expect("ephemeral CA generated");
         let allow = vec![crate::http::HttpRule::parse("GET allowed.test/*").expect("rule parses")];
-        let handle = super::spawn_transparent_proxy(allow, vec![], Arc::new(vec![]), Some(&ca.cert_pem), Some(&ca.key_pem))
+        let handle = super::spawn_transparent_proxy(allow, vec![], Arc::new(vec![]), Some(&ca.cert_pem), Some(&ca.key_pem), None)
             .await
             .expect("proxy spawns");
         let addr = handle.addr;
