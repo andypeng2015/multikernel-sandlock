@@ -292,6 +292,9 @@ struct LearnObserver {
     /// would catch the child bootstrap pipe writes before the parent receives
     /// the seccomp listener fd.
     pending_udp_connects: Arc<Mutex<HashMap<(u32, i64), String>>>,
+    /// HTTP requests observed via the transparent proxy (method + host + path).
+    /// Format: "METHOD host/path" matching HttpRule::parse input.
+    http_requests: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl LearnObserver {
@@ -304,6 +307,7 @@ impl LearnObserver {
             pending_maps: Arc::new(Mutex::new(HashSet::new())),
             first_exe: Arc::new(Mutex::new(None)),
             pending_udp_connects: Arc::new(Mutex::new(HashMap::new())),
+            http_requests: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -522,7 +526,10 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     // the real filesystem is untouched and no write is blocked.
     let observer = LearnObserver::new();
     let observer_cb = observer.clone();
-    let policy = Sandbox::builder()
+
+    let want_http = args.learn_http;
+
+    let mut builder = Sandbox::builder()
         // Name + mode mark this as a learning sandbox in `sandlock ps`: the
         // observation policy below (read "/", allow-all network) would
         // otherwise look like a dangerously permissive run. One learn
@@ -539,7 +546,24 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .net_allow("*")
         .net_allow("icmp://*")
         .max_memory(sandlock_core::sandbox::ByteSize(1 << 43)) // 8 TiB
-        .policy_fn(move |event, _ctx| observer_cb.on_event(event))
+        .policy_fn(move |event, _ctx| observer_cb.on_event(event));
+
+    if want_http {
+        let http_requests_cb = Arc::clone(&observer.http_requests);
+        let http_log: Arc<dyn Fn(&str, &str, &str) + Send + Sync> =
+            Arc::new(move |method, host, path| {
+                http_requests_cb.lock().unwrap().insert(format!("{method} {host}{path}"));
+            });
+        builder = builder.http_log_fn(http_log);
+    }
+    for path in &args.http_inject_ca {
+        builder = builder.http_inject_ca(path);
+    }
+    for port in &args.http_port {
+        builder = builder.http_port(*port);
+    }
+
+    let policy = builder
         .build()
         .map_err(|e| anyhow!("failed to build sandbox policy: {e}"))?;
 
@@ -644,6 +668,19 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     profile_out.network.allow_bind = observer.binds.lock().unwrap().iter()
         .map(|&p| sandlock_core::profile::PortSpec::Port(p))
         .collect();
+
+    let http_reqs: Vec<String> = observer.http_requests.lock().unwrap().iter().cloned().collect();
+    if !http_reqs.is_empty() {
+        // Ports: always include 80; add 443 when --http-inject-ca was given; add any --http-port extras.
+        let mut ports = vec![80u16];
+        if !args.http_inject_ca.is_empty() { ports.push(443); }
+        for &p in &args.http_port {
+            if !ports.contains(&p) { ports.push(p); }
+        }
+        profile_out.http.ports = ports;
+        profile_out.http.allow = http_reqs;
+        profile_out.config.http_inject_ca = args.http_inject_ca.clone();
+    }
 
     // Fill limits with observed peaks + headroom so the profile is usable with sandlock run.
     // Memory: tracked via the sentinel max_memory in the builder, which activates handle_memory

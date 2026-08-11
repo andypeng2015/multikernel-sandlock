@@ -233,6 +233,19 @@ struct LearnArgs {
     #[arg(long, requires = "collapse_prefix")]
     force_sensitive_collapse: bool,
 
+    /// Record HTTP method + host + path in [http].allow
+    #[arg(long)]
+    learn_http: bool,
+
+    /// Inject an ephemeral MITM CA into this trust bundle to observe HTTPS (implies --learn-http).
+    /// Enables port 443 interception.
+    #[arg(long, value_name = "PATH")]
+    http_inject_ca: Vec<PathBuf>,
+
+    /// Additional TCP port to intercept for HTTP/HTTPS learning (implies --learn-http)
+    #[arg(long, value_name = "PORT")]
+    http_port: Vec<u16>,
+
     /// Command to observe (everything after --)
     #[arg(last = true, required = true)]
     cmd: Vec<String>,

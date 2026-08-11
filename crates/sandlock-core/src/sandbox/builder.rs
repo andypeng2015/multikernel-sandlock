@@ -102,6 +102,11 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "http-ca-out", value_name = "PATH"))]
     pub http_ca_out: Option<PathBuf>,
 
+    /// Optional observation callback for HTTP learn mode. When set, the proxy is
+    /// spawned even without ACL rules so every request is logged via this closure.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub http_log_fn: Option<std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+
     // max_memory uses a string in the CLI (e.g. "512M"); not directly clap-friendly as ByteSize.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub max_memory: Option<ByteSize>,
@@ -269,6 +274,7 @@ impl Default for SandboxBuilder {
             http_key: None,
             http_inject_ca: Vec::new(),
             http_ca_out: None,
+            http_log_fn: None,
             max_memory: None,
             max_processes: None,
             max_open_files: None,
@@ -332,6 +338,7 @@ impl Clone for SandboxBuilder {
             http_key: self.http_key.clone(),
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
+            http_log_fn: self.http_log_fn.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
@@ -543,6 +550,11 @@ impl SandboxBuilder {
 
     pub fn http_ca_out(mut self, path: impl Into<PathBuf>) -> Self {
         self.http_ca_out = Some(path.into());
+        self
+    }
+
+    pub fn http_log_fn(mut self, f: std::sync::Arc<dyn Fn(&str, &str, &str) + Send + Sync>) -> Self {
+        self.http_log_fn = Some(f);
         self
     }
 
@@ -850,8 +862,8 @@ impl SandboxBuilder {
         }
 
         // --http-inject-ca / --http-ca-out are meaningless without an HTTP ACL
-        // proxy to do MITM, which only spawns when http rules exist.
-        let has_http_rules = !self.http_allow.is_empty() || !self.http_deny.is_empty();
+        // proxy to do MITM, which only spawns when http rules or a log callback exist.
+        let has_http_rules = !self.http_allow.is_empty() || !self.http_deny.is_empty() || self.http_log_fn.is_some();
         if !self.http_inject_ca.is_empty() && !has_http_rules {
             return Err(SandboxError::Invalid(
                 "--http-inject-ca requires --http-allow or --http-deny".into(),
@@ -947,7 +959,7 @@ impl SandboxBuilder {
         let inject = std::sync::Arc::new(inject_rules);
 
         // Default HTTP intercept ports: 80 always, 443 when HTTPS CA is configured.
-        let http_ports = if self.http_ports.is_empty() && (!http_allow.is_empty() || !http_deny.is_empty()) {
+        let http_ports = if self.http_ports.is_empty() && has_http_rules {
             let mut ports = vec![80];
             if self.http_ca.is_some() || !self.http_inject_ca.is_empty() {
                 ports.push(443);
@@ -1016,6 +1028,7 @@ impl SandboxBuilder {
             http_key: self.http_key,
             http_inject_ca: self.http_inject_ca,
             http_ca_out: self.http_ca_out,
+            http_log_fn: self.http_log_fn,
             max_memory: self.max_memory,
             max_processes: self.max_processes.unwrap_or(64),
             max_open_files: self.max_open_files,
