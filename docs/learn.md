@@ -18,6 +18,9 @@ sandlock learn [options] -- <cmd> [args...]
 | `--collapse [N]` | off | Collapse directories where ≥N files were observed (default N=4) |
 | `--collapse-prefix <path>` | none | Force collapse of all paths under prefix (repeatable) |
 | `--force-sensitive-collapse` | off | Allow `--collapse-prefix` to target sensitive paths (requires `--collapse-prefix`) |
+| `--learn-http` | off | Enable HTTP/HTTPS traffic observation|
+| `--http-inject-ca <path>` | none | System CA bundle path; sandlock splices an ephemeral CA in at `open()` time so HTTPS is intercepted. Requires `--learn-http`. |
+| `--http-port <port>` | none | Additional TCP port to intercept (repeatable). Requires `--learn-http`. |
 
 ## What is recorded
 
@@ -27,6 +30,7 @@ sandlock learn [options] -- <cmd> [args...]
 | Filesystem writes | Same; classified by open flags (`O_WRONLY`, `O_RDWR`, `O_CREAT`) |
 | Executed binaries and libraries | `/proc/<pid>/exe` + r-xp mappings from `/proc/<pid>/maps` |
 | Network connections (TCP/UDP) | seccomp-notify on `connect`/`sendto`/`sendmsg` |
+| HTTP method + host + path | Transparent proxy in logging-only mode (opt-in, see below) |
 | Resource peaks | `/proc/<pid>/status` sampling: RSS, thread count, fd count |
 
 ## Path collapsing
@@ -61,6 +65,10 @@ to. The operator can use this to decide whether the grant is acceptable.
 
 `--force-sensitive-collapse` allows `--collapse-prefix` to target protected
 and guarded paths. A warning and diff are still printed.
+
+## HTTP/HTTPS observation
+
+`--learn-http` activates the transparent proxy in logging-only mode. Method, host, and path of every request are recorded as `[http].allow` rules. Port 80 is always intercepted; port 443 requires `--http-inject-ca` (sandlock splices an ephemeral CA into the named bundle at `open()` time); non-standard ports use `--http-port`. The inject-ca path is written to `[config].http_inject_ca` so `sandlock run` picks it up automatically. `[http].deny` rules are not learned.
 
 ## Tests
 

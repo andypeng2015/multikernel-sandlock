@@ -440,3 +440,138 @@ fn test_learn_then_run_merge() {
     assert!(!run_deny.status.success(),
         "secret should be blocked by deny rule after merge");
 }
+
+// ── HTTP learning ─────────────────────────────────────────────────────────────
+
+fn spawn_http_server() -> u16 {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test http server");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream { Ok(s) => s, Err(_) => break };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+            );
+        }
+    });
+    port
+}
+
+/// Learn HTTP traffic then run with the learned profile:
+/// - the learned path is allowed and returns the real response
+/// - a different path that was not observed is blocked (403 from proxy)
+#[test]
+fn test_learn_then_run_http() {
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+    let port = spawn_http_server();
+    let url_learned = format!("http://127.0.0.1:{port}/data");
+    let url_other   = format!("http://127.0.0.1:{port}/other");
+    let port_str = port.to_string();
+
+    // Learn only GET /data.
+    let learn = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--learn-http", "--http-port", &port_str,
+               "--", "curl", "-sf", &url_learned])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(learn.status.success(),
+        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+
+    let profile_content = std::fs::read_to_string(&profile_path).expect("read profile");
+    assert!(profile_content.contains("[http]"), "profile must have [http] section: {profile_content}");
+    assert!(profile_content.contains("/data"), "profile must record /data: {profile_content}");
+
+    // Allowed: the learned path returns the real server response.
+    let run_allow = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "curl", "-s", &url_learned])
+        .output()
+        .expect("failed to run sandlock run (allow)");
+    assert!(run_allow.status.success(),
+        "run failed for learned path: {}", String::from_utf8_lossy(&run_allow.stderr));
+    assert_eq!(String::from_utf8_lossy(&run_allow.stdout).trim(), "ok",
+        "expected 'ok' from test server for learned path");
+
+    // Blocked: a path not in the learned allow list gets 403 from the proxy.
+    // curl -f exits non-zero on HTTP 4xx/5xx.
+    let run_deny = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "curl", "-sf", &url_other])
+        .output()
+        .expect("failed to run sandlock run (deny)");
+    assert!(!run_deny.status.success(),
+        "run should have been blocked for non-learned path /other");
+}
+
+fn system_ca_bundle() -> Option<&'static str> {
+    for path in &[
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/ca-certificates/extracted/tls-ca-bundle.pem",
+    ] {
+        if std::path::Path::new(path).exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// HTTPS learn → run round-trip: --http-inject-ca is written to [config] and
+/// picked up automatically by sandlock run without any extra flags.
+/// - the learned HTTPS path is allowed
+/// - an unlearned path is blocked (403 from proxy)
+#[test]
+fn test_learn_then_run_https() {
+    let Some(ca_bundle) = system_ca_bundle() else {
+        eprintln!("skipping test_learn_then_run_https: no system CA bundle found");
+        return;
+    };
+
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+    let port = spawn_http_server();
+    let url_learned = format!("http://127.0.0.1:{port}/data");
+    let url_other   = format!("http://127.0.0.1:{port}/other");
+    let port_str = port.to_string();
+
+    let learn = sandlock_bin()
+        .args([
+            "learn", "-o", &profile_path,
+            "--learn-http",
+            "--http-inject-ca", ca_bundle,
+            "--http-port", &port_str,
+            "--", "curl", "-sf", &url_learned,
+        ])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(learn.status.success(),
+        "learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+
+    let profile_content = std::fs::read_to_string(&profile_path).expect("read profile");
+    assert!(profile_content.contains("http_inject_ca"),
+        "profile must record http_inject_ca in [config]: {profile_content}");
+    assert!(profile_content.contains("/data"),
+        "profile must record /data in [http].allow: {profile_content}");
+
+    // Allowed: sandlock run picks up http_inject_ca from [config], no extra flags.
+    let run_allow = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "curl", "-s", &url_learned])
+        .output()
+        .expect("failed to run sandlock run (allow)");
+    assert!(run_allow.status.success(),
+        "run failed for learned path: {}", String::from_utf8_lossy(&run_allow.stderr));
+    assert_eq!(String::from_utf8_lossy(&run_allow.stdout).trim(), "ok",
+        "expected 'ok' from test server for learned path");
+
+    // Blocked: unlearned path returns 403.
+    let run_deny = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "curl", "-sf", &url_other])
+        .output()
+        .expect("failed to run sandlock run (deny)");
+    assert!(!run_deny.status.success(),
+        "run should have been blocked for non-learned path /other");
+}
