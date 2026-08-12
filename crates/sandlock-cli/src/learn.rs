@@ -562,6 +562,16 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     for port in &args.http_port {
         builder = builder.http_port(*port);
     }
+    if let Some(ref out) = args.http_ca_out {
+        builder = builder.http_ca_out(out);
+    }
+    for spec in &args.env_vars {
+        if let Some((k, v)) = spec.split_once('=') {
+            builder = builder.env_var(k, v);
+        } else {
+            return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
+        }
+    }
 
     let policy = builder
         .build()
