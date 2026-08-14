@@ -197,6 +197,37 @@ impl ProfileInput {
     }
 }
 
+/// Lazily resolves `${HOME}` so a profile that uses no variables still loads
+/// on a host where home cannot be resolved.
+struct Expander {
+    home: Option<String>,
+}
+
+impl Expander {
+    fn new() -> Self {
+        Self { home: None }
+    }
+
+    fn path(&mut self, field: &str, p: &std::path::Path) -> Result<PathBuf, SandlockError> {
+        Ok(PathBuf::from(self.text(field, &p.to_string_lossy())?))
+    }
+
+    fn text(&mut self, field: &str, s: &str) -> Result<String, SandlockError> {
+        if !s.contains('$') && !s.starts_with('~') {
+            return Ok(s.to_string());
+        }
+        if self.home.is_none() {
+            self.home = Some(crate::expand::resolve_home()?);
+        }
+        crate::expand::expand(s, self.home.as_deref().unwrap()).map_err(|e| match e {
+            SandlockError::Sandbox(crate::error::SandboxError::Invalid(m)) => {
+                SandlockError::Sandbox(crate::error::SandboxError::Invalid(format!("{field}: {m}")))
+            }
+            other => other,
+        })
+    }
+}
+
 /// Convert a parsed `ProfileInput` into a `(Sandbox, ProgramSpec)` pair.
 ///
 /// Forwards each schema section's fields to the corresponding `SandboxBuilder`
@@ -205,14 +236,17 @@ impl ProfileInput {
 /// that lack `FromStr` impls on their target types.
 pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), SandlockError> {
     let mut b = Sandbox::builder();
+    let mut ex = Expander::new();
 
     // [config]
-    if let Some(p) = input.config.http_ca       { b = b.http_ca(p); }
-    if let Some(p) = input.config.http_key      { b = b.http_key(p); }
-    for p in input.config.http_inject_ca       { b = b.http_inject_ca(p); }
-    if let Some(p) = input.config.http_ca_out  { b = b.http_ca_out(p); }
-    if let Some(p) = input.config.fs_storage    { b = b.fs_storage(p); }
-    if let Some(p) = input.config.workdir       { b = b.workdir(p); }
+    if let Some(p) = input.config.http_ca  { b = b.http_ca(ex.path("[config].http_ca", &p)?); }
+    if let Some(p) = input.config.http_key { b = b.http_key(ex.path("[config].http_key", &p)?); }
+    for p in input.config.http_inject_ca.iter() {
+        b = b.http_inject_ca(ex.path("[config].http_inject_ca", p)?);
+    }
+    if let Some(p) = input.config.http_ca_out { b = b.http_ca_out(ex.path("[config].http_ca_out", &p)?); }
+    if let Some(p) = input.config.fs_storage  { b = b.fs_storage(ex.path("[config].fs_storage", &p)?); }
+    if let Some(p) = input.config.workdir     { b = b.workdir(ex.path("[config].workdir", &p)?); }
 
     // [determinism]
     if let Some(s) = input.determinism.random_seed { b = b.random_seed(s); }
@@ -224,7 +258,7 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
 
     // [program] — process knobs go to Sandbox; exec/args go to ProgramSpec.
     for (k, v) in input.program.env.iter() { b = b.env_var(k, v); }
-    if let Some(c) = input.program.cwd             { b = b.cwd(c); }
+    if let Some(c) = input.program.cwd             { b = b.cwd(ex.path("[program].cwd", &c)?); }
     match (input.program.uid, input.program.gid) {
         (Some(u), Some(g)) => b = b.user(u, g),
         (None, None) => {}
@@ -237,12 +271,16 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     if input.program.no_huge_pages                 { b = b.no_huge_pages(true); }
 
     // [filesystem]
-    for p in input.filesystem.read.iter()  { b = b.fs_read(p); }
-    for p in input.filesystem.write.iter() { b = b.fs_write(p); }
-    for p in input.filesystem.deny.iter()  { b = b.fs_deny(p); }
-    if let Some(c) = input.filesystem.chroot         { b = b.chroot(c); }
+    for p in input.filesystem.read.iter()  { b = b.fs_read(ex.path("[filesystem].read", p)?); }
+    for p in input.filesystem.write.iter() { b = b.fs_write(ex.path("[filesystem].write", p)?); }
+    for p in input.filesystem.deny.iter()  { b = b.fs_deny(ex.path("[filesystem].deny", p)?); }
+    if let Some(c) = input.filesystem.chroot { b = b.chroot(ex.path("[filesystem].chroot", &c)?); }
     for spec in input.filesystem.mount.iter() {
         let (virt, host, read_only) = parse_mount_spec(spec)?;
+        // Expand after the split so a resolved value containing a colon
+        // cannot be read as a spec separator.
+        let virt = ex.path("[filesystem].mount", &virt)?;
+        let host = ex.path("[filesystem].mount", &host)?;
         b = if read_only { b.fs_mount_ro(virt, host) } else { b.fs_mount(virt, host) };
     }
     if let Some(s) = input.filesystem.on_exit.as_deref()  { b = b.on_exit(parse_branch_action(s)?); }
@@ -292,8 +330,12 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     if let Some(c) = input.limits.cpu_cores    { b = b.cpu_cores(c); }
     if let Some(n) = input.limits.num_cpus             { b = b.num_cpus(n); }
 
+    let exec = match input.program.exec {
+        Some(p) => Some(ex.path("[program].exec", &p)?),
+        None => None,
+    };
     let policy = b.build()?;
-    let spec = ProgramSpec { exec: input.program.exec, args: input.program.args };
+    let spec = ProgramSpec { exec, args: input.program.args };
     Ok((policy, spec))
 }
 
@@ -619,6 +661,58 @@ pub fn list_profiles() -> Result<Vec<String>, SandlockError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_profile_expands_home_in_path_fields() {
+        let home = crate::expand::resolve_home().unwrap();
+        let toml = r#"
+            [filesystem]
+            read = ["${HOME}/src"]
+            write = ["${HOME}/out"]
+            mount = ["/work:${HOME}/host:ro"]
+
+            [program]
+            cwd = "${HOME}/src"
+            args = ["${HOME}"]
+        "#;
+        let (policy, _spec) = parse_profile(toml).unwrap();
+        assert_eq!(policy.fs_readable, vec![PathBuf::from(format!("{home}/src"))]);
+        assert_eq!(policy.fs_writable, vec![PathBuf::from(format!("{home}/out"))]);
+        assert_eq!(policy.cwd, Some(PathBuf::from(format!("{home}/src"))));
+    }
+
+    #[test]
+    fn parse_profile_leaves_program_args_untouched() {
+        let toml = r#"
+            [program]
+            args = ["${HOME}", "$PATH", "~/x"]
+        "#;
+        let (_policy, spec) = parse_profile(toml).unwrap();
+        assert_eq!(spec.args, vec!["${HOME}", "$PATH", "~/x"]);
+    }
+
+    #[test]
+    fn parse_profile_reports_the_offending_field() {
+        let toml = r#"
+            [filesystem]
+            read = ["${NOPE}/src"]
+        "#;
+        let err = parse_profile(toml).unwrap_err().to_string();
+        assert!(err.contains("[filesystem].read"), "error was {err:?}");
+        assert!(err.contains("unknown variable"), "error was {err:?}");
+    }
+
+    #[test]
+    fn parse_profile_without_variables_never_resolves_home() {
+        // A profile with no variables must load even where HOME cannot be
+        // resolved, so resolution has to stay lazy.
+        let toml = r#"
+            [filesystem]
+            read = ["/usr/lib"]
+        "#;
+        let (policy, _spec) = parse_profile(toml).unwrap();
+        assert_eq!(policy.fs_readable, vec![PathBuf::from("/usr/lib")]);
+    }
 
     #[test]
     fn sandbox_to_profile_hides_cow_upper_grant() {
