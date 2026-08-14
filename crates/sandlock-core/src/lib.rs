@@ -3,6 +3,7 @@ pub mod http;
 pub(crate) mod credential;
 pub mod sandbox;     // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
 pub mod profile;
+pub mod expand;
 pub mod result;
 pub(crate) mod arch;
 pub(crate) mod sys;

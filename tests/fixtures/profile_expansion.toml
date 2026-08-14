@@ -1,0 +1,93 @@
+# Shared expansion cases for the Rust and Python profile loaders.
+# Both implementations must agree on every case here.
+# Each case has `input` plus exactly one of `expect` (success) or
+# `error` (a substring that must appear in the error message).
+
+home = "/home/alice"
+
+[[case]]
+input = "/usr/lib"
+expect = "/usr/lib"
+
+[[case]]
+input = "${HOME}"
+expect = "/home/alice"
+
+[[case]]
+input = "${HOME}/src"
+expect = "/home/alice/src"
+
+[[case]]
+input = "/prefix${HOME}"
+expect = "/prefix/home/alice"
+
+[[case]]
+input = "${HOME}/a/${HOME}/b"
+expect = "/home/alice/a//home/alice/b"
+
+[[case]]
+input = "$$"
+error = "bare $"
+
+[[case]]
+input = "/opt/foo$$bar"
+error = "bare $"
+
+[[case]]
+input = "/opt/~x"
+expect = "/opt/~x"
+
+# Substituted text is never rescanned: a home containing ${HOME} must
+# survive verbatim.
+[[case]]
+input = "${HOME}/x"
+home = "/home/${HOME}"
+expect = "/home/${HOME}/x"
+
+[[case]]
+input = "${UNKNOWN}"
+error = "unknown variable"
+
+[[case]]
+input = "${home}"
+error = "did you mean ${HOME}"
+
+[[case]]
+input = "${Home}"
+error = "did you mean ${HOME}"
+
+[[case]]
+input = "${}"
+error = "malformed variable name"
+
+[[case]]
+input = "${HO-ME}"
+error = "malformed variable name"
+
+[[case]]
+input = "${1FOO}"
+error = "malformed variable name"
+
+[[case]]
+input = "${HOME"
+error = "unterminated"
+
+[[case]]
+input = "$HOME/src"
+error = "write ${HOME}"
+
+[[case]]
+input = "/opt/$"
+error = "bare $"
+
+[[case]]
+input = "~"
+error = "tilde is not expanded"
+
+[[case]]
+input = "~/src"
+error = "tilde is not expanded"
+
+[[case]]
+input = "~alice/src"
+error = "tilde is not expanded"
