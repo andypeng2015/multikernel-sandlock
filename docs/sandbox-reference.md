@@ -261,6 +261,44 @@ fields on `Sandbox`.
 | `no_huge_pages` | `no_huge_pages` | `bool`              | `False` | Disable transparent huge pages via `prctl(PR_SET_THP_DISABLE)`.                                                                                      |
 | `no_supervisor` | `no_supervisor` | `bool`              | `False` | Skip the seccomp user-notification supervisor. The sandbox runs with Landlock + a kernel-only deny filter, without IP allowlisting, resource limits, COW, chroot mediation, `/proc` virtualization, or custom handlers. Required when nesting inside another sandlock (the kernel only allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task). |
 
+## Variable expansion
+
+Path-typed profile fields expand `${HOME}`, which makes a profile portable
+between machines where the username differs.
+
+`${HOME}` resolves to `$HOME` when that is set and absolute, and otherwise to
+the home directory in the passwd entry for the real uid. The environment wins
+because the sandboxed program resolves its own `~` through `$HOME`, so a
+passwd-derived grant could cover a directory the program never opens.
+
+Expansion applies to `[config].http_ca`, `http_key`, `http_inject_ca`,
+`http_ca_out`, `fs_storage`, `workdir`; `[program].exec` and `cwd`; and
+`[filesystem].read`, `write`, `deny`, `chroot`, and both halves of each
+`mount` entry. It never applies to `[program].args` or `[program].env`, where
+a `$` belongs to the sandboxed program, nor to network rules, syscall names,
+or limits.
+
+The grammar is strict, so that adding variables in a later release cannot
+change what an existing profile grants:
+
+| Form | Meaning |
+| ---- | ------- |
+| `${HOME}` | the home directory |
+| `${OTHER}` | error, unknown variable |
+| `${home}` | error, lookup is case-sensitive |
+| `${}`, `${HO-ME}` | error, malformed name (`[A-Za-z_][A-Za-z0-9_]*`) |
+| `${` with no `}` | error, unterminated |
+| `$` anywhere else | error, `${HOME}` is the only meaning `$` can have |
+| leading `~` | error, write `${HOME}` |
+
+A profile cannot express a path whose first character is a literal `~`
+(write it as `./~name` instead), and cannot express a path containing a
+literal `$` at all. `sandlock learn` and `sandlock inspect --toml` emit
+such observed paths verbatim, so a profile generated from a workload that
+touched a `$`-named file fails to load until the entry is removed.
+`sandlock learn --merge` preserves a `${HOME}` you wrote by hand and will
+not add its expanded duplicate.
+
 ## `[filesystem]`
 
 Landlock filesystem rules plus chroot, mount mapping, and COW

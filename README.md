@@ -472,7 +472,7 @@ clean_env = true
 env = { CC = "gcc", LANG = "C.UTF-8" }
 
 [filesystem]
-read = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
+read = ["/usr", "/lib", "/lib64", "/bin", "/etc", "${HOME}/.cargo"]
 write = ["/tmp/work"]
 
 [limits]
@@ -482,6 +482,11 @@ processes = 50
 [syscalls]
 extra_deny = []
 ```
+
+Path fields expand `${HOME}`, so the same profile works on machines with
+different usernames. `${HOME}` is the only variable; anything else, including
+a leading `~`, is a load error. See
+[docs/sandbox-reference.md](docs/sandbox-reference.md) for the full grammar.
 
 ```bash
 sandlock profile list
