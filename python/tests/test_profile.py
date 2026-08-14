@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import textwrap
 
@@ -356,3 +357,79 @@ class TestMergeCliOverrides:
 
 def test_profiles_dir_is_a_path():
     assert profiles_dir().is_absolute() or str(profiles_dir()).startswith("~")
+
+
+class TestExpansion:
+    @staticmethod
+    def _fixture():
+        from pathlib import Path
+
+        # _profile binds `tomllib` to tomli on 3.10, so reuse its binding
+        # rather than importing tomllib directly.
+        from sandlock._profile import tomllib
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "tests"
+            / "fixtures"
+            / "profile_expansion.toml"
+        )
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+
+    def test_shared_fixture_cases(self):
+        from sandlock._profile import _expand
+
+        data = self._fixture()
+        default_home = data["home"]
+        for case in data["case"]:
+            home = case.get("home", default_home)
+            if "expect" in case:
+                assert _expand(case["input"], home) == case["expect"], case["input"]
+            else:
+                with pytest.raises(PolicyError) as exc:
+                    _expand(case["input"], home)
+                assert case["error"] in str(exc.value), case["input"]
+
+    def test_path_fields_expand(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/alice")
+        p = policy_from_dict(
+            {
+                "filesystem": {
+                    "read": ["${HOME}/src"],
+                    "mount": ["/work:${HOME}/host"],
+                },
+                "program": {"cwd": "${HOME}/src"},
+            }
+        )
+        assert p.fs_readable == ["/home/alice/src"]
+        assert p.cwd == "/home/alice/src"
+        assert p.fs_mount == {"/work": "/home/alice/host"}
+
+    def test_error_names_the_field(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/alice")
+        with pytest.raises(PolicyError, match=r"\[filesystem\]\.read"):
+            policy_from_dict({"filesystem": {"read": ["${NOPE}"]}})
+
+    def test_no_variables_never_resolves_home(self, monkeypatch):
+        monkeypatch.delenv("HOME", raising=False)
+        p = policy_from_dict({"filesystem": {"read": ["/usr/lib"]}})
+        assert p.fs_readable == ["/usr/lib"]
+
+    def test_absolute_env_home_wins(self, monkeypatch):
+        from sandlock._profile import _resolve_home
+
+        monkeypatch.setenv("HOME", "/env/home")
+        assert _resolve_home() == "/env/home"
+
+    @pytest.mark.parametrize("bad", ["", "relative/home"])
+    def test_non_absolute_env_home_falls_back_to_passwd(self, monkeypatch, bad):
+        import pwd
+
+        from sandlock._profile import _resolve_home
+
+        monkeypatch.setenv("HOME", bad)
+        expected = pwd.getpwuid(os.getuid()).pw_dir
+        if not expected.startswith("/"):
+            pytest.skip("this uid has no absolute passwd home")
+        assert _resolve_home() == expected

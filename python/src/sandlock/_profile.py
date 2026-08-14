@@ -30,6 +30,8 @@ Rust CLI). Each section maps to a subset of ``Sandbox`` fields:
 
 from __future__ import annotations
 
+import os
+import pwd
 import sys
 
 if sys.version_info >= (3, 11):
@@ -115,6 +117,108 @@ _SECTIONS: dict[str, dict[str, tuple[str | None, type]]] = {
 }
 
 
+_VARS = ("HOME",)
+
+# Sandbox attribute names whose values are paths. Program args and env are
+# data belonging to the sandboxed program and are never expanded.
+_PATH_KEYS = frozenset({
+    "http_ca", "http_key", "http_ca_out", "fs_storage", "workdir", "cwd", "chroot",
+})
+_PATH_LIST_KEYS = frozenset({
+    "http_inject_ca", "fs_readable", "fs_writable", "fs_denied",
+})
+
+
+def _resolve_home() -> str:
+    """Resolve ``${HOME}``.
+
+    The environment wins over passwd because the sandboxed program resolves
+    its own ``~`` through ``$HOME``.
+    """
+    env = os.environ.get("HOME")
+    if env and env.startswith("/"):
+        return env
+    try:
+        entry = pwd.getpwuid(os.getuid())
+    except KeyError:
+        entry = None
+    if entry is not None and entry.pw_dir.startswith("/"):
+        return entry.pw_dir
+    raise PolicyError(
+        "cannot resolve ${HOME}: $HOME is unset or not absolute, and this uid "
+        "has no passwd entry with an absolute home directory"
+    )
+
+
+def _well_formed(name: str) -> bool:
+    if not name or not (name[0].isascii() and (name[0].isalpha() or name[0] == "_")):
+        return False
+    return all(c.isascii() and (c.isalnum() or c == "_") for c in name[1:])
+
+
+def _lookup(name: str, home: str, value: str) -> str:
+    if not _well_formed(name):
+        raise PolicyError(
+            f"{value!r}: malformed variable name ${{{name}}}; "
+            "names match [A-Za-z_][A-Za-z0-9_]*"
+        )
+    if name == "HOME":
+        return home
+    suggestion = ""
+    for known in _VARS:
+        if known.lower() == name.lower():
+            suggestion = f"; did you mean ${{{known}}}?"
+            break
+    supported = ", ".join(f"${{{v}}}" for v in _VARS)
+    raise PolicyError(
+        f"{value!r}: unknown variable ${{{name}}}{suggestion}; supported: {supported}"
+    )
+
+
+def _expand(value: str, home: str) -> str:
+    """Expand ``${HOME}`` in one profile path value.
+
+    Every unrecognised form raises, so adding a variable later cannot
+    silently reinterpret a grant written today.
+    """
+    if value.startswith("~"):
+        raise PolicyError(
+            f"{value!r}: tilde is not expanded in profiles; write ${{HOME}} instead"
+        )
+    out: list[str] = []
+    rest = value
+    while True:
+        pos = rest.find("$")
+        if pos < 0:
+            out.append(rest)
+            return "".join(out)
+        out.append(rest[:pos])
+        after = rest[pos + 1:]
+        if after.startswith("{"):
+            tail = after[1:]
+            end = tail.find("}")
+            if end < 0:
+                raise PolicyError(f"{value!r}: unterminated ${{")
+            out.append(_lookup(tail[:end], home, value))
+            rest = tail[end + 1:]
+        else:
+            name = ""
+            for c in after:
+                if c.isascii() and (c.isalnum() or c == "_"):
+                    name += c
+                else:
+                    break
+            if name:
+                raise PolicyError(
+                    f"{value!r}: bare $ is not a variable; write ${{{name}}} "
+                    "for a variable"
+                )
+            raise PolicyError(
+                f"{value!r}: bare $ is not allowed; a literal $ cannot appear "
+                "in a profile path"
+            )
+
+
 def profiles_dir() -> Path:
     """Return the profiles directory path."""
     return _PROFILES_DIR
@@ -181,6 +285,8 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Sandbox:
         )
 
     kwargs: dict[str, Any] = {}
+    # One-element cache so a profile with no variables never resolves home.
+    home: list[str] = []
 
     for section_name, section_data in data.items():
         if not isinstance(section_data, dict):
@@ -205,16 +311,32 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Sandbox:
                     f"{source}: [{section_name}].{toml_key} expected "
                     f"{expected_type.__name__}, got {type(value).__name__}"
                 )
-            value = _coerce(section_name, toml_key, sandbox_key, value, source)
+            value = _coerce(section_name, toml_key, sandbox_key, value, source, home)
             kwargs[sandbox_key] = value
 
     return Sandbox(**kwargs)
 
 
 def _coerce(
-    section: str, toml_key: str, sandbox_key: str, value: Any, source: str
+    section: str, toml_key: str, sandbox_key: str, value: Any, source: str,
+    home: list[str],
 ) -> Any:
     """Per-field value coercion (enums, mount-spec parsing, port lists)."""
+
+    def expand(text: str) -> str:
+        if "$" not in text and not text.startswith("~"):
+            return text
+        if not home:
+            home.append(_resolve_home())
+        try:
+            return _expand(text, home[0])
+        except PolicyError as e:
+            raise PolicyError(f"{source}: [{section}].{toml_key}: {e}") from None
+
+    if sandbox_key in _PATH_KEYS:
+        return expand(value)
+    if sandbox_key in _PATH_LIST_KEYS:
+        return [expand(v) for v in value]
     if sandbox_key in ("on_exit", "on_error"):
         try:
             return BranchAction(value)
@@ -275,7 +397,9 @@ def _coerce(
                     f"{source}: [{section}].{toml_key} entry {spec!r} "
                     "requires both VIRTUAL and HOST to be non-empty"
                 )
-            mount[virt] = host
+            # Expand after the split so a resolved value containing a colon
+            # cannot be read as a spec separator.
+            mount[expand(virt)] = expand(host)
         return mount
     if sandbox_key == "net_allow_bind":
         # Coerce TOML integers to strings for port specs (existing behaviour).
