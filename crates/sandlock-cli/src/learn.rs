@@ -3,7 +3,7 @@
 //! Runs a workload under observation and emits a sandlock profile TOML
 //! usable by `sandlock run -p`.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -702,7 +702,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     // TODO: learn limits.open_files via supervisor once open_files enforcement is implemented.
 
     // --merge: union observed profile into an existing one.
-    // Start from the existing profile so all fields we don't observe 
+    // Start from the existing profile so all fields we don't observe
     // are preserved. Then union in the observed fields.
     if let Some(ref merge_path) = args.merge {
         let existing_toml = std::fs::read_to_string(merge_path)
@@ -714,19 +714,42 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         let observed = profile_out;
         profile_out = existing.clone();
 
-        // Union filesystem paths, re-run dedup after merging.
-        let merged_reads: Vec<PathBuf> = {
-            let mut set: BTreeSet<PathBuf> = observed.filesystem.read.iter().cloned().collect();
-            set.extend(existing.filesystem.read.iter().cloned());
-            dedup_subsumed(set.into_iter().collect())
+        // Union filesystem paths, re-run dedup after merging. Dedup keys on
+        // the expanded path but writes back the raw entry, so a profile's
+        // ${HOME} survives instead of being replaced by this machine's
+        // absolute path.
+        let mut home: Option<String> = None;
+        let mut expand_key = |p: &PathBuf| -> Result<PathBuf> {
+            let s = p.to_string_lossy();
+            if !s.contains('$') {
+                return Ok(p.clone());
+            }
+            if home.is_none() {
+                home = Some(sandlock_core::expand::resolve_home()?);
+            }
+            // Observed kernel paths can contain a literal $, which the grammar
+            // rejects; key them raw so an odd filename cannot abort the merge.
+            match sandlock_core::expand::expand(&s, home.as_deref().unwrap()) {
+                Ok(e) => Ok(PathBuf::from(e)),
+                Err(_) => Ok(p.clone()),
+            }
         };
-        let merged_writes: Vec<PathBuf> = {
-            let mut set: BTreeSet<PathBuf> = observed.filesystem.write.iter().cloned().collect();
-            set.extend(existing.filesystem.write.iter().cloned());
-            dedup_subsumed(set.into_iter().collect())
+        let mut merge_paths = |observed: &[PathBuf], existing: &[PathBuf]| -> Result<Vec<PathBuf>> {
+            let mut by_expanded: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+            for p in observed {
+                by_expanded.insert(expand_key(p)?, p.clone());
+            }
+            // Existing entries land second so their raw spelling wins.
+            for p in existing {
+                by_expanded.insert(expand_key(p)?, p.clone());
+            }
+            let kept = dedup_subsumed(by_expanded.keys().cloned().collect());
+            Ok(kept.into_iter().map(|k| by_expanded[&k].clone()).collect())
         };
-        profile_out.filesystem.read = merged_reads;
-        profile_out.filesystem.write = merged_writes;
+        profile_out.filesystem.read =
+            merge_paths(&observed.filesystem.read, &existing.filesystem.read)?;
+        profile_out.filesystem.write =
+            merge_paths(&observed.filesystem.write, &existing.filesystem.write)?;
 
         // Union network.allow.
         let mut allow_set: std::collections::BTreeSet<String> =
