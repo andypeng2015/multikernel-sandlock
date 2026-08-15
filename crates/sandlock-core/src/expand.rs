@@ -32,15 +32,24 @@ pub fn resolve_home() -> Result<String, SandlockError> {
 /// mutating the process environment.
 fn resolve_home_from(env: Option<&str>, passwd: Option<&str>) -> Result<String, SandlockError> {
     for candidate in [env, passwd].into_iter().flatten() {
-        if candidate.starts_with('/') {
+        if is_usable_home(candidate) {
             return Ok(candidate.to_string());
         }
     }
     Err(invalid(
-        "cannot resolve ${HOME}: $HOME is unset or not absolute, and this uid \
-         has no passwd entry with an absolute home directory"
+        "cannot resolve ${HOME}: $HOME is unset, not absolute, or is the \
+         filesystem root, and this uid has no passwd entry with a usable home \
+         directory"
             .to_string(),
     ))
+}
+
+/// `/` is rejected alongside the relative and empty cases: it is nobody's home,
+/// and expanding it would turn `write = ["${HOME}"]` into a grant over the
+/// entire filesystem, which is the one thing a sandbox must never hand out by
+/// accident.
+fn is_usable_home(dir: &str) -> bool {
+    dir.starts_with('/') && !dir.trim_end_matches('/').is_empty()
 }
 
 /// Expand `${HOME}` in one profile path value.
@@ -181,6 +190,26 @@ mod tests {
                 "env {env:?}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_home_refuses_the_filesystem_root() {
+        // `/` is absolute but is nobody's home, and expanding it would turn
+        // `write = ["${HOME}"]` into a grant over the whole filesystem.
+        for env in [Some("/"), Some("//")] {
+            assert_eq!(
+                resolve_home_from(env, Some("/passwd/home")).unwrap(),
+                "/passwd/home",
+                "env {env:?}"
+            );
+            assert!(resolve_home_from(env, Some("/")).is_err(), "env {env:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_home_keeps_a_trailing_slash_home() {
+        // Only the all-slashes case is meaningless; `/root/` is a real home.
+        assert_eq!(resolve_home_from(Some("/root/"), None).unwrap(), "/root/");
     }
 
     #[test]

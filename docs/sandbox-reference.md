@@ -266,10 +266,19 @@ fields on `Sandbox`.
 Path-typed profile fields expand `${HOME}`, which makes a profile portable
 between machines where the username differs.
 
-`${HOME}` resolves to `$HOME` when that is set and absolute, and otherwise to
-the home directory in the passwd entry for the real uid. The environment wins
-because the sandboxed program resolves its own `~` through `$HOME`, so a
-passwd-derived grant could cover a directory the program never opens.
+`${HOME}` is the home directory of whoever runs sandlock: `$HOME` when that is
+usable, and otherwise the home directory in the passwd entry for the real uid.
+The environment wins because the sandboxed program resolves its own `~` through
+`$HOME`, so a passwd-derived grant could cover a directory the program never
+opens. A usable home is an absolute path other than the filesystem root: `/` is
+nobody's home, and `write = ["${HOME}"]` would otherwise become a grant over
+everything. If neither source is usable, loading the profile fails.
+
+Under `[filesystem].chroot`, `${HOME}` in a path field is an error. Paths there
+name the jail rather than the host, so expanding a host home would build the
+rule from a directory that does not exist inside it, and Landlock would skip
+the rule in silence. Jail layouts do not vary by username, so write the path
+as it exists inside the jail.
 
 Expansion applies to `[config].http_ca`, `http_key`, `http_inject_ca`,
 `http_ca_out`, `fs_storage`, `workdir`; `[program].exec` and `cwd`; and

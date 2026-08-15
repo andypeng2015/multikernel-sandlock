@@ -422,6 +422,41 @@ class TestExpansion:
         monkeypatch.setenv("HOME", "/env/home")
         assert _resolve_home() == "/env/home"
 
+    @pytest.mark.parametrize("bad", ["/", "//"])
+    def test_root_env_home_falls_back_to_passwd(self, monkeypatch, bad):
+        # `/` is absolute but is nobody's home, and expanding it would turn
+        # write = ["${HOME}"] into a grant over the whole filesystem.
+        import pwd
+
+        from sandlock._profile import _resolve_home
+
+        monkeypatch.setenv("HOME", bad)
+        expected = pwd.getpwuid(os.getuid()).pw_dir
+        if not expected.startswith("/") or expected.rstrip("/") == "":
+            pytest.skip("this uid has no usable passwd home")
+        assert _resolve_home() == expected
+
+    def test_trailing_slash_home_is_kept(self, monkeypatch):
+        # Only the all-slashes case is meaningless; `/root/` is a real home.
+        from sandlock._profile import _resolve_home
+
+        monkeypatch.setenv("HOME", "/root/")
+        assert _resolve_home() == "/root/"
+
+    def test_home_under_chroot_is_an_error(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/env/home")
+        with pytest.raises(PolicyError, match="chroot"):
+            policy_from_dict(
+                {"filesystem": {"chroot": "/jail", "read": ["${HOME}/src"]}}
+            )
+
+    def test_chroot_without_variables_still_loads(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/env/home")
+        p = policy_from_dict(
+            {"filesystem": {"chroot": "/jail", "read": ["/usr/lib"]}}
+        )
+        assert p.chroot == "/jail"
+
     @pytest.mark.parametrize("bad", ["", "relative/home"])
     def test_non_absolute_env_home_falls_back_to_passwd(self, monkeypatch, bad):
         import pwd

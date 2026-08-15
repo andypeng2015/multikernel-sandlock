@@ -200,12 +200,15 @@ impl ProfileInput {
 /// Lazily resolves `${HOME}` so a profile that uses no variables still loads
 /// on a host where home cannot be resolved.
 struct Expander {
+    /// Under chroot the grants are relative to the jail, so the only home
+    /// sandlock can see is in the wrong namespace.
+    chroot: bool,
     home: Option<String>,
 }
 
 impl Expander {
-    fn new() -> Self {
-        Self { home: None }
+    fn new(chroot: bool) -> Self {
+        Self { chroot, home: None }
     }
 
     fn path(&mut self, field: &str, p: &std::path::Path) -> Result<PathBuf, SandlockError> {
@@ -215,6 +218,17 @@ impl Expander {
     fn text(&mut self, field: &str, s: &str) -> Result<String, SandlockError> {
         if !s.contains('$') && !s.starts_with('~') {
             return Ok(s.to_string());
+        }
+        if self.chroot {
+            // Expanding anyway builds the rule from a host path that does not
+            // exist in the jail, and Landlock then skips it in silence.
+            return Err(SandlockError::Sandbox(crate::error::SandboxError::Invalid(
+                format!(
+                    "{field}: {s:?}: ${{HOME}} cannot be expanded under \
+                     [filesystem].chroot, where paths name the jail rather than \
+                     the host. Write the path as it exists inside the jail"
+                ),
+            )));
         }
         if self.home.is_none() {
             self.home = Some(crate::expand::resolve_home()?);
@@ -236,7 +250,7 @@ impl Expander {
 /// that lack `FromStr` impls on their target types.
 pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), SandlockError> {
     let mut b = Sandbox::builder();
-    let mut ex = Expander::new();
+    let mut ex = Expander::new(input.filesystem.chroot.is_some());
 
     // [config]
     if let Some(p) = input.config.http_ca  { b = b.http_ca(ex.path("[config].http_ca", &p)?); }
@@ -661,6 +675,31 @@ pub fn list_profiles() -> Result<Vec<String>, SandlockError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_profile_refuses_home_under_chroot() {
+        // Grants are relative to the jail, so a host home is the wrong
+        // namespace: Landlock would drop the rule without a word.
+        let toml = r#"
+            [filesystem]
+            chroot = "/jail"
+            read = ["${HOME}/src"]
+        "#;
+        let err = parse_profile(toml).unwrap_err().to_string();
+        assert!(err.contains("[filesystem].read"), "error was {err:?}");
+        assert!(err.contains("chroot"), "error was {err:?}");
+    }
+
+    #[test]
+    fn parse_profile_allows_chroot_without_variables() {
+        let toml = r#"
+            [filesystem]
+            chroot = "/jail"
+            read = ["/usr/lib"]
+        "#;
+        let (policy, _spec) = parse_profile(toml).unwrap();
+        assert_eq!(policy.chroot, Some(PathBuf::from("/jail")));
+    }
 
     #[test]
     fn parse_profile_expands_home_in_path_fields() {

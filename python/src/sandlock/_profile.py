@@ -136,18 +136,29 @@ def _resolve_home() -> str:
     its own ``~`` through ``$HOME``.
     """
     env = os.environ.get("HOME")
-    if env and env.startswith("/"):
+    if env and _usable_home(env):
         return env
     try:
         entry = pwd.getpwuid(os.getuid())
     except KeyError:
         entry = None
-    if entry is not None and entry.pw_dir.startswith("/"):
+    if entry is not None and _usable_home(entry.pw_dir):
         return entry.pw_dir
     raise PolicyError(
-        "cannot resolve ${HOME}: $HOME is unset or not absolute, and this uid "
-        "has no passwd entry with an absolute home directory"
+        "cannot resolve ${HOME}: $HOME is unset, not absolute, or is the "
+        "filesystem root, and this uid has no passwd entry with a usable "
+        "home directory"
     )
+
+
+def _usable_home(directory: str) -> bool:
+    """Reject ``/`` alongside the relative and empty cases.
+
+    It is nobody's home, and expanding it would turn ``write = ["${HOME}"]``
+    into a grant over the entire filesystem, which is the one thing a sandbox
+    must never hand out by accident.
+    """
+    return directory.startswith("/") and directory.rstrip("/") != ""
 
 
 def _well_formed(name: str) -> bool:
@@ -287,6 +298,8 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Sandbox:
     kwargs: dict[str, Any] = {}
     # One-element cache so a profile with no variables never resolves home.
     home: list[str] = []
+    filesystem = data.get("filesystem")
+    chroot = isinstance(filesystem, dict) and "chroot" in filesystem
 
     for section_name, section_data in data.items():
         if not isinstance(section_data, dict):
@@ -311,7 +324,9 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Sandbox:
                     f"{source}: [{section_name}].{toml_key} expected "
                     f"{expected_type.__name__}, got {type(value).__name__}"
                 )
-            value = _coerce(section_name, toml_key, sandbox_key, value, source, home)
+            value = _coerce(
+                section_name, toml_key, sandbox_key, value, source, home, chroot
+            )
             kwargs[sandbox_key] = value
 
     return Sandbox(**kwargs)
@@ -319,13 +334,22 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Sandbox:
 
 def _coerce(
     section: str, toml_key: str, sandbox_key: str, value: Any, source: str,
-    home: list[str],
+    home: list[str], chroot: bool,
 ) -> Any:
     """Per-field value coercion (enums, mount-spec parsing, port lists)."""
 
     def expand(text: str) -> str:
         if "$" not in text and not text.startswith("~"):
             return text
+        if chroot:
+            # Expanding anyway builds the rule from a host path that does not
+            # exist in the jail, and Landlock then skips it in silence.
+            raise PolicyError(
+                f"{source}: [{section}].{toml_key}: {text!r}: ${{HOME}} cannot "
+                "be expanded under [filesystem].chroot, where paths name the "
+                "jail rather than the host. Write the path as it exists inside "
+                "the jail"
+            )
         if not home:
             home.append(_resolve_home())
         try:
