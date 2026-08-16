@@ -182,10 +182,6 @@ impl AclService {
         let host = authority.host().to_string();
         let path = req.uri().path().to_string();
 
-        if let Some(ref f) = self.log_fn {
-            f(&method, &host, &path);
-        }
-
         if !self.verify_host(&client_addr, &host).await {
             if let Ok(mut m) = self.orig_dest.write() {
                 m.remove(&client_addr);
@@ -197,6 +193,10 @@ impl AclService {
         }
         if let Ok(mut m) = self.orig_dest.write() {
             m.remove(&client_addr);
+        }
+
+        if let Some(ref f) = self.log_fn {
+            f(&method, &host, &path);
         }
 
         if !http_acl_check(&self.allow, &self.deny, &method, &host, &path) {
