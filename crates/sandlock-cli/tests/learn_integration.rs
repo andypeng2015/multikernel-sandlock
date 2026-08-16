@@ -574,3 +574,61 @@ fn test_learn_then_run_https() {
     assert!(!run_deny.status.success(),
         "run should have been blocked for non-learned path /other");
 }
+
+/// --merge carries [http].allow and [http].ports from the observed run into the
+/// existing profile.
+#[test]
+fn test_learn_then_run_merge_http() {
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+    let port = spawn_http_server();
+    let url_a     = format!("http://127.0.0.1:{port}/path_a");
+    let url_b     = format!("http://127.0.0.1:{port}/path_b");
+    let url_other = format!("http://127.0.0.1:{port}/other");
+    let port_str  = port.to_string();
+
+    // Run 1: learn /path_a.
+    let learn1 = sandlock_bin()
+        .args(["learn", "-o", &profile_path, "--http-port", &port_str,
+               "--", "curl", "-sf", &url_a])
+        .output()
+        .expect("failed to run sandlock learn (run 1)");
+    assert!(learn1.status.success(),
+        "learn run 1 failed: {}", String::from_utf8_lossy(&learn1.stderr));
+
+    // Run 2: merge, learn /path_b.
+    let learn2 = sandlock_bin()
+        .args(["learn", "--merge", &profile_path, "--http-port", &port_str,
+               "--", "curl", "-sf", &url_b])
+        .output()
+        .expect("failed to run sandlock learn --merge (run 2)");
+    assert!(learn2.status.success(),
+        "learn run 2 (merge) failed: {}", String::from_utf8_lossy(&learn2.stderr));
+
+    let merged = std::fs::read_to_string(&profile_path).expect("read merged profile");
+    assert!(merged.contains("/path_a"), "merged profile must contain /path_a: {merged}");
+    assert!(merged.contains("/path_b"), "merged profile must contain /path_b: {merged}");
+
+    // Both learned paths are allowed.
+    let run_a = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "curl", "-s", &url_a])
+        .output()
+        .expect("failed to run sandlock run (path_a)");
+    assert!(run_a.status.success(),
+        "run failed for /path_a: {}", String::from_utf8_lossy(&run_a.stderr));
+
+    let run_b = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "curl", "-s", &url_b])
+        .output()
+        .expect("failed to run sandlock run (path_b)");
+    assert!(run_b.status.success(),
+        "run failed for /path_b: {}", String::from_utf8_lossy(&run_b.stderr));
+
+    // Unlearned path is blocked.
+    let run_deny = sandlock_bin()
+        .args(["run", "--profile-file", &profile_path, "--", "curl", "-sf", &url_other])
+        .output()
+        .expect("failed to run sandlock run (deny)");
+    assert!(!run_deny.status.success(),
+        "run should have been blocked for non-learned path /other");
+}

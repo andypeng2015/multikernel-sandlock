@@ -755,6 +755,22 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         profile_out.limits.memory = max_bytesize(existing.limits.memory.as_deref(), observed.limits.memory.as_deref());
         profile_out.limits.processes = max_opt(existing.limits.processes, observed.limits.processes);
         profile_out.limits.open_files = max_opt(existing.limits.open_files, observed.limits.open_files);
+
+        // Union http.allow, http.ports, and config.http_inject_ca.
+        let mut http_allow_set: std::collections::BTreeSet<String> =
+            observed.http.allow.iter().cloned().collect();
+        http_allow_set.extend(existing.http.allow.iter().cloned());
+        profile_out.http.allow = http_allow_set.into_iter().collect();
+
+        let mut http_ports_set: std::collections::BTreeSet<u16> =
+            observed.http.ports.iter().cloned().collect();
+        http_ports_set.extend(existing.http.ports.iter().cloned());
+        profile_out.http.ports = http_ports_set.into_iter().collect();
+
+        let mut ca_set: std::collections::BTreeSet<std::path::PathBuf> =
+            observed.config.http_inject_ca.iter().cloned().collect();
+        ca_set.extend(existing.config.http_inject_ca.iter().cloned());
+        profile_out.config.http_inject_ca = ca_set.into_iter().collect();
     }
 
     let kernel = std::fs::read_to_string("/proc/version")
