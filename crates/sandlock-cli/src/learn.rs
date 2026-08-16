@@ -527,8 +527,6 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let observer = LearnObserver::new();
     let observer_cb = observer.clone();
 
-    let want_http = args.learn_http;
-
     let mut builder = Sandbox::builder()
         // Name + mode mark this as a learning sandbox in `sandlock ps`: the
         // observation policy below (read "/", allow-all network) would
@@ -548,14 +546,12 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .max_memory(sandlock_core::sandbox::ByteSize(1 << 43)) // 8 TiB
         .policy_fn(move |event, _ctx| observer_cb.on_event(event));
 
-    if want_http {
-        let http_requests_cb = Arc::clone(&observer.http_requests);
-        let http_log: Arc<dyn Fn(&str, &str, &str) + Send + Sync> =
-            Arc::new(move |method, host, path| {
-                http_requests_cb.lock().unwrap().insert(format!("{method} {host}{path}"));
-            });
-        builder = builder.http_log_fn(http_log);
-    }
+    let http_requests_cb = Arc::clone(&observer.http_requests);
+    let http_log: Arc<dyn Fn(&str, &str, &str) + Send + Sync> =
+        Arc::new(move |method, host, path| {
+            http_requests_cb.lock().unwrap().insert(format!("{method} {host}{path}"));
+        });
+    builder = builder.http_log_fn(http_log);
     for path in &args.http_inject_ca {
         builder = builder.http_inject_ca(path);
     }

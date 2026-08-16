@@ -844,7 +844,7 @@ fn test_learn_captures_http_request() {
     let url = format!("http://127.0.0.1:{port}/hello");
 
     let output = sandlock_bin()
-        .args(["learn", "--learn-http", "--http-port", &port.to_string(), "--", "curl", "-sf", &url])
+        .args(["learn", "--http-port", &port.to_string(), "--", "curl", "-sf", &url])
         .output()
         .expect("failed to run sandlock learn");
     assert!(output.status.success(),
@@ -869,7 +869,7 @@ fn test_learn_captures_http_multiple_paths() {
     let cmd = format!("curl -sf {url_a} && curl -sf {url_b} && curl -sf {url_a}");
 
     let output = sandlock_bin()
-        .args(["learn", "--learn-http", "--http-port", &port.to_string(), "--", "sh", "-c", &cmd])
+        .args(["learn", "--http-port", &port.to_string(), "--", "sh", "-c", &cmd])
         .output()
         .expect("failed to run sandlock learn");
     assert!(output.status.success(),
@@ -912,7 +912,6 @@ fn test_learn_captures_https_request() {
     let output = sandlock_bin()
         .args([
             "learn",
-            "--learn-http",
             "--http-inject-ca", ca_bundle,
             "--http-port", &port.to_string(),
             "--", "curl", "-sf", &url,

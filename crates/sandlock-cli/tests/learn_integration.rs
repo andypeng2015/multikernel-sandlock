@@ -475,7 +475,7 @@ fn test_learn_then_run_http() {
 
     // Learn only GET /data.
     let learn = sandlock_bin()
-        .args(["learn", "-o", &profile_path, "--learn-http", "--http-port", &port_str,
+        .args(["learn", "-o", &profile_path, "--http-port", &port_str,
                "--", "curl", "-sf", &url_learned])
         .output()
         .expect("failed to run sandlock learn");
@@ -541,7 +541,6 @@ fn test_learn_then_run_https() {
     let learn = sandlock_bin()
         .args([
             "learn", "-o", &profile_path,
-            "--learn-http",
             "--http-inject-ca", ca_bundle,
             "--http-port", &port_str,
             "--", "curl", "-sf", &url_learned,
