@@ -858,6 +858,24 @@ fn test_learn_captures_http_request() {
     assert!(profile.contains("/hello"), "expected /hello path in [http].allow: {profile}");
 }
 
+/// --http-port writes only the intercepted port to [http].ports, not port 80.
+#[test]
+fn test_learn_http_port_not_inflated() {
+    let port = spawn_http_server();
+    let url = format!("http://127.0.0.1:{port}/hello");
+
+    let output = sandlock_bin()
+        .args(["learn", "--http-port", &port.to_string(), "--", "curl", "-sf", &url])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "learn failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let profile = String::from_utf8_lossy(&output.stdout);
+    assert!(profile.contains(&format!("ports = [{}]", port)),
+        "expected only port {port} in [http].ports, got: {profile}");
+}
+
 /// Multiple distinct requests to different paths are all recorded and deduplicated.
 #[test]
 fn test_learn_captures_http_multiple_paths() {

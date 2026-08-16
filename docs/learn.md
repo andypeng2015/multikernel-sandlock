@@ -67,7 +67,7 @@ and guarded paths. A warning and diff are still printed.
 
 ## HTTP/HTTPS observation
 
-The transparent proxy always runs in logging-only mode during `sandlock learn`. Method, host, and path of every request are recorded as `[http].allow` rules. Port 80 is always intercepted; port 443 requires `--http-inject-ca` (sandlock splices an ephemeral CA into the named bundle at `open()` time); non-standard ports use `--http-port`. The inject-ca path is written to `[config].http_inject_ca` so `sandlock run` picks it up automatically. `[http].deny` rules are not learned.
+The transparent proxy always runs in logging-only mode during `sandlock learn`. Method, host, and path of every request are recorded as `[http].allow` rules. By default port 80 is intercepted; port 443 requires `--http-inject-ca` (sandlock splices an ephemeral CA into the named bundle at `open()` time); passing `--http-port` overrides the default and intercepts only the specified ports. The inject-ca path is written to `[config].http_inject_ca` so `sandlock run` picks it up automatically. `[http].deny` rules are not learned.
 
 ## Tests
 

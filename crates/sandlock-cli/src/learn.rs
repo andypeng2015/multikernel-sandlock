@@ -677,13 +677,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     let http_reqs: Vec<String> = observer.http_requests.lock().unwrap().iter().cloned().collect();
     if !http_reqs.is_empty() {
-        // Ports: always include 80; add 443 when --http-inject-ca was given; add any --http-port extras.
-        let mut ports = vec![80u16];
-        if !args.http_inject_ca.is_empty() { ports.push(443); }
-        for &p in &args.http_port {
-            if !ports.contains(&p) { ports.push(p); }
-        }
-        profile_out.http.ports = ports;
+        profile_out.http.ports = sandbox.http_ports.clone();
         profile_out.http.allow = http_reqs;
         profile_out.config.http_inject_ca = args.http_inject_ca.clone();
     }
