@@ -624,6 +624,11 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let first_exe = observer.first_exe.lock().unwrap().clone();
     profile_out.program.exec = first_exe.or_else(|| Some(PathBuf::from(&args.cmd[0])));
     profile_out.program.args = args.cmd[1..].to_vec();
+    for spec in &args.env_vars {
+        if let Some((k, v)) = spec.split_once('=') {
+            profile_out.program.env.insert(k.to_string(), v.to_string());
+        }
+    }
 
     let reads_raw: Vec<PathBuf> = observer.reads.lock().unwrap().iter()
         .filter(|p| p.exists() && !is_junk_path(p))
@@ -680,6 +685,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         profile_out.http.ports = sandbox.http_ports.clone();
         profile_out.http.allow = http_reqs;
         profile_out.config.http_inject_ca = args.http_inject_ca.clone();
+        profile_out.config.http_ca_out = args.http_ca_out.clone();
     }
 
     // Fill limits with observed peaks + headroom so the profile is usable with sandlock run.
@@ -765,6 +771,16 @@ pub async fn run(args: LearnArgs) -> Result<()> {
             observed.config.http_inject_ca.iter().cloned().collect();
         ca_set.extend(existing.config.http_inject_ca.iter().cloned());
         profile_out.config.http_inject_ca = ca_set.into_iter().collect();
+
+        // http_ca_out: take from observed when existing has none.
+        if profile_out.config.http_ca_out.is_none() {
+            profile_out.config.http_ca_out = observed.config.http_ca_out;
+        }
+
+        // env: union observed vars into existing, observed wins on conflict.
+        for (k, v) in observed.program.env {
+            profile_out.program.env.insert(k, v);
+        }
     }
 
     let kernel = std::fs::read_to_string("/proc/version")

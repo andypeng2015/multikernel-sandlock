@@ -815,8 +815,8 @@ fn test_learn_symlink_path_canonicalized() {
 
 // ── HTTP learning ─────────────────────────────────────────────────────────────
 
-/// Spawn a minimal HTTP server on an ephemeral port, serve one response,
-/// and return the port. The server accepts one connection then exits.
+/// Spawn a minimal HTTP server on an ephemeral port and return the port.
+/// The server loops over incoming connections, returning a 200 OK for each.
 fn spawn_http_server() -> u16 {
     use std::io::Write;
     use std::net::TcpListener;
@@ -839,7 +839,6 @@ fn spawn_http_server() -> u16 {
 /// A plaintext HTTP request is captured and written as an [http] allow rule.
 #[test]
 fn test_learn_captures_http_request() {
-    use std::io::Read;
     let port = spawn_http_server();
     let url = format!("http://127.0.0.1:{port}/hello");
 
@@ -879,7 +878,6 @@ fn test_learn_http_port_not_inflated() {
 /// Multiple distinct requests to different paths are all recorded and deduplicated.
 #[test]
 fn test_learn_captures_http_multiple_paths() {
-    use std::io::Read;
     let port = spawn_http_server();
     let url_a = format!("http://127.0.0.1:{port}/a");
     let url_b = format!("http://127.0.0.1:{port}/b");
@@ -919,7 +917,6 @@ fn system_ca_bundle() -> Option<&'static str> {
 /// The [config] section records the inject-ca path so sandlock run can replay MITM.
 #[test]
 fn test_learn_captures_https_request() {
-    use std::io::Read;
     let Some(ca_bundle) = system_ca_bundle() else {
         eprintln!("skipping test_learn_captures_https_request: no system CA bundle found");
         return;

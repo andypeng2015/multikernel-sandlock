@@ -247,7 +247,8 @@ struct LearnArgs {
     #[arg(long, value_name = "PATH")]
     http_ca_out: Option<PathBuf>,
 
-    /// Set an environment variable for the observed process (repeatable, KEY=VALUE)
+    /// Set an environment variable for the observed process and record it in the
+    /// profile so sandlock run inherits it (repeatable, KEY=VALUE).
     #[arg(long = "env", value_name = "KEY=VALUE")]
     env_vars: Vec<String>,
 

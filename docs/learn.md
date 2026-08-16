@@ -19,7 +19,9 @@ sandlock learn [options] -- <cmd> [args...]
 | `--collapse-prefix <path>` | none | Force collapse of all paths under prefix (repeatable) |
 | `--force-sensitive-collapse` | off | Allow `--collapse-prefix` to target sensitive paths (requires `--collapse-prefix`) |
 | `--http-inject-ca <path>` | none | System CA bundle path; sandlock splices an ephemeral CA in at `open()` time so HTTPS is intercepted. |
+| `--http-ca-out <path>` | none | Write the ephemeral MITM CA public cert to a file and record the path in the profile. Runtimes with a compiled-in CA store (e.g. Node.js) ignore the system bundle patched by `--http-inject-ca`; pair with `--env NODE_EXTRA_CA_CERTS=<path>` to point the runtime at the cert. |
 | `--http-port <port>` | none | Additional TCP port to intercept (repeatable). |
+| `--env KEY=VALUE` | none | Set an environment variable for the observed process (repeatable). |
 
 ## What is recorded
 
