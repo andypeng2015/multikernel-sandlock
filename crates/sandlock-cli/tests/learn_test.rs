@@ -16,6 +16,7 @@ fn sandlock_bin() -> Command {
 /// all). `-r` maps to a mandatory `fs_read`, so requiring `/lib64` on such a
 /// host aborts confinement; this mirrors `fs_read_if_exists` at the CLI layer.
 /// On hosts that have `/lib64` (x86-64) the arguments pass through unchanged.
+#[allow(dead_code)]
 fn args_for_host(args: &[&str]) -> Vec<String> {
     let has_lib64 = std::path::Path::new("/lib64").exists();
     let mut out: Vec<String> = Vec::with_capacity(args.len());
@@ -913,23 +914,34 @@ fn system_ca_bundle() -> Option<&'static str> {
     None
 }
 
+/// Returns true if host:443 accepts a TCP connection within 3 seconds.
+fn https_reachable(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Ok(mut it) = format!("{host}:443").to_socket_addrs() else { return false };
+    let Some(addr) = it.next() else { return false };
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)).is_ok()
+}
+
 /// HTTPS traffic via --http-inject-ca is captured and written as an [http] allow rule.
-/// The [config] section records the inject-ca path so sandlock run can replay MITM.
+/// Uses a real HTTPS server (example.com) so that TLS termination, MITM cert signing,
+/// CA injection, and proxy forwarding are all exercised end to end.
+/// Skipped if example.com is unreachable or no system CA bundle is found.
 #[test]
 fn test_learn_captures_https_request() {
+    if !https_reachable("example.com") {
+        eprintln!("skipping test_learn_captures_https_request: example.com unreachable");
+        return;
+    }
     let Some(ca_bundle) = system_ca_bundle() else {
         eprintln!("skipping test_learn_captures_https_request: no system CA bundle found");
         return;
     };
-    let port = spawn_http_server();
-    let url = format!("http://127.0.0.1:{port}/secure");
 
     let output = sandlock_bin()
         .args([
             "learn",
             "--http-inject-ca", ca_bundle,
-            "--http-port", &port.to_string(),
-            "--", "curl", "-sf", &url,
+            "--", "curl", "-sf", "https://example.com/",
         ])
         .output()
         .expect("failed to run sandlock learn");
@@ -938,8 +950,10 @@ fn test_learn_captures_https_request() {
 
     let profile = String::from_utf8_lossy(&output.stdout);
     assert!(profile.contains("[http]"), "expected [http] section: {profile}");
-    assert!(profile.contains("/secure"), "expected /secure path in [http].allow: {profile}");
+    assert!(profile.contains("example.com"), "expected example.com in [http].allow: {profile}");
     assert!(profile.contains("[config]"), "expected [config] section: {profile}");
     assert!(profile.contains("http_inject_ca"), "expected http_inject_ca in [config]: {profile}");
     assert!(profile.contains(ca_bundle), "expected ca bundle path in [config]: {profile}");
 }
+
+

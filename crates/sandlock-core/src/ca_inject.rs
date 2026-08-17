@@ -22,9 +22,17 @@ pub(crate) fn combine_bundle(original: &[u8], ca_pem: &[u8]) -> Vec<u8> {
     out
 }
 
-/// True if `resolved` exactly matches one of the user-declared inject paths.
+/// True if `resolved` matches one of the user-declared inject paths.
+/// Follows symlinks on both sides so a symlink path matches a canonical inject path and vice versa.
 pub(crate) fn path_matches(resolved: &Path, inject_paths: &[PathBuf]) -> bool {
-    inject_paths.iter().any(|p| p == resolved)
+    if inject_paths.iter().any(|p| p == resolved) {
+        return true;
+    }
+    // Try canonicalized form to handle symlinks on either side.
+    let canonical = std::fs::canonicalize(resolved).ok();
+    canonical.map_or(false, |c| inject_paths.iter().any(|p| {
+        p == &c || std::fs::canonicalize(p).ok().map_or(false, |cp| cp == c)
+    }))
 }
 
 /// Intercept an open-family syscall targeting a declared trust bundle and
