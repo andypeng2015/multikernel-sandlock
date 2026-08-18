@@ -41,6 +41,9 @@ pub(crate) struct AclService {
     /// so a library/API caller gets the warning once per run instead of per
     /// request. See [`first_cleartext_warn`].
     cleartext_warned: Arc<AtomicBool>,
+    /// Optional observation callback for learn mode. Called with (method, host, path)
+    /// for every request after the host is validated, before the ACL check.
+    pub(crate) log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
 }
 
 /// Whether this cleartext injection should emit the one-per-run warning: true the
@@ -95,6 +98,7 @@ impl AclService {
         inject: Arc<Vec<InjectRule>>,
         orig_dest: OrigDestMap,
         forwarder: Forwarder,
+        log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
     ) -> Self {
         Self {
             allow: Arc::new(allow),
@@ -104,6 +108,7 @@ impl AclService {
             forwarder,
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
             cleartext_warned: Arc::new(AtomicBool::new(false)),
+            log_fn,
         }
     }
 
@@ -188,6 +193,10 @@ impl AclService {
         }
         if let Ok(mut m) = self.orig_dest.write() {
             m.remove(&client_addr);
+        }
+
+        if let Some(ref f) = self.log_fn {
+            f(&method, &host, &path);
         }
 
         if !http_acl_check(&self.allow, &self.deny, &method, &host, &path) {

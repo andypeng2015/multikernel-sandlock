@@ -292,6 +292,9 @@ struct LearnObserver {
     /// would catch the child bootstrap pipe writes before the parent receives
     /// the seccomp listener fd.
     pending_udp_connects: Arc<Mutex<HashMap<(u32, i64), String>>>,
+    /// HTTP requests observed via the transparent proxy (method + host + path).
+    /// Format: "METHOD host/path" matching HttpRule::parse input.
+    http_requests: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl LearnObserver {
@@ -304,6 +307,7 @@ impl LearnObserver {
             pending_maps: Arc::new(Mutex::new(HashSet::new())),
             first_exe: Arc::new(Mutex::new(None)),
             pending_udp_connects: Arc::new(Mutex::new(HashMap::new())),
+            http_requests: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -522,7 +526,8 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     // the real filesystem is untouched and no write is blocked.
     let observer = LearnObserver::new();
     let observer_cb = observer.clone();
-    let policy = Sandbox::builder()
+
+    let mut builder = Sandbox::builder()
         // Name + mode mark this as a learning sandbox in `sandlock ps`: the
         // observation policy below (read "/", allow-all network) would
         // otherwise look like a dangerously permissive run. One learn
@@ -539,7 +544,32 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         .net_allow("*")
         .net_allow("icmp://*")
         .max_memory(sandlock_core::sandbox::ByteSize(1 << 43)) // 8 TiB
-        .policy_fn(move |event, _ctx| observer_cb.on_event(event))
+        .policy_fn(move |event, _ctx| observer_cb.on_event(event));
+
+    let http_requests_cb = Arc::clone(&observer.http_requests);
+    let http_log: Arc<dyn Fn(&str, &str, &str) + Send + Sync> =
+        Arc::new(move |method, host, path| {
+            http_requests_cb.lock().unwrap().insert(format!("{method} {host}{path}"));
+        });
+    builder = builder.http_log_fn(http_log);
+    for path in &args.http_inject_ca {
+        builder = builder.http_inject_ca(path);
+    }
+    for port in &args.http_port {
+        builder = builder.http_port(*port);
+    }
+    if let Some(ref out) = args.http_ca_out {
+        builder = builder.http_ca_out(out);
+    }
+    for spec in &args.env_vars {
+        if let Some((k, v)) = spec.split_once('=') {
+            builder = builder.env_var(k, v);
+        } else {
+            return Err(anyhow!("--env requires KEY=VALUE, got: {}", spec));
+        }
+    }
+
+    let policy = builder
         .build()
         .map_err(|e| anyhow!("failed to build sandbox policy: {e}"))?;
 
@@ -594,6 +624,11 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let first_exe = observer.first_exe.lock().unwrap().clone();
     profile_out.program.exec = first_exe.or_else(|| Some(PathBuf::from(&args.cmd[0])));
     profile_out.program.args = args.cmd[1..].to_vec();
+    for spec in &args.env_vars {
+        if let Some((k, v)) = spec.split_once('=') {
+            profile_out.program.env.insert(k.to_string(), v.to_string());
+        }
+    }
 
     let reads_raw: Vec<PathBuf> = observer.reads.lock().unwrap().iter()
         .filter(|p| p.exists() && !is_junk_path(p))
@@ -644,6 +679,14 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     profile_out.network.allow_bind = observer.binds.lock().unwrap().iter()
         .map(|&p| sandlock_core::profile::PortSpec::Port(p))
         .collect();
+
+    let http_reqs: Vec<String> = observer.http_requests.lock().unwrap().iter().cloned().collect();
+    if !http_reqs.is_empty() {
+        profile_out.http.ports = sandbox.http_ports.clone();
+        profile_out.http.allow = http_reqs;
+        profile_out.config.http_inject_ca = args.http_inject_ca.clone();
+        profile_out.config.http_ca_out = args.http_ca_out.clone();
+    }
 
     // Fill limits with observed peaks + headroom so the profile is usable with sandlock run.
     // Memory: tracked via the sentinel max_memory in the builder, which activates handle_memory
@@ -712,6 +755,32 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         profile_out.limits.memory = max_bytesize(existing.limits.memory.as_deref(), observed.limits.memory.as_deref());
         profile_out.limits.processes = max_opt(existing.limits.processes, observed.limits.processes);
         profile_out.limits.open_files = max_opt(existing.limits.open_files, observed.limits.open_files);
+
+        // Union http.allow, http.ports, and config.http_inject_ca.
+        let mut http_allow_set: std::collections::BTreeSet<String> =
+            observed.http.allow.iter().cloned().collect();
+        http_allow_set.extend(existing.http.allow.iter().cloned());
+        profile_out.http.allow = http_allow_set.into_iter().collect();
+
+        let mut http_ports_set: std::collections::BTreeSet<u16> =
+            observed.http.ports.iter().cloned().collect();
+        http_ports_set.extend(existing.http.ports.iter().cloned());
+        profile_out.http.ports = http_ports_set.into_iter().collect();
+
+        let mut ca_set: std::collections::BTreeSet<std::path::PathBuf> =
+            observed.config.http_inject_ca.iter().cloned().collect();
+        ca_set.extend(existing.config.http_inject_ca.iter().cloned());
+        profile_out.config.http_inject_ca = ca_set.into_iter().collect();
+
+        // http_ca_out: take from observed when existing has none.
+        if profile_out.config.http_ca_out.is_none() {
+            profile_out.config.http_ca_out = observed.config.http_ca_out;
+        }
+
+        // env: union observed vars into existing, observed wins on conflict.
+        for (k, v) in observed.program.env {
+            profile_out.program.env.insert(k, v);
+        }
     }
 
     let kernel = std::fs::read_to_string("/proc/version")

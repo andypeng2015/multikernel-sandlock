@@ -18,6 +18,10 @@ sandlock learn [options] -- <cmd> [args...]
 | `--collapse [N]` | off | Collapse directories where ≥N files were observed (default N=4) |
 | `--collapse-prefix <path>` | none | Force collapse of all paths under prefix (repeatable) |
 | `--force-sensitive-collapse` | off | Allow `--collapse-prefix` to target sensitive paths (requires `--collapse-prefix`) |
+| `--http-inject-ca <path>` | none | System CA bundle path; sandlock splices an ephemeral CA in at `open()` time so HTTPS is intercepted. |
+| `--http-ca-out <path>` | none | Write the ephemeral MITM CA public cert to a file and record the path in the profile. Runtimes with a compiled-in CA store (e.g. Node.js) ignore the system bundle patched by `--http-inject-ca`; pair with `--env NODE_EXTRA_CA_CERTS=<path>` to point the runtime at the cert. |
+| `--http-port <port>` | none | Additional TCP port to intercept (repeatable). |
+| `--env KEY=VALUE` | none | Set an environment variable for the observed process (repeatable). |
 
 ## What is recorded
 
@@ -27,6 +31,7 @@ sandlock learn [options] -- <cmd> [args...]
 | Filesystem writes | Same; classified by open flags (`O_WRONLY`, `O_RDWR`, `O_CREAT`) |
 | Executed binaries and libraries | `/proc/<pid>/exe` + r-xp mappings from `/proc/<pid>/maps` |
 | Network connections (TCP/UDP) | seccomp-notify on `connect`/`sendto`/`sendmsg` |
+| HTTP method + host + path | Transparent proxy in logging-only mode (always on, see below) |
 | Resource peaks | `/proc/<pid>/status` sampling: RSS, thread count, fd count |
 
 ## Path collapsing
@@ -61,6 +66,10 @@ to. The operator can use this to decide whether the grant is acceptable.
 
 `--force-sensitive-collapse` allows `--collapse-prefix` to target protected
 and guarded paths. A warning and diff are still printed.
+
+## HTTP/HTTPS observation
+
+The transparent proxy always runs in logging-only mode during `sandlock learn`. Method, host, and path of every request are recorded as `[http].allow` rules. By default port 80 is intercepted; port 443 requires `--http-inject-ca` (sandlock splices an ephemeral CA into the named bundle at `open()` time); passing `--http-port` overrides the default and intercepts only the specified ports. The inject-ca path is written to `[config].http_inject_ca` so `sandlock run` picks it up automatically. `[http].deny` rules are not learned.
 
 ## Tests
 

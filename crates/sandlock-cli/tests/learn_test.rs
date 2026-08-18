@@ -3,6 +3,7 @@
 // Limit parallelism when running this suite:
 //   cargo test -p sandlock-cli --test learn_test -- --test-threads=4
 
+use std::io::Read;
 use std::process::Command;
 
 fn sandlock_bin() -> Command {
@@ -15,6 +16,7 @@ fn sandlock_bin() -> Command {
 /// all). `-r` maps to a mandatory `fs_read`, so requiring `/lib64` on such a
 /// host aborts confinement; this mirrors `fs_read_if_exists` at the CLI layer.
 /// On hosts that have `/lib64` (x86-64) the arguments pass through unchanged.
+#[allow(dead_code)]
 fn args_for_host(args: &[&str]) -> Vec<String> {
     let has_lib64 = std::path::Path::new("/lib64").exists();
     let mut out: Vec<String> = Vec::with_capacity(args.len());
@@ -811,3 +813,147 @@ fn test_learn_symlink_path_canonicalized() {
 
     let _ = std::fs::remove_file(&link);
 }
+
+// ── HTTP learning ─────────────────────────────────────────────────────────────
+
+/// Spawn a minimal HTTP server on an ephemeral port and return the port.
+/// The server loops over incoming connections, returning a 200 OK for each.
+fn spawn_http_server() -> u16 {
+    use std::io::Write;
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        // Accept multiple connections so the server handles repeated test requests.
+        for stream in listener.incoming() {
+            let mut stream = match stream { Ok(s) => s, Err(_) => break };
+            // Read until the end of HTTP headers.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            let _ = stream.write_all(response);
+        }
+    });
+    port
+}
+
+/// A plaintext HTTP request is captured and written as an [http] allow rule.
+#[test]
+fn test_learn_captures_http_request() {
+    let port = spawn_http_server();
+    let url = format!("http://127.0.0.1:{port}/hello");
+
+    let output = sandlock_bin()
+        .args(["learn", "--http-port", &port.to_string(), "--", "curl", "-sf", &url])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "learn failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let profile = String::from_utf8_lossy(&output.stdout);
+    assert!(profile.contains("[http]"), "expected [http] section: {profile}");
+    assert!(profile.contains("ports"), "expected ports in [http]: {profile}");
+    assert!(profile.contains(&port.to_string()), "expected port {port} in [http].ports: {profile}");
+    assert!(profile.contains("GET"), "expected GET rule in [http].allow: {profile}");
+    assert!(profile.contains("/hello"), "expected /hello path in [http].allow: {profile}");
+}
+
+/// --http-port writes only the intercepted port to [http].ports, not port 80.
+#[test]
+fn test_learn_http_port_not_inflated() {
+    let port = spawn_http_server();
+    let url = format!("http://127.0.0.1:{port}/hello");
+
+    let output = sandlock_bin()
+        .args(["learn", "--http-port", &port.to_string(), "--", "curl", "-sf", &url])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "learn failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let profile = String::from_utf8_lossy(&output.stdout);
+    assert!(profile.contains(&format!("ports = [{}]", port)),
+        "expected only port {port} in [http].ports, got: {profile}");
+}
+
+/// Multiple distinct requests to different paths are all recorded and deduplicated.
+#[test]
+fn test_learn_captures_http_multiple_paths() {
+    let port = spawn_http_server();
+    let url_a = format!("http://127.0.0.1:{port}/a");
+    let url_b = format!("http://127.0.0.1:{port}/b");
+    // Request /a twice to verify deduplication.
+    let cmd = format!("curl -sf {url_a} && curl -sf {url_b} && curl -sf {url_a}");
+
+    let output = sandlock_bin()
+        .args(["learn", "--http-port", &port.to_string(), "--", "sh", "-c", &cmd])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "learn failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let profile = String::from_utf8_lossy(&output.stdout);
+    let allow_count = profile.matches("GET 127.0.0.1").count();
+    assert_eq!(allow_count, 2,
+        "expected exactly 2 unique GET rules (/a and /b), got {allow_count}: {profile}");
+}
+
+/// Returns the first system CA bundle path that exists on this machine,
+/// or None if no known path is found (test is skipped in that case).
+fn system_ca_bundle() -> Option<&'static str> {
+    for path in &[
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/ca-certificates/extracted/tls-ca-bundle.pem",
+    ] {
+        if std::path::Path::new(path).exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Returns true if host:443 accepts a TCP connection within 3 seconds.
+fn https_reachable(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Ok(mut it) = format!("{host}:443").to_socket_addrs() else { return false };
+    let Some(addr) = it.next() else { return false };
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)).is_ok()
+}
+
+/// HTTPS traffic via --http-inject-ca is captured and written as an [http] allow rule.
+/// Uses a real HTTPS server (example.com) so that TLS termination, MITM cert signing,
+/// CA injection, and proxy forwarding are all exercised end to end.
+/// Skipped if example.com is unreachable or no system CA bundle is found.
+#[test]
+fn test_learn_captures_https_request() {
+    if !https_reachable("example.com") {
+        eprintln!("skipping test_learn_captures_https_request: example.com unreachable");
+        return;
+    }
+    let Some(ca_bundle) = system_ca_bundle() else {
+        eprintln!("skipping test_learn_captures_https_request: no system CA bundle found");
+        return;
+    };
+
+    let output = sandlock_bin()
+        .args([
+            "learn",
+            "--http-inject-ca", ca_bundle,
+            "--", "curl", "-sf", "https://example.com/",
+        ])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(output.status.success(),
+        "learn failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let profile = String::from_utf8_lossy(&output.stdout);
+    assert!(profile.contains("[http]"), "expected [http] section: {profile}");
+    assert!(profile.contains("example.com"), "expected example.com in [http].allow: {profile}");
+    assert!(profile.contains("[config]"), "expected [config] section: {profile}");
+    assert!(profile.contains("http_inject_ca"), "expected http_inject_ca in [config]: {profile}");
+    assert!(profile.contains(ca_bundle), "expected ca bundle path in [config]: {profile}");
+}
+
+

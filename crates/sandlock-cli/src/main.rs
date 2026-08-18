@@ -233,6 +233,25 @@ struct LearnArgs {
     #[arg(long, requires = "collapse_prefix")]
     force_sensitive_collapse: bool,
 
+    /// Inject an ephemeral MITM CA into this trust bundle to observe HTTPS.
+    /// Enables port 443 interception.
+    #[arg(long, value_name = "PATH")]
+    http_inject_ca: Vec<PathBuf>,
+
+    /// Additional TCP port to intercept for HTTP/HTTPS learning (repeatable)
+    #[arg(long, value_name = "PORT")]
+    http_port: Vec<u16>,
+
+    /// Write the ephemeral MITM CA public cert to this path so the workload can trust it
+    /// (e.g. NODE_EXTRA_CA_CERTS=<path> or curl --cacert <path>)
+    #[arg(long, value_name = "PATH")]
+    http_ca_out: Option<PathBuf>,
+
+    /// Set an environment variable for the observed process and record it in the
+    /// profile so sandlock run inherits it (repeatable, KEY=VALUE).
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    env_vars: Vec<String>,
+
     /// Command to observe (everything after --)
     #[arg(last = true, required = true)]
     cmd: Vec<String>,
