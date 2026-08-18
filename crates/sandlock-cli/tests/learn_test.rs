@@ -956,4 +956,36 @@ fn test_learn_captures_https_request() {
     assert!(profile.contains(ca_bundle), "expected ca bundle path in [config]: {profile}");
 }
 
+/// --merge keeps a hand-written ${HOME} and does not append its expanded twin.
+#[test]
+fn test_learn_merge_preserves_home_variable() {
+    let home = std::env::var("HOME").expect("HOME set");
+    let probe_dir = std::path::PathBuf::from(&home).join(".config");
+    std::fs::create_dir_all(&probe_dir).expect("create probe dir");
+    let probe = probe_dir.join("sandlock-merge-probe");
+    std::fs::write(&probe, b"ok").expect("write probe");
 
+    let profile = tempfile::NamedTempFile::new().expect("tempfile");
+    let profile_path = profile.path().to_str().unwrap().to_owned();
+    std::fs::write(&profile_path, "[filesystem]\nread = [\"${HOME}/.config\", \"/usr\"]\n")
+        .expect("seed profile");
+
+    let learn = sandlock_bin()
+        .args(["learn", "--merge", &profile_path, "--", "cat", probe.to_str().unwrap()])
+        .output()
+        .expect("failed to run sandlock learn --merge");
+    let _ = std::fs::remove_file(&probe);
+    assert!(learn.status.success(),
+        "merge learn failed: {}", String::from_utf8_lossy(&learn.stderr));
+
+    let merged = std::fs::read_to_string(&profile_path).expect("read merged profile");
+    let parsed: sandlock_core::ProfileInput = toml::from_str(&merged).expect("parse merged");
+    let reads: Vec<String> = parsed.filesystem.read.iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+
+    assert!(reads.iter().any(|r| r == "${HOME}/.config"),
+        "merge dropped the ${{HOME}} spelling: {reads:?}");
+    assert!(!reads.iter().any(|r| r.starts_with(&format!("{home}/.config"))),
+        "merge added a machine-specific duplicate of ${{HOME}}/.config: {reads:?}");
+}

@@ -158,3 +158,42 @@ fn no_supervisor_rejects_supervisor_only_profile_fields() {
         stderr,
     );
 }
+
+#[test]
+fn profile_home_variable_grants_real_access() {
+    let home = std::env::var("HOME").expect("HOME set");
+    let probe = std::path::PathBuf::from(&home).join(".sandlock-expand-probe");
+    std::fs::write(&probe, b"ok").expect("write probe");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let profile_path = tmp.path().join("expand.toml");
+    // The write grant is what proves expansion happened: it is mandatory, so
+    // a literal "${HOME}" would abort the run on a path that does not exist.
+    std::fs::write(&profile_path, format!(r#"
+        [filesystem]
+        {read}
+        write = ["${{HOME}}/.sandlock-expand-probe"]
+    "#, read = read_list())).unwrap();
+
+    let out = sandlock_bin()
+        .args([
+            "run",
+            "--profile-file",
+            profile_path.to_str().unwrap(),
+            "--fs-read",
+            probe.to_str().unwrap(),
+            "--",
+            "/bin/cat",
+            probe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn sandlock");
+
+    std::fs::remove_file(&probe).ok();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+}
